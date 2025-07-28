@@ -1,0 +1,110 @@
+[
+  {
+    "timestamp": "2025-07-28T17:02:26.798925",
+    "pair": "DOGE_EUR",
+    "type": "buy",
+    "quantity": 5.263943091208984,
+    "price": 0.20067808,
+    "amount": 1.0563579968,
+    "commission": 0.0031690739904000004
+  },
+  {
+    "timestamp": "2025-07-28T17:02:59.285969",
+    "pair": "DOGE_EUR",
+    "type": "buy",
+    "quantity": 5.265312422730957,
+    "price": 0.20057774,
+    "amount": 1.0561044712,
+    "commission": 0.0031683134136000005
+  },
+  {
+    "timestamp": "2025-07-28T17:03:22.497265",
+    "pair": "DOGE_EUR",
+    "type": "buy",
+    "quantity": 5.265312422730957,
+    "price": 0.20057774,
+    "amount": 1.0561044712,
+    "commission": 0.0031683134136000005
+  },
+  {
+    "timestamp": 1753715451,
+    "pair": "DOGE_EUR",
+    "type": "buy",
+    "quantity": 5.256235716768408,
+    "price": 0.20092411,
+    "amount": 1.0561044712,
+    "commission": 0.0031683134136000005
+  },
+  {
+    "timestamp": 1753717201,
+    "pair": "DOGE_EUR",
+    "type": "buy",
+    "quantity": 5.262750256000983,
+    "price": 0.20067539,
+    "amount": 1.0561044712,
+    "commission": 0.0031683134136000005
+  },
+  {
+    "timestamp": 1753717438,
+    "pair": "DOGE_EUR",
+    "type": "buy",
+    "quantity": 5.244736540050515,
+    "price": 0.20136464,
+    "amount": 1.0561044712,
+    "commission": 0.0031683134136000005
+  },
+  {
+    "timestamp": 1753717987,
+    "pair": "DOGE_EUR",
+    "type": "buy",
+    "quantity": 7.967383759511691,
+    "price": 0.19883023,
+    "amount": 1.5841567068,
+    "commission": 0.0047524701204
+  },
+  {
+    "timestamp": 1753731351,
+    "pair": "DOGE_EUR",
+    "type": "sell",
+    "quantity": 9.6055029,
+    "price": 0.19840688693,
+    "amount": 1.905797927786087,
+    "commission": 0.005717393783358261
+  },
+  {
+    "timestamp": 1753731483,
+    "pair": "DOGE_EUR",
+    "type": "sell",
+    "quantity": 9.6055029,
+    "price": 0.19840688693,
+    "amount": 1.905797927786087,
+    "commission": 0.005717393783358261
+  },
+  {
+    "timestamp": 1753731546,
+    "pair": "DOGE_EUR",
+    "type": "sell",
+    "quantity": 9.6055029,
+    "price": 0.19843044514500002,
+    "amount": 1.9060242162885885,
+    "commission": 0.005718072648865766
+  },
+  {
+    "timestamp": 1753732662,
+    "pair": "DOGE_EUR",
+    "type": "sell",
+    "quantity": 9.6055029,
+    "price": 0.19821813135500002,
+    "amount": 1.9039848355630336,
+    "commission": 0.0057119545066891
+  },
+  {
+    "timestamp": 1753736368,
+    "pair": "DOGE_EUR",
+    "type": "sell",
+    "quantity": 9.6055029,
+    "price": 0.1969396809,
+    "amount": 1.8917046760100245,
+    "commission": 0.005675114028030073
+  }
+]
