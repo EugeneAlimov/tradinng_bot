@@ -13,13 +13,13 @@ from analytics_system import TradingAnalytics
 from adaptive_dca_strategy import AdaptiveDCAStrategy
 from trailing_stop import TrailingStopManager
 from pyramid_strategy import SmartPyramidStrategy
+from advanced_trend_filter import AdvancedTrendFilter, TrendDirection
 
 # 🆕 Новые улучшенные компоненты
 from hybrid_strategy import HybridTradeOrchestrator
 from rate_limiter import RateLimitedAPIClient
 from improved_technical_indicators import ImprovedTechnicalIndicators
 
-# 🆕 Новые сервисы
 from services.api_service import APIService
 from services.trade_validator import TradeValidator
 
@@ -64,6 +64,7 @@ class ImprovedTradingBot:
 
         self.logger.info("🚀 Улучшенный торговый бот инициализирован")
 
+
     def _initialize_components(self):
         """🔧 Инициализация всех компонентов бота"""
 
@@ -103,6 +104,14 @@ class ImprovedTradingBot:
         )
 
         self.analytics = TradingAnalytics()
+
+        # 🧠 Trend Filter для защиты от медвежьих трендов
+        if self.config.TREND_FILTER_ENABLED:
+            self.trend_filter = AdvancedTrendFilter(self.config)
+            self.logger.info("🧠 Trend Filter активирован")
+        else:
+            self.trend_filter = None
+            self.logger.warning("⚠️ Trend Filter ОТКЛЮЧЕН - высокий риск!")
 
         self.pair = f"{self.config.CURRENCY_1}_{self.config.CURRENCY_2}"
         self.pair_settings = {}
@@ -254,26 +263,38 @@ class ImprovedTradingBot:
                 self.running = False
 
     def _collect_market_data(self) -> Dict[str, Any]:
-        """📊 Сбор рыночных данных"""
+        """📊 Сбор рыночных данных с анализом тренда"""
         try:
             # Текущая цена
-            current_price = self.api_service.get_current_price(self.pair)  # 🔧 Используем api_service
+            current_price = self.api_service.get_current_price(self.pair)
             if current_price == 0:
                 return None
 
             # Баланс
-            balances = self.api_service.get_balances()  # 🔧 Используем новый метод
+            balances = self.api_service.get_balances()
             balance_eur = balances.get(self.config.CURRENCY_2, 0)
             balance_doge = balances.get(self.config.CURRENCY_1, 0)
 
             # Точные данные позиции
             accurate_data = self.position_manager.get_accurate_position_data(self.config.CURRENCY_1)
 
+            # 🧠 НОВОЕ: Анализ тренда
+            trend_analysis = None
+            if self.trend_filter:
+                trend_analysis = self.trend_filter.analyze_trend(current_price)
+
+                # Логируем изменения тренда каждые 50 циклов
+                if self.cycle_count % 50 == 0:
+                    self.logger.info(f"🧠 Trend: {trend_analysis.direction.value}, "
+                                     f"4h: {trend_analysis.trend_4h * 100:+.1f}%, "
+                                     f"DCA: {'✅' if trend_analysis.should_allow_dca else '🚫'}")
+
             return {
                 'current_price': current_price,
                 'balance': balance_eur,
                 'doge_balance': balance_doge,
                 'accurate_position': accurate_data,
+                'trend_analysis': trend_analysis,  # 🧠 НОВОЕ поле
                 'timestamp': time.time()
             }
 

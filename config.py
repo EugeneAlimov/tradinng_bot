@@ -116,6 +116,15 @@ class TradingConfig:
     DOGE_VOLUME_CHECK: bool = True  # Проверка объемов для DOGE
     MIN_ORDER_VOLUME_EUR: float = 55  # Минимальный объем ордера
 
+    # 🧠 НОВЫЕ настройки Trend Filter
+    TREND_FILTER_ENABLED: bool = True                    # Включить фильтр трендов
+    TREND_BEARISH_THRESHOLD_4H: float = -0.08           # -8% за 4ч = сильный медведь
+    TREND_BEARISH_THRESHOLD_1H: float = -0.04           # -4% за 1ч = медведь
+    TREND_DCA_DISABLE_THRESHOLD: float = -0.05          # Отключать DCA при -5% за 4ч
+    TREND_BUY_DISABLE_THRESHOLD: float = -0.10          # Отключать покупки при -10% за 4ч
+    TREND_HIGH_VOLATILITY_THRESHOLD: float = 0.05       # 5% волатильность = высокая
+    TREND_CONFIDENCE_MIN: float = 0.6                   # Минимальная уверенность для решений
+
     # Логирование
     LOG_LEVEL: str = 'INFO'
     LOG_FILE: str = 'trading_bot_recovery.log'  # 🩹 НОВОЕ имя лога

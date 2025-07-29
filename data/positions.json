@@ -1,16 +1,16 @@
 {
   "version": "1.0",
-  "timestamp": "2025-07-29T18:31:45.417238",
+  "timestamp": "2025-07-29T22:55:39.314982",
   "config": {
     "currency_1": "DOGE",
     "currency_2": "EUR"
   },
   "positions": {
     "DOGE": {
-      "quantity": 22.600593701942024,
-      "avg_price": 0.20064506930023573,
-      "total_cost": 4.534697689552629,
-      "last_updated": "2025-07-29T18:31:45.416949",
+      "quantity": 26.594223392694335,
+      "avg_price": 0.198893512184332,
+      "total_cost": 5.289418494387697,
+      "last_updated": "2025-07-29T22:55:39.314427",
       "trades": [
         {
           "date": "2025-07-13T23:34:39",
@@ -148,13 +148,40 @@
           "commission": 0.01501467
         },
         {
-          "date": "",
-          "timestamp": 1753806705,
+          "date": "2025-07-29T18:38:19",
+          "timestamp": 1753807099,
           "type": "buy",
-          "quantity": 4.756909701942024,
+          "quantity": 5.0,
           "price": 0.19066952,
-          "amount": 0.9069976895526288,
-          "commission": 0.0027209930686578863
+          "amount": 0.9533476,
+          "commission": 0.015
+        },
+        {
+          "date": "2025-07-29T18:41:40",
+          "timestamp": 1753807300,
+          "type": "sell",
+          "quantity": 5.710921,
+          "price": 0.18927621,
+          "amount": 1.08094148,
+          "commission": 0.00324282
+        },
+        {
+          "date": "2025-07-29T20:04:46",
+          "timestamp": 1753812286,
+          "type": "buy",
+          "quantity": 5.0,
+          "price": 0.19421876,
+          "amount": 0.9710938,
+          "commission": 0.015
+        },
+        {
+          "date": "",
+          "timestamp": 1753822539,
+          "type": "buy",
+          "quantity": 4.461460392694334,
+          "price": 0.1919144,
+          "amount": 0.8562184943876975,
+          "commission": 0.0025686554831630924
         }
       ]
     }

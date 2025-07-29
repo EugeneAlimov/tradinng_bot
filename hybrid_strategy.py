@@ -5,6 +5,8 @@ from typing import Dict, Any, Tuple, Optional, List
 from datetime import datetime
 from dataclasses import dataclass
 
+from advanced_trend_filter import TrendDirection
+
 
 @dataclass
 class PositionMetrics:
@@ -232,6 +234,23 @@ class HybridStrategy:
                 'should_execute': False,
                 'reason': f'Недостаточно баланса: {balance:.2f} < {dca_amount:.2f}'
             }
+
+            # 🧠 Критическая проверка тренда для Smart DCA
+        if 'trend_analysis' in metrics.__dict__:
+            trend_analysis = metrics.trend_analysis
+            if trend_analysis and not trend_analysis.should_allow_dca:
+                return {
+                    'should_execute': False,
+                    'reason': f'Smart DCA заблокирована трендом: {trend_analysis.reason}'
+                }
+
+            # Дополнительные ограничения для Smart DCA
+            if trend_analysis and trend_analysis.direction == TrendDirection.STRONG_BEARISH:
+                if trend_analysis.confidence > 0.7:  # Высокая уверенность в медвежьем тренде
+                    return {
+                        'should_execute': False,
+                        'reason': f'Smart DCA заблокирована: сильный медвежий тренд (уверенность {trend_analysis.confidence:.1f})'
+                    }
 
         # Рассчитываем новую среднюю цену после DCA
         dca_quantity = dca_amount / metrics.current_price

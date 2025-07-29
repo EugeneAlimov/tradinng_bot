@@ -5,6 +5,7 @@ from datetime import datetime
 import logging
 import time
 
+from advanced_trend_filter import TrendDirection
 
 @dataclass
 class BottomPurchase:
@@ -60,12 +61,26 @@ class AdaptiveDCAStrategy:
         self.logger.info(f"   🎯 Максимум покупок: {self.max_purchases}")
 
     def should_buy_initial(self, market_data: Dict) -> Tuple[bool, float, float]:
-        """Первая покупка - используем существующую логику"""
+        """🎯 Первая покупка с проверкой тренда"""
         if self.first_entry_price is not None:
             return False, 0.0, 0.0  # Уже есть позиция
 
         current_price = market_data.get('current_price', 0.0)
         balance = market_data.get('balance', 0.0)
+
+        # 🧠 НОВОЕ: Проверка trend filter
+        trend_analysis = market_data.get('trend_analysis')
+        if trend_analysis:
+            if not trend_analysis.should_allow_buy:
+                self.logger.warning(f"🚫 НАЧАЛЬНАЯ ПОКУПКА заблокирована трендом: {trend_analysis.reason}")
+                return False, 0.0, 0.0
+
+            # Дополнительная проверка для критических трендов
+            if trend_analysis.direction in [TrendDirection.STRONG_BEARISH, TrendDirection.BEARISH]:
+                if trend_analysis.trend_4h < -0.08:  # -8% за 4 часа
+                    self.logger.warning(
+                        f"🚫 НАЧАЛЬНАЯ ПОКУПКА заблокирована: критический медвежий тренд {trend_analysis.trend_4h * 100:.1f}%")
+                    return False, 0.0, 0.0
 
         if self._is_good_initial_entry(current_price, balance):
             quantity = balance * self.bottom_purchase_size / current_price
@@ -75,17 +90,35 @@ class AdaptiveDCAStrategy:
             self.logger.info(f"   Цена: {buy_price:.8f}")
             self.logger.info(f"   Количество: {quantity:.4f}")
 
+            # 🧠 Логируем разрешение тренда
+            if trend_analysis:
+                self.logger.info(f"   🧠 Trend разрешение: {trend_analysis.direction.value}")
+
             return True, quantity, buy_price
 
         return False, 0.0, 0.0
 
     def should_buy_on_bottom(self, market_data: Dict) -> Tuple[bool, float, float]:
-        """⚡ УЛЬТРА-БЫСТРАЯ покупка на дне (30 секунд определения!)"""
+        """⚡ УЛЬТРА-БЫСТРАЯ покупка на дне с защитой от медвежьих трендов"""
         if self.first_entry_price is None:
             return False, 0.0, 0.0  # Нет первой позиции
 
         current_price = market_data.get('current_price', 0.0)
         balance = market_data.get('balance', 0.0)
+
+        # 🧠 КРИТИЧЕСКАЯ ПРОВЕРКА: Trend Filter
+        trend_analysis = market_data.get('trend_analysis')
+        if trend_analysis:
+            if not trend_analysis.should_allow_dca:
+                self.logger.warning(f"🚫 DCA ЗАБЛОКИРОВАНА трендом: {trend_analysis.reason}")
+                return False, 0.0, 0.0
+
+            # Особо строгая проверка для DCA
+            if trend_analysis.direction == TrendDirection.STRONG_BEARISH:
+                self.logger.warning(f"🚫 DCA ЗАБЛОКИРОВАНА: сильный медвежий тренд")
+                self.logger.warning(f"   Тренд 4ч: {trend_analysis.trend_4h * 100:.1f}%")
+                self.logger.warning(f"   Тренд 1ч: {trend_analysis.trend_1h * 100:.1f}%")
+                return False, 0.0, 0.0
 
         # Проверяем ограничения
         if not self._can_make_bottom_purchase(balance):
@@ -97,7 +130,7 @@ class AdaptiveDCAStrategy:
 
         # Дно подтверждено - покупаем!
         quantity = balance * self.bottom_purchase_size / current_price
-        buy_price = current_price * 0.9995  # Минимальная скидка для быстрого исполнения
+        buy_price = current_price * 0.9995
 
         drop_from_first = (self.first_entry_price - current_price) / self.first_entry_price * 100
 
@@ -106,7 +139,12 @@ class AdaptiveDCAStrategy:
         self.logger.info(f"   Цена дна: {buy_price:.8f}")
         self.logger.info(f"   Падение от первой: {drop_from_first:.1f}%")
         self.logger.info(f"   Количество: {quantity:.4f}")
-        self.logger.info(f"   Время определения: {self.stabilization_minutes * 60:.0f} секунд")
+
+        # 🧠 Логируем состояние тренда
+        if trend_analysis:
+            self.logger.info(f"   🧠 Trend: {trend_analysis.direction.value} (сила: {trend_analysis.strength:.2f})")
+            self.logger.info(
+                f"   📈 Тренд 4ч: {trend_analysis.trend_4h * 100:+.1f}%, 1ч: {trend_analysis.trend_1h * 100:+.1f}%")
 
         return True, quantity, buy_price
 

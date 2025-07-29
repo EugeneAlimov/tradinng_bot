@@ -124,5 +124,68 @@
     "price": 0.19066952,
     "amount": 0.9069976895526288,
     "commission": 0.0027209930686578863
+  },
+  {
+    "timestamp": 1753808675,
+    "pair": "DOGE_EUR",
+    "type": "buy",
+    "quantity": 4.754960546422703,
+    "price": 0.192316,
+    "amount": 0.9144549924458285,
+    "commission": 0.0027433649773374856
+  },
+  {
+    "timestamp": 1753808976,
+    "pair": "DOGE_EUR",
+    "type": "buy",
+    "quantity": 4.74893294347871,
+    "price": 0.1925601,
+    "amount": 0.9144550024895548,
+    "commission": 0.0027433650074686644
+  },
+  {
+    "timestamp": 1753809474,
+    "pair": "DOGE_EUR",
+    "type": "buy",
+    "quantity": 4.727588953704105,
+    "price": 0.19342947,
+    "amount": 0.9144550256928395,
+    "commission": 0.0027433650770785187
+  },
+  {
+    "timestamp": 1753810260,
+    "pair": "DOGE_EUR",
+    "type": "buy",
+    "quantity": 4.708376273030022,
+    "price": 0.19421876,
+    "amount": 0.9144550013613123,
+    "commission": 0.002743365004083937
+  },
+  {
+    "timestamp": 1753812294,
+    "pair": "DOGE_EUR",
+    "type": "buy",
+    "quantity": 4.442893575230111,
+    "price": 0.19271641,
+    "amount": 0.856218499830412,
+    "commission": 0.002568655499491236
+  },
+  {
+    "timestamp": 1753815356,
+    "pair": "DOGE_EUR",
+    "type": "buy",
+    "quantity": 4.45056867998602,
+    "price": 0.19238407,
+    "amount": 0.8562185164702381,
+    "commission": 0.0025686555494107144
+  },
+  {
+    "timestamp": 1753822539,
+    "pair": "DOGE_EUR",
+    "type": "buy",
+    "quantity": 4.461460392694334,
+    "price": 0.1919144,
+    "amount": 0.8562184943876975,
+    "commission": 0.0025686554831630924
   }
 ]
