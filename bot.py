@@ -14,10 +14,14 @@ from adaptive_dca_strategy import AdaptiveDCAStrategy
 from trailing_stop import TrailingStopManager
 from pyramid_strategy import SmartPyramidStrategy
 
-# Новые улучшенные компоненты
+# 🆕 Новые улучшенные компоненты
 from hybrid_strategy import HybridTradeOrchestrator
 from rate_limiter import RateLimitedAPIClient
 from improved_technical_indicators import ImprovedTechnicalIndicators
+
+# 🆕 Новые сервисы
+from services.api_service import APIService
+from services.trade_validator import TradeValidator
 
 
 class ImprovedTradingBot:
@@ -65,16 +69,24 @@ class ImprovedTradingBot:
 
         self.logger.info("🔧 Инициализация компонентов...")
 
-        # Базовые компоненты
+        # Базовые API компоненты
         original_api = ExmoAPIClient(self.config)
-        self.api = RateLimitedAPIClient(original_api)  # 🆕 С rate limiting
+        rate_limited_api = RateLimitedAPIClient(original_api)
 
+        # 🆕 Новый API сервис
+        self.api_service = APIService(rate_limited_api, self.config)
+        self.api = rate_limited_api  # Оставляем для обратной совместимости
+
+        # 🆕 Валидатор сделок
+        self.trade_validator = TradeValidator(self.config)
+
+        # Менеджеры
         self.risk_manager = RiskManager(self.config)
-        self.position_manager = PositionManager(self.config, self.api)
+        self.position_manager = PositionManager(self.config, self.api_service)  # 🔧 Передаем api_service
 
         # Стратегии с улучшенными индикаторами
         self.dca_strategy = AdaptiveDCAStrategy(
-            self.config, self.api, self.risk_manager, self.position_manager
+            self.config, self.api_service, self.risk_manager, self.position_manager  # 🔧 api_service
         )
 
         # 🆕 Заменяем индикаторы на улучшенные в DCA стратегии
@@ -86,7 +98,7 @@ class ImprovedTradingBot:
 
         # 🆕 Главное улучшение - торговый оркестратор
         self.trade_orchestrator = HybridTradeOrchestrator(
-            self.config, self.api, self.risk_manager, self.position_manager,
+            self.config, self.api_service, self.risk_manager, self.position_manager,  # 🔧 api_service
             self.pyramid_strategy, self.trailing_stop
         )
 
@@ -121,12 +133,12 @@ class ImprovedTradingBot:
             self.logger.info("🔄 Инициализация бота...")
 
             # Проверяем соединение с API
-            if not self.api.check_connection():
+            if not self.api_service.check_connection():
                 self.logger.error("❌ Нет соединения с API")
                 return False
 
             # Получаем настройки пары
-            pair_settings = self.api.get_pair_settings()
+            pair_settings = self.api_service.get_pair_settings()
             if self.pair not in pair_settings:
                 self.logger.error(f"❌ Пара {self.pair} не найдена")
                 return False
@@ -150,10 +162,9 @@ class ImprovedTradingBot:
                 self.logger.error(f"❌ Ошибка загрузки позиций: {e}")
 
             # Проверяем баланс
-            user_info = self.api.get_user_info()
-            balances = user_info.get('balances', {})
-            balance_eur = float(balances.get(self.config.CURRENCY_2, 0))
-            balance_doge = float(balances.get(self.config.CURRENCY_1, 0))
+            balances = self.api_service.get_balances()  # 🔧 Используем новый метод
+            balance_eur = balances.get(self.config.CURRENCY_2, 0)
+            balance_doge = balances.get(self.config.CURRENCY_1, 0)
 
             self.logger.info(f"💰 Баланс: {balance_eur:.4f} EUR, {balance_doge:.6f} DOGE")
 
@@ -186,12 +197,18 @@ class ImprovedTradingBot:
         self.logger.info(f"   Trailing: {self.trailing_stop.trailing_percent * 100:.1f}%")
         self.logger.info(f"   Активация: {self.trailing_stop.activation_profit * 100:.1f}%")
 
-        # 🆕 Новое: Rate Limiting статистика
+        # 🆕 Новое: Rate Limiting и API Service статистика
         rate_stats = self.api.get_rate_limit_stats()
         self.logger.info(f"⏱️ RATE LIMITING:")
         self.logger.info(
             f"   Лимиты: {rate_stats['limits']['per_second']}/сек, {rate_stats['limits']['per_minute']}/мин")
         self.logger.info(f"   Торговые: {rate_stats['limits']['trading_per_minute']}/мин")
+
+        # API Service статистика
+        cache_stats = self.api_service.get_cache_stats()
+        self.logger.info(f"🌐 API SERVICE:")
+        self.logger.info(f"   Кэш балансов: {cache_stats['balance_cache_size']} записей")
+        self.logger.info(f"   Кэш цен: {cache_stats['price_cache_size']} записей")
 
     def execute_trade_cycle(self):
         """🔄 Основной торговый цикл (упрощенный)"""
@@ -240,15 +257,14 @@ class ImprovedTradingBot:
         """📊 Сбор рыночных данных"""
         try:
             # Текущая цена
-            current_price = self._get_current_price()
+            current_price = self.api_service.get_current_price(self.pair)  # 🔧 Используем api_service
             if current_price == 0:
                 return None
 
             # Баланс
-            user_info = self.api.get_user_info()
-            balances = user_info.get('balances', {})
-            balance_eur = float(balances.get(self.config.CURRENCY_2, 0))
-            balance_doge = float(balances.get(self.config.CURRENCY_1, 0))
+            balances = self.api_service.get_balances()  # 🔧 Используем новый метод
+            balance_eur = balances.get(self.config.CURRENCY_2, 0)
+            balance_doge = balances.get(self.config.CURRENCY_1, 0)
 
             # Точные данные позиции
             accurate_data = self.position_manager.get_accurate_position_data(self.config.CURRENCY_1)
@@ -264,17 +280,6 @@ class ImprovedTradingBot:
         except Exception as e:
             self.logger.error(f"❌ Ошибка сбора рыночных данных: {e}")
             return None
-
-    def _get_current_price(self) -> float:
-        """💱 Получение текущей цены с обработкой ошибок"""
-        try:
-            trades = self.api.get_trades(self.pair)
-            if self.pair in trades and trades[self.pair]:
-                price = float(trades[self.pair][0]['price'])
-                return price
-        except Exception as e:
-            self.logger.error(f"❌ Ошибка получения цены: {str(e)}")
-        return 0.0
 
     def _process_cycle_result(self, cycle_result: Dict[str, Any]):
         """📝 Обработка результата торгового цикла"""
@@ -349,6 +354,13 @@ class ImprovedTradingBot:
         # 🆕 Статистика rate limiting
         self.api.log_rate_limit_stats()
 
+        # 🆕 Статистика API Service
+        cache_stats = self.api_service.get_cache_stats()
+        self.logger.info(f"🌐 API SERVICE СТАТИСТИКА:")
+        self.logger.info(f"   💰 Кэш балансов: {cache_stats['balance_cache_size']} записей")
+        self.logger.info(f"   💱 Кэш цен: {cache_stats['price_cache_size']} записей")
+        self.logger.info(f"   ⚙️ Настройки пар: {'КЭШИРОВАНЫ' if cache_stats['pair_settings_cached'] else 'НЕ КЭШИРОВАНЫ'}")
+
         # Статистика стратегий
         dca_status = self.dca_strategy.get_status()
         if dca_status['active']:
@@ -361,7 +373,7 @@ class ImprovedTradingBot:
     def _cancel_all_orders(self, reason: str = ""):
         """❌ Отмена всех открытых ордеров"""
         try:
-            open_orders = self.api.get_open_orders()
+            open_orders = self.api_service.get_open_orders()  # 🔧 Используем api_service
             pair_orders = open_orders.get(self.pair, [])
 
             if pair_orders:
@@ -369,7 +381,7 @@ class ImprovedTradingBot:
 
                 for order in pair_orders:
                     try:
-                        self.api.cancel_order(int(order['order_id']))
+                        self.api_service.cancel_order(int(order['order_id']))  # 🔧 api_service
                         self.logger.info(f"✅ Ордер {order['order_id']} отменен")
                     except Exception as e:
                         self.logger.error(f"❌ Ошибка отмены ордера {order['order_id']}: {e}")
@@ -398,8 +410,7 @@ class ImprovedTradingBot:
 
             # Проверяем позицию
             if mode == 'normal':
-                user_info = self.api.get_user_info()
-                balance_doge = float(user_info.get('balances', {}).get(self.config.CURRENCY_1, 0))
+                balance_doge = self.api_service.get_balance(self.config.CURRENCY_1)  # 🔧 api_service
 
                 if balance_doge > 0:
                     mode = 'position'
@@ -497,9 +508,14 @@ class ImprovedTradingBot:
                 self.logger.info(f"   Статус: {trailing_status['status']}")
                 self.logger.info(f"   Остается: {trailing_status['remaining_quantity']:.4f}")
 
-            # 🆕 Финальная статистика rate limiting
+            # 🆕 Финальная статистика rate limiting и API service
             self.logger.info("⏱️ ФИНАЛЬНАЯ СТАТИСТИКА RATE LIMITING:")
             self.api.log_rate_limit_stats()
+
+            cache_stats = self.api_service.get_cache_stats()
+            self.logger.info("🌐 ФИНАЛЬНАЯ СТАТИСТИКА API SERVICE:")
+            self.logger.info(f"   💰 Кэш балансов: {cache_stats['balance_cache_size']} записей")
+            self.logger.info(f"   💱 Кэш цен: {cache_stats['price_cache_size']} записей")
 
             # Финальная аналитика
             try:
@@ -546,6 +562,9 @@ class ImprovedTradingBot:
                 # 🆕 Rate limiting статистика
                 'rate_limit_stats': self.api.get_rate_limit_stats(),
 
+                # 🆕 API Service статистика
+                'api_service_stats': self.api_service.get_cache_stats(),
+
                 # Риск-метрики
                 'risk_metrics': self.risk_manager.get_risk_metrics()
             }
@@ -556,15 +575,15 @@ class ImprovedTradingBot:
 
 
 if __name__ == "__main__":
-    print("🚀 УЛУЧШЕННЫЙ ТОРГОВЫЙ БОТ")
-    print("=" * 50)
-    print("Улучшения:")
-    print("✅ Рефакторинг bot.py -> TradeOrchestrator")
-    print("✅ Базовые классы для общей логики")
-    print("✅ Исправленный RSI без глюков")
-    print("✅ Rate Limiting защита API")
+    print("🚀 УЛУЧШЕННЫЙ ТОРГОВЫЙ БОТ С НОВЫМИ СЕРВИСАМИ")
+    print("=" * 60)
+    print("Новые возможности:")
+    print("✅ APIService - единый API с кэшированием")
+    print("✅ TradeValidator - централизованная валидация")
+    print("✅ Исправленные технические индикаторы")
+    print("✅ Очищенный от дублирования код")
     print("✅ Улучшенное логирование и статистика")
-    print("=" * 50)
+    print("=" * 60)
 
     bot = ImprovedTradingBot()
     bot.run()

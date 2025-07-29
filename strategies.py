@@ -3,13 +3,15 @@ from typing import Dict, Any, Optional, Tuple, List
 import logging
 import time
 from config import TradingConfig
-from technical_indicators import TechnicalIndicators
+# 🔧 ИСПРАВЛЕНО: заменен импорт
+from improved_technical_indicators import ImprovedTechnicalIndicators
+from services.trade_validator import TradeValidator
 
 
 class TradingStrategy(ABC):
-    def __init__(self, config: TradingConfig, api_client, risk_manager):
+    def __init__(self, config: TradingConfig, api_service, risk_manager):
         self.config = config
-        self.api = api_client
+        self.api_service = api_service  # 🔧 ИСПРАВЛЕНО: используем api_service
         self.risk_manager = risk_manager
         self.logger = logging.getLogger(__name__)
 
@@ -25,11 +27,16 @@ class TradingStrategy(ABC):
 
 
 class MeanReversionStrategy(TradingStrategy):
-    def __init__(self, config: TradingConfig, api_client, risk_manager, position_manager):
-        super().__init__(config, api_client, risk_manager)
+    def __init__(self, config: TradingConfig, api_service, risk_manager, position_manager):
+        super().__init__(config, api_service, risk_manager)
         self.recent_prices = []
         self.position_manager = position_manager
-        self.indicators = TechnicalIndicators()
+
+        # 🔧 ИСПРАВЛЕНО: используем новый класс индикаторов
+        self.indicators = ImprovedTechnicalIndicators()
+
+        # 🔧 ДОБАВЛЕНО: используем новый валидатор
+        self.trade_validator = TradeValidator(config)
 
         # 🛡️ КОНСЕРВАТИВНЫЕ параметры
         self.min_data_points = self.config.MIN_DATA_POINTS
@@ -76,45 +83,6 @@ class MeanReversionStrategy(TradingStrategy):
         if current_time - self.last_trade_time < self.min_time_between_trades:
             remaining = self.min_time_between_trades - (current_time - self.last_trade_time)
             return False, f"Минимальный интервал: {remaining / 60:.0f} мин"
-
-        return True, "OK"
-
-    def _validate_trade_profitability(self, order_type: str, price: float, quantity: float,
-                                      position_price: float = None) -> Tuple[bool, str]:
-        """💰 Проверка прибыльности сделки до ее совершения"""
-
-        commission_cost = 0.006  # 0.6% туда и обратно
-
-        if order_type == 'buy':
-            # Для покупки: проверяем что сможем продать с прибылью
-            min_sell_price = price * (1 + self.config.MIN_PROFIT_TO_SELL + commission_cost)
-
-            self.logger.info(f"💡 Анализ покупки:")
-            self.logger.info(f"   Цена покупки: {price:.8f}")
-            self.logger.info(f"   Минимальная цена продажи: {min_sell_price:.8f}")
-            self.logger.info(f"   Требуемая прибыль: {self.config.MIN_PROFIT_TO_SELL * 100:.1f}%")
-
-            return True, "Покупка разрешена"
-
-        elif order_type == 'sell' and position_price:
-            # Для продажи: обязательная проверка прибыли
-            profit_percent = (price - position_price) / position_price
-            profit_after_commission = profit_percent - commission_cost
-
-            self.logger.info(f"💡 Анализ продажи:")
-            self.logger.info(f"   Цена покупки: {position_price:.8f}")
-            self.logger.info(f"   Цена продажи: {price:.8f}")
-            self.logger.info(f"   Прибыль до комиссий: {profit_percent * 100:.2f}%")
-            self.logger.info(f"   Прибыль после комиссий: {profit_after_commission * 100:.2f}%")
-            self.logger.info(f"   Требуемая прибыль: {self.config.MIN_PROFIT_TO_SELL * 100:.1f}%")
-
-            if profit_percent < self.config.MIN_PROFIT_TO_SELL:
-                return False, f"Недостаточная прибыль: {profit_percent * 100:.2f}% < {self.config.MIN_PROFIT_TO_SELL * 100:.1f}%"
-
-            if profit_after_commission < 0:
-                return False, f"Убыток после комиссий: {profit_after_commission * 100:.2f}%"
-
-            return True, f"Прибыльная продажа: {profit_after_commission * 100:.2f}%"
 
         return True, "OK"
 
@@ -281,7 +249,7 @@ class MeanReversionStrategy(TradingStrategy):
         conditions_met = len(met_conditions)
 
         # 🚫 ТРЕБУЕМ МИНИМУМ 3 УСЛОВИЯ для покупки
-        if conditions_met < 2: # 3:
+        if conditions_met < 2:  # 3:
             self.logger.info(f"⏸️  Недостаточно условий для покупки: {conditions_met}/6")
             self.logger.info(f"💡 Нужно минимум 2 условия для безопасной покупки")
             return False, 0.0, 0.0
@@ -292,7 +260,7 @@ class MeanReversionStrategy(TradingStrategy):
         quantity = max_spend / buy_price
 
         # 🛡️ Валидация прибыльности
-        is_profitable, profit_reason = self._validate_trade_profitability('buy', buy_price, quantity)
+        is_profitable, profit_reason = self.trade_validator.validate_profitability('buy', buy_price, quantity)
         if not is_profitable:
             self.logger.warning(f"🚫 Покупка отменена: {profit_reason}")
             return False, 0.0, 0.0
@@ -377,8 +345,7 @@ class MeanReversionStrategy(TradingStrategy):
             sell_price = current_price * 0.9998  # Продаем близко к рынку
 
             # Валидация прибыльности
-            is_profitable, profit_reason = self._validate_trade_profitability('sell', sell_price, quantity,
-                                                                              position_price)
+            is_profitable, profit_reason = self.trade_validator.validate_profitability('sell', sell_price, quantity, position_price)
             if is_profitable:
                 self.last_trade_time = time.time()
                 return True, quantity, sell_price
@@ -425,7 +392,7 @@ class MeanReversionStrategy(TradingStrategy):
         sell_price = current_price * (1 + spread)
 
         # 🛡️ Валидация прибыльности
-        is_profitable, profit_reason = self._validate_trade_profitability('sell', sell_price, quantity, position_price)
+        is_profitable, profit_reason = self.trade_validator.validate_profitability('sell', sell_price, quantity, position_price)
         if not is_profitable:
             self.logger.warning(f"🚫 Продажа отменена: {profit_reason}")
             return False, 0.0, 0.0
@@ -441,34 +408,31 @@ class MeanReversionStrategy(TradingStrategy):
         self.trade_count_today += 1
         return True, quantity, sell_price
 
-    # 🔧 Дополнительно:
+    # 🔧 ИСПРАВЛЕННЫЙ метод отладки RSI
     def _debug_rsi_issues(self, prices: List[float]):
         """🔍 Отладка проблем с RSI"""
 
         if len(prices) >= 10:
-            # ИСПРАВЛЕНИЕ: Используем debug_rsi из indicators
-            debug_info = self.indicators.debug_rsi(prices)
+            # 🔧 ИСПРАВЛЕНО: используем новый метод rsi_with_validation
+            rsi_value, validation_info = self.indicators.rsi_with_validation(prices)
 
             # Проверяем есть ли ошибка
-            if 'error' in debug_info:
-                self.logger.info(f"🔍 RSI ДИАГНОСТИКА: {debug_info['error']}")
+            if 'error' in validation_info:
+                self.logger.info(f"🔍 RSI ДИАГНОСТИКА: {validation_info['error']}")
                 return
 
             self.logger.info(f"🔍 RSI ДИАГНОСТИКА:")
-            self.logger.info(f"   📊 Точек данных: {debug_info.get('prices_count', 0)}")
-            self.logger.info(f"   📈 Последние цены: {debug_info.get('recent_prices', [])}")
-            self.logger.info(f"   🔄 Изменения: {debug_info.get('recent_changes', [])}")
-            self.logger.info(f"   ⬆️ Средний рост: {debug_info.get('avg_gain', 0):.6f}")
-            self.logger.info(f"   ⬇️ Средний спад: {debug_info.get('avg_loss', 0):.6f}")
-            self.logger.info(f"   🌊 Макс. изменение: {debug_info.get('max_change', 0):.6f}")
+            self.logger.info(f"   📊 Точек данных: {validation_info.get('prices_count', 0)}")
+            self.logger.info(f"   📈 Диапазон цен: {validation_info.get('price_range', 0):.6f}")
+            self.logger.info(f"   🔄 Среднее изменение: {validation_info.get('avg_change', 0):.6f}")
+            self.logger.info(f"   🌊 Макс. изменение: {validation_info.get('max_change', 0):.6f}")
+            self.logger.info(f"   💹 RSI: {rsi_value:.1f}")
 
-            # Вычисляем RSI вручную для проверки
-            avg_gain = debug_info.get('avg_gain', 0)
-            avg_loss = debug_info.get('avg_loss', 0)
+            # Дополнительная информация
+            if 'calculation_method' in validation_info:
+                self.logger.info(f"   🔧 Метод расчета: {validation_info['calculation_method']}")
 
-            if avg_loss > 0:
-                rs = avg_gain / avg_loss
-                calculated_rsi = 100 - (100 / (1 + rs))
-                self.logger.info(f"   💹 Расчетный RSI: {calculated_rsi:.1f}")
+            if validation_info.get('sufficient_data', True):
+                self.logger.info(f"   ✅ Достаточно данных для расчета")
             else:
-                self.logger.info(f"   💹 RSI: {100 if avg_gain > 0 else 50}")
+                self.logger.info(f"   ❌ Недостаточно данных, результат может быть неточным")

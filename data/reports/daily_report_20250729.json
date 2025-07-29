@@ -1,0 +1,23 @@
+{
+  "date": "2025-07-29",
+  "uptime_hours": 0.5053212830755446,
+  "total_cycles": 283,
+  "trades_made": 0,
+  "profitable_trades": 0,
+  "daily_pnl": 0.0,
+  "errors_today": 0,
+  "avg_cycle_time": 0,
+  "positions": {
+    "DOGE": {
+      "quantity": 17.843684032030918,
+      "avg_price": 0.20246717809658707,
+      "total_cost": 3.6127603528124306,
+      "last_updated": "2025-07-29T18:01:44.992048",
+      "trades_count": 15
+    }
+  },
+  "max_drawdown": 0.0,
+  "active_stop_losses": 0,
+  "win_rate": 0,
+  "avg_profit_per_trade": 0
+}

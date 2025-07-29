@@ -1,16 +1,16 @@
 {
   "version": "1.0",
-  "timestamp": "2025-07-28T23:31:35.799790",
+  "timestamp": "2025-07-29T18:31:45.417238",
   "config": {
     "currency_1": "DOGE",
     "currency_2": "EUR"
   },
   "positions": {
     "DOGE": {
-      "quantity": 27.444294,
-      "avg_price": 0.20624017,
-      "total_cost": 5.6601,
-      "last_updated": "2025-07-28T23:31:35.799315",
+      "quantity": 22.600593701942024,
+      "avg_price": 0.20064506930023573,
+      "total_cost": 4.534697689552629,
+      "last_updated": "2025-07-29T18:31:45.416949",
       "trades": [
         {
           "date": "2025-07-13T23:34:39",
@@ -110,6 +110,51 @@
           "price": 0.20067808,
           "amount": 1.05635799,
           "commission": 0.00316907
+        },
+        {
+          "date": "2025-07-28T23:31:36",
+          "timestamp": 1753738296,
+          "type": "sell",
+          "quantity": 7.03283065,
+          "price": 0.1962469,
+          "amount": 1.38017121,
+          "commission": 0.00414051
+        },
+        {
+          "date": "2025-07-28T23:36:36",
+          "timestamp": 1753738596,
+          "type": "sell",
+          "quantity": 2.57267225,
+          "price": 0.19578188,
+          "amount": 0.5036826,
+          "commission": 0.00151104
+        },
+        {
+          "date": "2025-07-29T09:51:16",
+          "timestamp": 1753775476,
+          "type": "sell",
+          "quantity": 5.0,
+          "price": 0.202516,
+          "amount": 1.01258,
+          "commission": 0.00303774
+        },
+        {
+          "date": "2025-07-29T18:18:29",
+          "timestamp": 1753805909,
+          "type": "buy",
+          "quantity": 5.00489203,
+          "price": 0.19278345,
+          "amount": 0.96486035,
+          "commission": 0.01501467
+        },
+        {
+          "date": "",
+          "timestamp": 1753806705,
+          "type": "buy",
+          "quantity": 4.756909701942024,
+          "price": 0.19066952,
+          "amount": 0.9069976895526288,
+          "commission": 0.0027209930686578863
         }
       ]
     }

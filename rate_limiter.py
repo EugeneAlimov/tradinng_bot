@@ -14,7 +14,6 @@ class APILimits:
     requests_per_minute: int
     requests_per_hour: int
     trading_requests_per_minute: int = 10  # Специальный лимит для торговых операций
-    burst_allowance: int = 5  # Разрешенные всплески
 
 
 class RateLimiter:
@@ -38,10 +37,6 @@ class RateLimiter:
         self.total_waits = 0
         self.total_wait_time = 0.0
         self.last_request_time = 0.0
-
-        # Специальные лимиты
-        self.burst_used = 0
-        self.last_burst_reset = time.time()
 
         self.logger.info("⏱️ Rate Limiter инициализирован")
         self.logger.info(f"   📊 Лимиты: {api_limits.requests_per_second}/сек, {api_limits.requests_per_minute}/мин")
@@ -96,11 +91,6 @@ class RateLimiter:
         # Очищаем торговые запросы старше 1 минуты
         while self.trading_requests and current_time - self.trading_requests[0][0] >= 60.0:
             self.trading_requests.popleft()
-
-        # Сброс burst лимита каждую минуту
-        if current_time - self.last_burst_reset >= 60.0:
-            self.burst_used = 0
-            self.last_burst_reset = current_time
 
     def _calculate_wait_time(self, current_time: float, request_type: str) -> float:
         """⏰ Расчет необходимого времени ожидания"""
@@ -157,25 +147,6 @@ class RateLimiter:
         self.total_requests += 1
         self.last_request_time = current_time
 
-    def can_make_burst_request(self) -> bool:
-        """💥 Проверка возможности выполнить burst запрос"""
-        return self.burst_used < self.limits.burst_allowance
-
-    def use_burst_request(self, request_type: str = 'burst') -> bool:
-        """💨 Использование burst запроса"""
-
-        with self._lock:
-            if not self.can_make_burst_request():
-                return False
-
-            current_time = time.time()
-            self.burst_used += 1
-
-            self._register_request(current_time, request_type)
-
-            self.logger.info(f"💨 Burst запрос: {self.burst_used}/{self.limits.burst_allowance}")
-            return True
-
     def get_stats(self) -> Dict[str, any]:
         """📊 Статистика rate limiter"""
 
@@ -212,8 +183,6 @@ class RateLimiter:
                 'per_minute': load_per_minute,
                 'per_hour': load_per_hour
             },
-            'burst_used': self.burst_used,
-            'burst_available': self.limits.burst_allowance - self.burst_used,
             'limits': {
                 'per_second': self.limits.requests_per_second,
                 'per_minute': self.limits.requests_per_minute,
@@ -253,7 +222,6 @@ class ExmoRateLimiter(RateLimiter):
             requests_per_minute=300,  # EXMO позволяет 600/мин, берем 300
             requests_per_hour=10000,  # EXMO позволяет больше, но лучше ограничить
             trading_requests_per_minute=20,  # Торговые операции еще более ограничены
-            burst_allowance=3  # Небольшой burst для экстренных случаев
         )
 
         super().__init__(exmo_limits)
@@ -377,21 +345,6 @@ class RateLimitedAPIClient:
         self.log_rate_limit_stats()
         if hasattr(self.api, 'close'):
             self.api.close()
-
-
-# Функция для обновления существующего бота
-def upgrade_bot_with_rate_limiting(bot_instance):
-    """🔧 Обновление существующего бота с rate limiting"""
-
-    # Сохраняем оригинальный API клиент
-    original_api = bot_instance.api
-
-    # Заменяем на rate limited версию
-    bot_instance.api = RateLimitedAPIClient(original_api)
-
-    bot_instance.logger.info("🔧 Бот обновлен с rate limiting защитой")
-
-    return bot_instance
 
 
 if __name__ == "__main__":
