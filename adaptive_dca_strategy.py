@@ -28,7 +28,7 @@ class AdaptiveDCAStrategy:
 
         # Настройки стратегии
         self.max_position_percent = 0.56  # Максимум 56% депозита в DOGE
-        self.bottom_purchase_size = 0.08  # 8% депозита на каждую покупку на дне
+        self.bottom_purchase_size = 0.0  # ОТКЛЮЧЕНО ПАТЧЕМ  # 8% депозита на каждую покупку на дне
         self.max_purchases = 7  # Максимум 7 покупок (7*8% = 56%)
 
         # ⚡ УЛЬТРА-БЫСТРЫЕ настройки для определения дна

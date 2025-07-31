@@ -31,9 +31,9 @@ class TradingConfig:
     AUTO_COMMISSION_RATE: float = 0.003  # Дефолт 0.3%, будет обновлено из API
 
     # DCA настройки
-    DCA_ENABLED = True
+    DCA_ENABLED = False #True
     DCA_MAX_PURCHASES = 7  # Максимум 7 покупок на дне
-    DCA_PURCHASE_SIZE = 0.08  # 8% депозита на покупку
+    DCA_PURCHASE_SIZE = 0.0  # 8% депозита на покупку
     DCA_MAX_POSITION = 0.56  # Максимум 56% в позиции
 
     # 🩹 НОВЫЕ настройки системы восстановления убытков
@@ -431,6 +431,42 @@ if __name__ == "__main__":
         if isinstance(value, float) and 0 < value < 1:
             print(f"   {key}: {value * 100:.1f}%")
         elif isinstance(value, bool):
-            print(f"   {key}: {'ВКЛ' if value else 'ВЫКЛ'}")
-        else:
-            print(f"   {key}: {value}")
+            # 🔇 НАСТРОЙКИ ОПТИМИЗИРОВАННОГО ЛОГИРОВАНИЯ
+            QUIET_MODE: bool = True
+            LOG_ONLY_EVENTS: bool = True
+            AGGREGATE_RATE_LIMITS: bool = True
+            LOG_PRICE_CHANGES_THRESHOLD: float = 0.005
+            LOG_PNL_CHANGES_THRESHOLD: float = 0.01
+
+            # 📊 НАСТРОЙКИ АНАЛИЗА ТРЕНДОВ
+            ENABLE_TREND_ANALYSIS: bool = True
+            TREND_DATA_RETENTION_DAYS: int = 30
+            TREND_UPDATE_INTERVAL_MINUTES: int = 10
+
+            # 🎯 НАСТРОЙКИ ЧАСТИЧНОЙ ТОРГОВЛИ
+            ENABLE_PARTIAL_TRADING: bool = True
+            PARTIAL_MIN_LAYER_PROFIT: float = 0.012
+            PARTIAL_MAX_HOLD_DAYS: int = 7
+            PARTIAL_LAYER_TOLERANCE: float = 0.02
+
+    # # 🔇 НАСТРОЙКИ ОПТИМИЗИРОВАННОГО ЛОГИРОВАНИЯ
+    # QUIET_MODE: bool = True
+    # LOG_ONLY_EVENTS: bool = True
+    # AGGREGATE_RATE_LIMITS: bool = True
+    # LOG_PRICE_CHANGES_THRESHOLD: float = 0.005
+    # LOG_PNL_CHANGES_THRESHOLD: float = 0.01
+    #
+    # # 📊 НАСТРОЙКИ АНАЛИЗА ТРЕНДОВ
+    # ENABLE_TREND_ANALYSIS: bool = True
+    # TREND_DATA_RETENTION_DAYS: int = 30
+    # TREND_UPDATE_INTERVAL_MINUTES: int = 10
+    #
+    # # 🎯 НАСТРОЙКИ ЧАСТИЧНОЙ ТОРГОВЛИ
+    # ENABLE_PARTIAL_TRADING: bool = True
+    # PARTIAL_MIN_LAYER_PROFIT: float = 0.012
+    # PARTIAL_MAX_HOLD_DAYS: int = 7
+    # PARTIAL_LAYER_TOLERANCE: float = 0.02
+
+#            print(f"   {key}: {'ВКЛ' if value else 'ВЫКЛ'}")
+#         else:
+#             print(f"   {key}: {value}")
