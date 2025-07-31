@@ -4,16 +4,9 @@
 .idea
 .env
 __pycache__/
-data
+data/
 services/__pycache__/
 trading_bot_recovery.log
 Пары и лимиты для EXMO.txt
 Сколько было денег.txt
-backup_20250730_180927
-backup_20250730_181854
-backup_20250730_194618
-patch_bot.py
-patch_partial_trading.py
-patch_smart_logger.py
-patch_trend_analyzer.py
-bot_backup_192937.py
+

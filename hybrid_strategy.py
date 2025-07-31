@@ -40,14 +40,14 @@ class HybridStrategy:
 
         # 🎯 Настройки гибридной стратегии
         self.enable_smart_dca = True
-        self.dca_drop_threshold = 0.03        # DCA при падении >3%
-        self.dca_max_position_percent = 0.65  # Максимум 65% депозита в позиции
-        self.dca_purchase_size = 0.06         # 6% депозита на DCA докупку
+        self.dca_drop_threshold = 0.06        # DCA при падении >3%
+        self.dca_max_position_percent = 0.50  # Максимум 65% депозита в позиции
+        self.dca_purchase_size = 0.03         # 6% депозита на DCA докупку
         self.adaptive_stop_loss = True
         self.base_stop_loss = 0.18            # Базовый стоп-лосс 18%
 
         # Минимальные интервалы между действиями
-        self.min_time_between_dca = 600       # 10 минут между DCA
+        self.min_time_between_dca = 2400       # 10 минут между DCA
         self.min_time_between_pyramid = 300   # 5 минут между пирамидой
 
         # История действий
