@@ -13,9 +13,7 @@ from analytics_system import TradingAnalytics
 from adaptive_dca_strategy import AdaptiveDCAStrategy
 from trailing_stop import TrailingStopManager
 from pyramid_strategy import SmartPyramidStrategy
-from advanced_trend_filter import AdvancedTrendFilter, TrendDirection
-
-# 🆕 Новые улучшенные компоненты
+from advanced_trend_filter import AdvancedTrendFilter
 from hybrid_strategy import HybridTradeOrchestrator
 from rate_limiter import RateLimitedAPIClient
 from improved_technical_indicators import ImprovedTechnicalIndicators
