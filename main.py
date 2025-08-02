@@ -5,13 +5,45 @@ import sys
 import os
 import argparse
 import asyncio
+
 from pathlib import Path
 
 # Добавляем src в путь
 src_path = Path(__file__).parent / "src"
 sys.path.insert(0, str(src_path))
 
+# Добавляем в main.py новый режим enhanced
+async def run_enhanced_mode(args):
+    """🚀 Запуск улучшенного режима"""
+    print("🚀 Запуск улучшенного режима с новой инфраструктурой...")
+
+    try:
+        from hybrid_bot_enhanced import EnhancedHybridBot
+
+        bot = EnhancedHybridBot()
+        await bot.initialize()
+
+        print("✅ Улучшенный бот инициализирован")
+        print("📊 Дашборд доступен на http://localhost:8080")
+
+        await bot.run()
+
+    except Exception as e:
+        print(f"❌ Ошибка улучшенного режима: {e}")
+        return False
+
+    return True
+
 def parse_arguments():
+    parser = argparse.ArgumentParser(description="🤖 DOGE Trading Bot v4.1-refactored")
+
+    parser.add_argument(
+        '--mode', '-m',
+        choices=['new', 'legacy', 'hybrid', 'enhanced'],  # Добавляем enhanced
+        default='enhanced',  # Меняем по умолчанию
+        help='Режим работы'
+    )
+
     """📋 Парсинг аргументов командной строки"""
     parser = argparse.ArgumentParser(description="🤖 DOGE Trading Bot v4.1-refactored")
 
@@ -145,38 +177,21 @@ async def validate_configuration(args):
         print(f"❌ Ошибка конфигурации: {e}")
         return False
 
-async def main():
-    """🚀 Главная функция"""
-    print("🤖 DOGE TRADING BOT v4.1-refactored")
-    print("=" * 50)
 
+async def main():
     args = parse_arguments()
 
-    print(f"🎯 Режим: {args.mode}")
-    print(f"📊 Профиль: {args.profile}")
-
-    # Валидация конфигурации
     if args.validate:
-        success = await validate_configuration(args)
-        return 0 if success else 1
+        return await validate_configuration(args)
 
-    # Запуск в выбранном режиме
-    try:
-        if args.mode == 'new':
-            success = await run_new_architecture(args)
-        elif args.mode == 'legacy':
-            success = await run_legacy_mode(args)
-        else:  # hybrid
-            success = await run_hybrid_mode(args)
-
-        return 0 if success else 1
-
-    except KeyboardInterrupt:
-        print("\n⌨️ Завершение по запросу пользователя")
-        return 0
-    except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e}")
-        return 1
+    if args.mode == 'new':
+        return await run_new_architecture(args)
+    elif args.mode == 'legacy':
+        return await run_legacy_mode(args)
+    elif args.mode == 'hybrid':
+        return await run_hybrid_mode(args)
+    elif args.mode == 'enhanced':  # Новый режим
+        return await run_enhanced_mode(args)
 
 if __name__ == "__main__":
     exit_code = asyncio.run(main())
