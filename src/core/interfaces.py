@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""🎯 Основные интерфейсы торговой системы"""
+
+from abc import ABC, abstractmethod
+from typing import Protocol, Dict, Any, Optional
+from decimal import Decimal
+
+# Базовые интерфейсы для миграции
+class IExchangeAPI(Protocol):
+    async def get_balance(self, currency: str) -> Decimal: ...
+    async def get_current_price(self, pair: str) -> Decimal: ...
+    async def create_order(self, pair: str, quantity: Decimal, price: Decimal, order_type: str) -> Dict[str, Any]: ...
+
+class ITradingStrategy(ABC):
+    @abstractmethod
+    async def analyze(self, market_data: Dict[str, Any], position: Optional[Dict[str, Any]] = None) -> Dict[str, Any]: ...
+
+class IRiskManager(Protocol):
+    async def assess_risk(self, signal: Dict[str, Any], position: Optional[Dict[str, Any]]) -> Dict[str, Any]: ...
+
+class IPositionManager(Protocol):
+    async def get_position(self, currency: str) -> Optional[Dict[str, Any]]: ...
+    async def update_position(self, trade: Dict[str, Any]) -> None: ...
