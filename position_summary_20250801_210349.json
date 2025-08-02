@@ -1,0 +1,23 @@
+{
+  "timestamp": "2025-08-01T21:03:49.094792",
+  "position_data": {
+    "calculated_quantity": 51.86605299,
+    "avg_price": 0.1732601875,
+    "total_cost": 8.986322065932335
+  },
+  "real_balances": {
+    "DOGE": 51.86605299,
+    "EUR": 8.55332792
+  },
+  "market_data": {
+    "current_price": 0.17831125,
+    "last_updated": "2025-08-01T21:03:49.094802"
+  },
+  "analysis": {
+    "balance_discrepancy": 0.0,
+    "current_value": 9.248300741213137,
+    "total_portfolio_value": 17.801628661213137,
+    "pnl_eur": 0.2619786752808029,
+    "pnl_percent": 2.9153047638252265
+  }
+}

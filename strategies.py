@@ -1,438 +1,359 @@
-from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, Tuple, List
 import logging
 import time
-from config import TradingConfig
-# 🔧 ИСПРАВЛЕНО: заменен импорт
-from improved_technical_indicators import ImprovedTechnicalIndicators
-from services.trade_validator import TradeValidator
+from abc import ABC, abstractmethod
+from typing import Dict, Any, Tuple, Optional
+from dataclasses import dataclass
+from datetime import datetime
 
 
-class TradingStrategy(ABC):
-    def __init__(self, config: TradingConfig, api_service, risk_manager):
+@dataclass
+class TradeSignal:
+    """📊 Торговый сигнал"""
+    action: str  # 'buy', 'sell', 'hold'
+    quantity: float
+    price: float
+    confidence: float  # 0.0 - 1.0
+    reason: str
+    strategy: str
+    timestamp: datetime
+
+
+class BaseStrategy(ABC):
+    """🏗️ Базовая стратегия"""
+    
+    def __init__(self, config, name: str):
         self.config = config
-        self.api_service = api_service  # 🔧 ИСПРАВЛЕНО: используем api_service
-        self.risk_manager = risk_manager
-        self.logger = logging.getLogger(__name__)
-
+        self.name = name
+        self.logger = logging.getLogger(f"{__name__}.{name}")
+        self.last_signal_time = 0
+        self.min_signal_interval = 60  # 60 секунд между сигналами
+    
     @abstractmethod
-    def should_buy(self, market_data: Dict[str, Any]) -> Tuple[bool, float, float]:
-        """Возвращает (should_buy, quantity, price)"""
+    def analyze(self, market_data: Dict[str, Any], position_data: Dict[str, Any]) -> TradeSignal:
+        """Анализ и генерация сигнала"""
         pass
+    
+    def can_generate_signal(self) -> bool:
+        """Проверка возможности генерации сигнала"""
+        return time.time() - self.last_signal_time > self.min_signal_interval
+    
+    def _create_signal(self, action: str, quantity: float, price: float, 
+                      confidence: float, reason: str) -> TradeSignal:
+        """Создание сигнала"""
+        self.last_signal_time = time.time()
+        
+        return TradeSignal(
+            action=action,
+            quantity=quantity,
+            price=price,
+            confidence=confidence,
+            reason=reason,
+            strategy=self.name,
+            timestamp=datetime.now()
+        )
 
-    @abstractmethod
-    def should_sell(self, market_data: Dict[str, Any], position: Dict[str, Any]) -> Tuple[bool, float, float]:
-        """Возвращает (should_sell, quantity, price)"""
-        pass
+
+class PyramidStrategy(BaseStrategy):
+    """🏗️ Пирамидальная стратегия продаж"""
+    
+    def __init__(self, config):
+        super().__init__(config, "pyramid")
+        self.last_sell_time = 0
+        self.cooldown_seconds = 300  # 5 минут между продажами
+        
+    def analyze(self, market_data: Dict[str, Any], position_data: Dict[str, Any]) -> TradeSignal:
+        """🏗️ Анализ пирамидальной продажи"""
+        
+        if not position_data or position_data.get('quantity', 0) == 0:
+            return self._create_signal('hold', 0, 0, 0, 'Нет позиции')
+        
+        current_price = market_data['current_price']
+        avg_price = position_data['avg_price']
+        quantity = position_data['quantity']
+        
+        if avg_price <= 0:
+            return self._create_signal('hold', 0, 0, 0, 'Нет средней цены')
+        
+        profit_percent = (current_price - avg_price) / avg_price
+        
+        # 🚨 Стоп-лосс
+        if profit_percent <= -self.config.STOP_LOSS_PERCENT:
+            return self._create_signal(
+                'sell', quantity, current_price * 1.001, 0.95,
+                f'Стоп-лосс: {profit_percent*100:.1f}%'
+            )
+        
+        # 🛡️ Блокировка продаж в убытке
+        if profit_percent < self.config.MIN_PROFIT_PERCENT:
+            return self._create_signal(
+                'hold', 0, 0, 0.3,
+                f'Удерживаем: прибыль {profit_percent*100:.2f}% < порога {self.config.MIN_PROFIT_PERCENT*100:.1f}%'
+            )
+        
+        # ⏰ Кулдаун
+        if time.time() - self.last_sell_time < self.cooldown_seconds:
+            remaining = (self.cooldown_seconds - (time.time() - self.last_sell_time)) / 60
+            return self._create_signal('hold', 0, 0, 0.2, f'Кулдаун: {remaining:.0f} мин')
+        
+        # 🏗️ Поиск подходящего уровня пирамиды
+        for level in self.config.PYRAMID_LEVELS:
+            if profit_percent >= level['profit']:
+                sell_quantity = quantity * level['sell_percent']
+                profit_eur = sell_quantity * (current_price - avg_price)
+                
+                if profit_eur >= level['min_eur']:
+                    self.last_sell_time = time.time()
+                    return self._create_signal(
+                        'sell', sell_quantity, current_price * 1.002, 0.8,
+                        f'Пирамида: прибыль {profit_percent*100:.1f}% = {profit_eur:.2f} EUR'
+                    )
+        
+        return self._create_signal('hold', 0, 0, 0.4, f'Ждем лучшего уровня: {profit_percent*100:.2f}%')
+
+class DCAStrategy(BaseStrategy):
+    """🛒 DCA стратегия"""
+    
+    def __init__(self, config):
+        super().__init__(config, "dca")
+        self.last_dca_time = 0
+        self.dca_count = 0
+        self.last_dca_date = datetime.now().date()
+        
+    def analyze(self, market_data: Dict[str, Any], position_data: Dict[str, Any]) -> TradeSignal:
+        """🛒 Анализ DCA"""
+        
+        current_price = market_data['current_price']
+        balance = market_data['balance']
+
+        # 🛡️ Проверка DCA лимитов
+        if hasattr(self, 'dca_limiter') and self.dca_limiter:
+            can_dca, reason = self.dca_limiter.can_execute_dca(
+                current_price, position_data, balance
+            )
+            
+            if not can_dca:
+                return self._create_signal('hold', 0, 0, 0.1, f'DCA заблокирована: {reason}')
+        
+        if not position_data or position_data.get('quantity', 0) == 0:
+            return self._create_signal('hold', 0, 0, 0.1, 'Нет позиции для DCA')
+        
+        avg_price = position_data['avg_price']
+        current_value = position_data['quantity'] * current_price
+        
+        if avg_price <= 0:
+            return self._create_signal('hold', 0, 0, 0.1, 'Нет средней цены')
+        
+        # Проверяем дневной лимит
+        today = datetime.now().date()
+        if today != self.last_dca_date:
+            self.dca_count = 0
+            self.last_dca_date = today
+        
+        if self.dca_count >= self.config.DCA_DAILY_LIMIT:
+            return self._create_signal('hold', 0, 0, 0.1, f'DCA лимит: {self.dca_count}/{self.config.DCA_DAILY_LIMIT}')
+        
+        # Проверяем кулдаун
+        cooldown_seconds = self.config.DCA_COOLDOWN_MINUTES * 60
+        if time.time() - self.last_dca_time < cooldown_seconds:
+            remaining = (cooldown_seconds - (time.time() - self.last_dca_time)) / 60
+            return self._create_signal('hold', 0, 0, 0.2, f'DCA кулдаун: {remaining:.0f} мин')
+        
+        # Проверяем падение
+        drop_percent = (avg_price - current_price) / avg_price
+        if drop_percent < self.config.DCA_DROP_THRESHOLD:
+            return self._create_signal(
+                'hold', 0, 0, 0.3,
+                f'Малое падение: {drop_percent*100:.1f}% < {self.config.DCA_DROP_THRESHOLD*100:.0f}%'
+            )
+        
+        # Проверяем лимит позиции
+        dca_amount = balance * self.config.DCA_PURCHASE_SIZE
+        new_total_value = current_value + dca_amount
+        new_position_percent = new_total_value / (balance + new_total_value)
+        
+        if new_position_percent > self.config.DCA_MAX_POSITION:
+            return self._create_signal(
+                'hold', 0, 0, 0.2,
+                f'Лимит позиции: {new_position_percent*100:.0f}% > {self.config.DCA_MAX_POSITION*100:.0f}%'
+            )
+        
+        # ✅ DCA разрешена
+        if balance < dca_amount:
+            return self._create_signal('hold', 0, 0, 0.1, f'Недостаточно баланса: {balance:.2f} < {dca_amount:.2f}')
+        
+        dca_quantity = dca_amount / current_price
+        self.last_dca_time = time.time()
+        self.dca_count += 1
+        
+        return self._create_signal(
+            'buy', dca_quantity, current_price * 0.9995, 0.7,
+            f'DCA: падение {drop_percent*100:.1f}%, размер {self.config.DCA_PURCHASE_SIZE*100:.0f}%'
+        )
 
 
-class MeanReversionStrategy(TradingStrategy):
-    def __init__(self, config: TradingConfig, api_service, risk_manager, position_manager):
-        super().__init__(config, api_service, risk_manager)
-        self.recent_prices = []
+class StrategyManager:
+    """🎯 Менеджер стратегий"""
+    
+    def __init__(self, config, api_service, position_manager):
+        self.config = config
+        self.api_service = api_service
         self.position_manager = position_manager
-
-        # 🔧 ИСПРАВЛЕНО: используем новый класс индикаторов
-        self.indicators = ImprovedTechnicalIndicators()
-
-        # 🔧 ДОБАВЛЕНО: используем новый валидатор
-        self.trade_validator = TradeValidator(config)
-
-        # 🛡️ КОНСЕРВАТИВНЫЕ параметры
-        self.min_data_points = self.config.MIN_DATA_POINTS
-        self.last_trade_time = 0
-        self.min_time_between_trades = self.config.MIN_TIME_BETWEEN_TRADES
-
-        # 📊 Счетчики для статистики
-        self.trade_count_today = 0
-        self.last_trade_reset = time.time()
-
-        # 🚫 ОТКЛЮЧАЕМ принудительную торговлю
-        if self.config.FORCE_TRADE_DISABLED:
-            self.logger.info("🛡️  Принудительная торговля ОТКЛЮЧЕНА")
-
-    def _update_prices(self, current_price: float):
-        """📊 Обновление списка цен"""
-        self.recent_prices.append(current_price)
-        if len(self.recent_prices) > self.config.VOLATILITY_PERIOD:
-            self.recent_prices.pop(0)
-
-    def get_average_price(self) -> float:
-        """📊 Получение средней цены"""
-        if not self.recent_prices:
-            return 0.0
-        return sum(self.recent_prices) / len(self.recent_prices)
-
-    def _check_trade_limits(self) -> Tuple[bool, str]:
-        """🚫 Проверка лимитов на торговлю"""
-        current_time = time.time()
-
-        # Сброс счетчика в новом дне
-        if current_time - self.last_trade_reset > 86400:  # 24 часа
-            self.trade_count_today = 0
-            self.last_trade_reset = current_time
-
-        # Проверка лимита сделок в час
-        if hasattr(self.config, 'MAX_TRADES_PER_HOUR'):
-            # Простая проверка - не более 2 сделок в час
-            if current_time - self.last_trade_time < 1800:  # 30 минут
-                remaining = 1800 - (current_time - self.last_trade_time)
-                return False, f"Кулдаун между сделками: {remaining / 60:.0f} мин"
-
-        # Проверка минимального времени между сделками
-        if current_time - self.last_trade_time < self.min_time_between_trades:
-            remaining = self.min_time_between_trades - (current_time - self.last_trade_time)
-            return False, f"Минимальный интервал: {remaining / 60:.0f} мин"
-
-        return True, "OK"
-
-    def _analyze_market_conditions(self, current_price: float) -> Dict[str, Any]:
-        """📊 Комплексный анализ рынка с улучшенными фильтрами"""
-        if len(self.recent_prices) < self.min_data_points:
+        self.logger = logging.getLogger(__name__)
+        
+        # Создаем стратегии
+        self.pyramid_strategy = PyramidStrategy(config)
+        self.dca_strategy = DCAStrategy(config)
+        
+        # Приоритеты (чем выше, тем важнее)
+        self.strategy_priorities = {
+            'pyramid': 100,  # Продажа всегда приоритетнее
+            'dca': 50        # DCA менее приоритетна
+        }
+        
+    def execute_cycle(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
+        """🔄 Торговый цикл"""
+        
+        try:
+            # Получаем позицию
+            position_data = self.position_manager.get_accurate_position_data(self.config.CURRENCY_1)
+            
+            # Получаем сигналы
+            signals = []
+            
+            pyramid_signal = self.pyramid_strategy.analyze(market_data, position_data)
+            if pyramid_signal.action != 'hold':
+                signals.append(pyramid_signal)
+            
+            dca_signal = self.dca_strategy.analyze(market_data, position_data)
+            if dca_signal.action != 'hold':
+                signals.append(dca_signal)
+            
+            # Если нет сигналов - держим
+            if not signals:
+                return {
+                    'action': 'hold',
+                    'reason': 'Нет торговых сигналов',
+                    'success': True,
+                    'trade_executed': False
+                }
+            
+            # Выбираем сигнал с наивысшим приоритетом
+            best_signal = max(signals, key=lambda s: self.strategy_priorities.get(s.strategy, 0))
+            
+            # Логируем решение
+            self.logger.info(f"🎯 Выбран сигнал: {best_signal.strategy}")
+            self.logger.info(f"   Действие: {best_signal.action}")
+            self.logger.info(f"   Причина: {best_signal.reason}")
+            self.logger.info(f"   Уверенность: {best_signal.confidence:.0%}")
+            
+            # Исполняем сигнал
+            if best_signal.action == 'buy':
+                return self._execute_buy(best_signal)
+            elif best_signal.action == 'sell':
+                return self._execute_sell(best_signal)
+            
             return {
-                'ready': False,
-                'reason': f'Накапливаем данные: {len(self.recent_prices)}/{self.min_data_points}',
-                'data_points': len(self.recent_prices)
+                'action': 'hold',
+                'reason': best_signal.reason,
+                'success': True,
+                'trade_executed': False
             }
-
-        # Базовые показатели
-        sma_short = self.indicators.sma(self.recent_prices, 10)
-        sma_long = self.indicators.sma(self.recent_prices, 20) if len(self.recent_prices) >= 20 else sma_short
-        ema = self.indicators.ema(self.recent_prices, 12)
-        rsi = self.indicators.rsi(self.recent_prices)
-
-        # Полосы Боллинджера
-        bb_upper, bb_middle, bb_lower = self.indicators.bollinger_bands(self.recent_prices)
-
-        # Волатильность
-        volatility = self.risk_manager.calculate_volatility(self.recent_prices)
-
-        # 🚫 СТРОГАЯ проверка волатильности
-        if volatility < self.config.MIN_VOLATILITY_THRESHOLD:
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка торгового цикла: {e}")
             return {
-                'ready': False,
-                'reason': f'Низкая волатильность: {volatility:.4f} < {self.config.MIN_VOLATILITY_THRESHOLD:.4f}',
-                'volatility': volatility
+                'action': 'error',
+                'reason': str(e),
+                'success': False,
+                'trade_executed': False
             }
-
-        # Тренд
-        trend_strength = (sma_short - sma_long) / sma_long if sma_long > 0 else 0
-
-        # Позиция относительно Боллинджера
-        bb_position = (current_price - bb_lower) / (bb_upper - bb_lower) if bb_upper != bb_lower else 0.5
-
-        return {
-            'ready': True,
-            'current_price': current_price,
-            'sma_short': sma_short,
-            'sma_long': sma_long,
-            'ema': ema,
-            'rsi': rsi,
-            'bb_upper': bb_upper,
-            'bb_middle': bb_middle,
-            'bb_lower': bb_lower,
-            'bb_position': bb_position,
-            'volatility': volatility,
-            'trend_strength': trend_strength,
-            'data_points': len(self.recent_prices)
-        }
-
-    def _calculate_conservative_buy_price(self, current_price: float, analysis: Dict, signal_strength: int) -> float:
-        """💰 Консервативное ценообразование для покупки"""
-
-        volatility = analysis.get('volatility', 0.002)
-
-        # Базовый спред увеличен для прибыльности
-        base_spread = self.config.BASE_PROFIT_MARKUP
-
-        # Адаптация к волатильности (консервативная)
-        volatility_multiplier = min(1.5, max(0.8, volatility * 50))
-        adaptive_spread = base_spread * volatility_multiplier
-
-        # Корректировка на силу сигнала (более консервативная)
-        if signal_strength >= 4:
-            # Очень сильный сигнал - небольшая скидка
-            price_adjustment = -adaptive_spread * 0.3
-            signal_desc = "ОЧЕНЬ СИЛЬНЫЙ"
-        elif signal_strength >= 3:
-            # Сильный сигнал - средняя скидка
-            price_adjustment = -adaptive_spread * 0.5
-            signal_desc = "СИЛЬНЫЙ"
-        elif signal_strength >= 2:
-            # Средний сигнал - обычная скидка
-            price_adjustment = -adaptive_spread * 0.7
-            signal_desc = "СРЕДНИЙ"
-        else:
-            # Слабый сигнал - большая скидка
-            price_adjustment = -adaptive_spread * 1.0
-            signal_desc = "СЛАБЫЙ"
-
-        buy_price = current_price * (1 + price_adjustment)
-
-        # Первое ограничение: MAX_PRICE_DEVIATION из конфига
-        max_discount_config = self.config.MAX_PRICE_DEVIATION
-        min_buy_price_config = current_price * (1 - max_discount_config)
-        buy_price = max(buy_price, min_buy_price_config)
-
-        # 🎯 ВТОРОЕ ОГРАНИЧЕНИЕ: Специально для DOGE (более строгое)
-        max_allowed_discount_percent = 0.0015  # 0.15% максимум для DOGE
-        min_allowed_price = current_price * (1 - max_allowed_discount_percent)
-
-        if buy_price < min_allowed_price:
-            old_discount_percent = (current_price - buy_price) / current_price * 100
-            buy_price = min_allowed_price
-            new_discount_percent = (current_price - buy_price) / current_price * 100
-
-            self.logger.info(f"🔧 ОГРАНИЧЕНИЕ СКИДКИ ДЛЯ DOGE:")
-            self.logger.info(f"   Расчетная скидка: {old_discount_percent:.2f}%")
-            self.logger.info(f"   Ограничена до: {new_discount_percent:.2f}%")
-            self.logger.info(f"   Причина: DOGE требует малых скидок для исполнения")
-
-        # Финальное логирование
-        self.logger.info(f"💰 Ценообразование покупки:")
-        self.logger.info(f"   Сигнал: {signal_desc} ({signal_strength} баллов)")
-        self.logger.info(f"   Волатильность: {volatility:.4f}, множитель: {volatility_multiplier:.2f}")
-        self.logger.info(f"   Базовый спред: {base_spread:.4f}, адаптивный: {adaptive_spread:.4f}")
-        self.logger.info(f"   Корректировка: {price_adjustment:+.4f} ({price_adjustment * 100:+.2f}%)")
-        self.logger.info(
-            f"   Финальная цена: {buy_price:.8f} (скидка {((current_price - buy_price) / current_price * 100):.2f}%)")
-
-        return buy_price
-
-    def should_buy(self, market_data: Dict[str, Any]) -> Tuple[bool, float, float]:
-        """🛒 КОНСЕРВАТИВНАЯ логика покупки"""
-        current_price = market_data.get('current_price', 0.0)
-        balance = market_data.get('balance', 0.0)
-
-        self._update_prices(current_price)
-
-        if len(self.recent_prices) >= 10:
-            self._debug_rsi_issues(self.recent_prices)
-
-        # 🚫 Проверка лимитов торговли
-        can_trade, limit_reason = self._check_trade_limits()
-        if not can_trade:
-            self.logger.info(f"⏸️  {limit_reason}")
-            return False, 0.0, 0.0
-
-        # 📊 Анализ рынка
-        analysis = self._analyze_market_conditions(current_price)
-
-        if not analysis['ready']:
-            self.logger.info(f"⏸️  {analysis['reason']}")
-            return False, 0.0, 0.0
-
-        self.logger.info(f"📊 Технический анализ:")
-        self.logger.info(f"   💹 RSI: {analysis['rsi']:.1f}")
-        self.logger.info(f"   📏 Bollinger позиция: {analysis['bb_position']:.2f}")
-        self.logger.info(f"   📈 Тренд: {analysis['trend_strength']:+.3f}")
-        self.logger.info(f"   🌊 Волатильность: {analysis['volatility']:.4f}")
-
-        # 🎯 СТРОГИЕ условия для покупки
-        conditions = {
-            'deeply_oversold': analysis['rsi'] < 30,  # Глубоко перепродан
-            'very_low_bb': analysis['bb_position'] < 0.2,  # В нижних 20% Bollinger
-            'below_ema': current_price < analysis['ema'] * 0.995,  # Ниже EMA на 0.5%+
-            'downtrend': analysis['trend_strength'] < -0.005,  # Четкий нисходящий тренд
-            'sufficient_volatility': analysis['volatility'] > self.config.MIN_VOLATILITY_THRESHOLD,
-            'strong_dip': current_price < analysis['sma_short'] * 0.99  # Ниже короткой MA на 1%+
-        }
-
-        # Логируем каждое условие
-        met_conditions = []
-        for condition_name, is_met in conditions.items():
-            status = "✅" if is_met else "❌"
-            self.logger.info(f"   {status} {condition_name}")
-            if is_met:
-                met_conditions.append(condition_name)
-
-        conditions_met = len(met_conditions)
-
-        # 🚫 ТРЕБУЕМ МИНИМУМ 3 УСЛОВИЯ для покупки
-        if conditions_met < 2:  # 3:
-            self.logger.info(f"⏸️  Недостаточно условий для покупки: {conditions_met}/6")
-            self.logger.info(f"💡 Нужно минимум 2 условия для безопасной покупки")
-            return False, 0.0, 0.0
-
-        # 💰 Рассчитываем цену и количество
-        buy_price = self._calculate_conservative_buy_price(current_price, analysis, conditions_met)
-        max_spend = balance * self.config.MAX_POSITION_SIZE
-        quantity = max_spend / buy_price
-
-        # 🛡️ Валидация прибыльности
-        is_profitable, profit_reason = self.trade_validator.validate_profitability('buy', buy_price, quantity)
-        if not is_profitable:
-            self.logger.warning(f"🚫 Покупка отменена: {profit_reason}")
-            return False, 0.0, 0.0
-
-        self.logger.info(f"🎯 СИГНАЛ ПОКУПКИ!")
-        self.logger.info(f"   Условий выполнено: {conditions_met}/6: {', '.join(met_conditions)}")
-        self.logger.info(f"   Планируем купить: {quantity:.4f} по {buy_price:.8f}")
-        self.logger.info(f"   Сумма: {max_spend:.2f} EUR ({self.config.MAX_POSITION_SIZE * 100:.0f}% от баланса)")
-        self.logger.info(f"   Скидка от рынка: {((current_price - buy_price) / current_price * 100):.2f}%")
-
-        if self.risk_manager.can_open_position(max_spend, balance):
-            self.last_trade_time = time.time()
-            self.trade_count_today += 1
-            return True, quantity, buy_price
-        else:
-            self.logger.warning("🚫 Риск-менеджер запретил открытие позиции")
-
-        return False, 0.0, 0.0
-
-    def should_sell(self, market_data: Dict[str, Any], position: Dict[str, Any]) -> Tuple[bool, float, float]:
-        """💎 КОНСЕРВАТИВНАЯ логика продажи с защитой от убытков"""
-        current_price = market_data.get('current_price', 0.0)
-        quantity = position.get('quantity', 0.0)
-
-        if not quantity:
-            return False, 0.0, 0.0
-
-        # 🚫 Проверка лимитов торговли
-        can_trade, limit_reason = self._check_trade_limits()
-        if not can_trade:
-            self.logger.info(f"⏸️  {limit_reason}")
-            return False, 0.0, 0.0
-
-        # Получаем реальную позицию из истории торгов
-        real_position = self.position_manager.get_position(self.config.CURRENCY_1)
-        if not real_position:
-            self.logger.warning("❓ Нет данных о позиции в истории торгов")
-            return False, 0.0, 0.0
-
-        position_price = real_position.avg_price
-        quantity = min(quantity, real_position.quantity)
-
-        # Рассчитываем потенциальную прибыль
-        potential_profit = (current_price - position_price) / position_price
-
-        self.logger.info(f"💎 Анализ продажи:")
-        self.logger.info(f"   Цена покупки: {position_price:.8f}")
-        self.logger.info(f"   Текущая цена: {current_price:.8f}")
-        self.logger.info(f"   Потенциальная прибыль: {potential_profit * 100:+.2f}%")
-        self.logger.info(f"   Количество: {quantity:.6f}")
-
-        # 🚨 ЭКСТРЕННЫЙ СТОП-ЛОСС
-        stop_loss_threshold = -self.config.STOP_LOSS_PERCENT
-        if potential_profit <= stop_loss_threshold:
-            loss_percent = potential_profit * 100
-            self.logger.error(f"🚨 СТОП-ЛОСС! Убыток: {loss_percent:.2f}%")
-            sell_price = current_price * 0.999  # Продаем немного ниже рынка для быстрого исполнения
-            self.last_trade_time = time.time()
-            return True, quantity, sell_price
-
-        # 🚫 НЕ ПРОДАЕМ при недостаточной прибыли
-        if potential_profit < self.config.MIN_PROFIT_TO_SELL:
-            self.logger.info(
-                f"⏸️  Держим позицию: прибыль {potential_profit * 100:.2f}% < порога {self.config.MIN_PROFIT_TO_SELL * 100:.1f}%")
-            return False, 0.0, 0.0
-
-        # 📊 Получаем технический анализ
-        analysis = self._analyze_market_conditions(current_price)
-
-        if not analysis['ready']:
-            # Если нет достаточных данных для анализа, но прибыль большая - продаем
-            if potential_profit >= self.config.FAST_PROFIT_THRESHOLD / 100:
-                self.logger.info(f"💎 БЫСТРАЯ ПРОДАЖА! Отличная прибыль: {potential_profit * 100:.2f}%")
-                sell_price = current_price * 0.9998
-                self.last_trade_time = time.time()
-                return True, quantity, sell_price
-            return False, 0.0, 0.0
-
-        # 🎯 БЫСТРАЯ ПРОДАЖА при отличной прибыли
-        if potential_profit >= self.config.FAST_PROFIT_THRESHOLD / 100:
-            self.logger.info(f"💎 БЫСТРАЯ ПРОДАЖА! Отличная прибыль: {potential_profit * 100:.2f}%")
-            sell_price = current_price * 0.9998  # Продаем близко к рынку
-
-            # Валидация прибыльности
-            is_profitable, profit_reason = self.trade_validator.validate_profitability('sell', sell_price, quantity, position_price)
-            if is_profitable:
-                self.last_trade_time = time.time()
-                return True, quantity, sell_price
+    
+    def _execute_buy(self, signal: TradeSignal) -> Dict[str, Any]:
+        """🛒 Исполнение покупки"""
+        try:
+            result = self.api_service.create_order(
+                self.config.get_pair(), signal.quantity, signal.price, 'buy'
+            )
+            
+            if result.get('result'):
+                # Обновляем позицию
+                trade_info = {
+                    'type': 'buy',
+                    'quantity': signal.quantity,
+                    'price': signal.price,
+                    'timestamp': int(time.time())
+                }
+                self.position_manager.update_position(self.config.CURRENCY_1, trade_info)
+                
+                self.logger.info(f"✅ {signal.strategy} покупка: {signal.quantity:.4f} по {signal.price:.8f}")
+                
+                return {
+                    'action': f'{signal.strategy}_buy',
+                    'reason': signal.reason,
+                    'success': True,
+                    'trade_executed': True,
+                    'quantity': signal.quantity,
+                    'price': signal.price
+                }
             else:
-                self.logger.warning(f"🚫 Быстрая продажа отменена: {profit_reason}")
-
-        # 📊 ТЕХНИЧЕСКИЙ АНАЛИЗ для обычных продаж
-        self.logger.info(f"📊 Технический анализ для продажи:")
-        self.logger.info(f"   💹 RSI: {analysis['rsi']:.1f}")
-        self.logger.info(f"   📏 Bollinger позиция: {analysis['bb_position']:.2f}")
-        self.logger.info(f"   📈 vs EMA: {(current_price / analysis['ema'] - 1) * 100:+.2f}%")
-        self.logger.info(f"   🌊 Волатильность: {analysis['volatility']:.4f}")
-
-        # 🎯 СТРОГИЕ условия продажи
-        sell_conditions = {
-            'good_profit': potential_profit >= self.config.MIN_PROFIT_TO_SELL,
-            'overbought_rsi': analysis['rsi'] > 70,  # Строже: 70 вместо 55
-            'high_bb_position': analysis['bb_position'] > 0.8,  # Строже: 80% вместо 65%
-            'above_ema': current_price > analysis['ema'] * 1.01,  # Строже: +1% вместо +0.03%
-            'uptrend': analysis['trend_strength'] > 0.005,  # Восходящий тренд
-        }
-
-        # Логируем условия продажи
-        met_sell_conditions = []
-        for condition_name, is_met in sell_conditions.items():
-            status = "✅" if is_met else "❌"
-            self.logger.info(f"   {status} {condition_name}")
-            if is_met:
-                met_sell_conditions.append(condition_name)
-
-        sell_conditions_met = len(met_sell_conditions)
-
-        # 🚫 ТРЕБУЕМ МИНИМУМ 3 УСЛОВИЯ для продажи (кроме быстрой прибыли)
-        if sell_conditions_met < 3:
-            self.logger.info(f"⏸️  Недостаточно условий для продажи: {sell_conditions_met}/5")
-            self.logger.info(f"💎 Держим позицию, ждем лучших условий")
-            return False, 0.0, 0.0
-
-        # 💰 Рассчитываем цену продажи с достаточной надбавкой
-        volatility = analysis['volatility']
-        spread_multiplier = max(1.0, min(2.0, volatility * 100))  # От 1x до 2x от волатильности
-        spread = self.config.MIN_SPREAD * spread_multiplier
-
-        sell_price = current_price * (1 + spread)
-
-        # 🛡️ Валидация прибыльности
-        is_profitable, profit_reason = self.trade_validator.validate_profitability('sell', sell_price, quantity, position_price)
-        if not is_profitable:
-            self.logger.warning(f"🚫 Продажа отменена: {profit_reason}")
-            return False, 0.0, 0.0
-
-        final_profit = (sell_price - position_price) / position_price
-
-        self.logger.info(f"🎯 СИГНАЛ ПРОДАЖИ!")
-        self.logger.info(f"   Условий выполнено: {sell_conditions_met}/5: {', '.join(met_sell_conditions)}")
-        self.logger.info(f"   Цена продажи: {sell_price:.8f} (+{spread * 100:.2f}% к рынку)")
-        self.logger.info(f"   Финальная прибыль: {final_profit * 100:+.2f}%")
-
-        self.last_trade_time = time.time()
-        self.trade_count_today += 1
-        return True, quantity, sell_price
-
-    # 🔧 ИСПРАВЛЕННЫЙ метод отладки RSI
-    def _debug_rsi_issues(self, prices: List[float]):
-        """🔍 Отладка проблем с RSI"""
-
-        if len(prices) >= 10:
-            # 🔧 ИСПРАВЛЕНО: используем новый метод rsi_with_validation
-            rsi_value, validation_info = self.indicators.rsi_with_validation(prices)
-
-            # Проверяем есть ли ошибка
-            if 'error' in validation_info:
-                self.logger.info(f"🔍 RSI ДИАГНОСТИКА: {validation_info['error']}")
-                return
-
-            self.logger.info(f"🔍 RSI ДИАГНОСТИКА:")
-            self.logger.info(f"   📊 Точек данных: {validation_info.get('prices_count', 0)}")
-            self.logger.info(f"   📈 Диапазон цен: {validation_info.get('price_range', 0):.6f}")
-            self.logger.info(f"   🔄 Среднее изменение: {validation_info.get('avg_change', 0):.6f}")
-            self.logger.info(f"   🌊 Макс. изменение: {validation_info.get('max_change', 0):.6f}")
-            self.logger.info(f"   💹 RSI: {rsi_value:.1f}")
-
-            # Дополнительная информация
-            if 'calculation_method' in validation_info:
-                self.logger.info(f"   🔧 Метод расчета: {validation_info['calculation_method']}")
-
-            if validation_info.get('sufficient_data', True):
-                self.logger.info(f"   ✅ Достаточно данных для расчета")
+                self.logger.error(f"❌ Ошибка покупки: {result}")
+                return {
+                    'action': 'buy_failed',
+                    'reason': f'API ошибка: {result}',
+                    'success': False,
+                    'trade_executed': False
+                }
+                
+        except Exception as e:
+            self.logger.error(f"❌ Исключение при покупке: {e}")
+            return {
+                'action': 'buy_error',
+                'reason': str(e),
+                'success': False,
+                'trade_executed': False
+            }
+    
+    def _execute_sell(self, signal: TradeSignal) -> Dict[str, Any]:
+        """💎 Исполнение продажи"""
+        try:
+            result = self.api_service.create_order(
+                self.config.get_pair(), signal.quantity, signal.price, 'sell'
+            )
+            
+            if result.get('result'):
+                # Обновляем позицию
+                trade_info = {
+                    'type': 'sell',
+                    'quantity': signal.quantity,
+                    'price': signal.price,
+                    'timestamp': int(time.time())
+                }
+                self.position_manager.update_position(self.config.CURRENCY_1, trade_info)
+                
+                self.logger.info(f"✅ {signal.strategy} продажа: {signal.quantity:.4f} по {signal.price:.8f}")
+                
+                return {
+                    'action': f'{signal.strategy}_sell',
+                    'reason': signal.reason,
+                    'success': True,
+                    'trade_executed': True,
+                    'quantity': signal.quantity,
+                    'price': signal.price
+                }
             else:
-                self.logger.info(f"   ❌ Недостаточно данных, результат может быть неточным")
+                self.logger.error(f"❌ Ошибка продажи: {result}")
+                return {
+                    'action': 'sell_failed',
+                    'reason': f'API ошибка: {result}',
+                    'success': False,
+                    'trade_executed': False
+                }
+                
+        except Exception as e:
+            self.logger.error(f"❌ Исключение при продаже: {e}")
+            return {
+                'action': 'sell_error',
+                'reason': str(e),
+                'success': False,
+                'trade_executed': False
+            }

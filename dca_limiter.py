@@ -1,188 +1,166 @@
 # dca_limiter.py
-"""
-🛡️ ПАТЧ 2: Ограничитель DCA покупок
-Предотвращает бесконечное усреднение убыточных позиций
-"""
+"""🛡️ Ограничитель DCA покупок для предотвращения бесконечного усреднения"""
 
 import time
 import logging
-from typing import Dict, Any, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime
+from typing import Dict, Any, Tuple
 
 
 class DCALimiter:
-    """🛡️ Умный ограничитель DCA операций"""
+    """🛡️ Умный ограничитель DCA покупок"""
     
     def __init__(self, config):
         self.config = config
         self.logger = logging.getLogger(__name__)
         
         # 🛡️ Лимиты DCA
-        self.MAX_CONSECUTIVE_DCA = 3        # Максимум 3 DCA подряд
-        self.MAX_DCA_PER_DAY = 5           # Максимум 5 DCA в день
-        self.MIN_INTERVAL_BETWEEN_DCA = 1800  # 30 минут между DCA
-        self.MAX_POSITION_SIZE_WITH_DCA = 0.65  # 65% депозита максимум
+        self.MAX_DCA_PER_DAY = getattr(config, 'DCA_MAX_PER_DAY', 5)
+        self.MAX_CONSECUTIVE_DCA = getattr(config, 'DCA_MAX_CONSECUTIVE', 3)
+        self.MIN_DCA_INTERVAL_MINUTES = getattr(config, 'DCA_MIN_INTERVAL_MINUTES', 30)
+        self.LOSS_BLOCK_THRESHOLD = getattr(config, 'DCA_LOSS_BLOCK_THRESHOLD', 0.08)
         
-        # 📚 История DCA операций
-        self.dca_history = []
+        # 📊 Отслеживание DCA
+        self.daily_dca_count = 0
+        self.consecutive_dca_count = 0
+        self.last_dca_date = None
         self.last_dca_time = 0
+        self.last_successful_sell_time = 0
         
-        # 🚨 Блокировка при плохих условиях
-        self.blocked_until = 0
+        # 🚫 Состояние блокировки
+        self.is_blocked = False
         self.block_reason = ""
+        self.block_until = 0
         
         self.logger.info("🛡️ DCALimiter инициализирован")
-        self.logger.info(f"   📊 Максимум подряд: {self.MAX_CONSECUTIVE_DCA}")
-        self.logger.info(f"   📅 Максимум в день: {self.MAX_DCA_PER_DAY}")
-        self.logger.info(f"   ⏰ Интервал: {self.MIN_INTERVAL_BETWEEN_DCA//60} минут")
+        self.logger.info(f"   📊 Макс DCA в день: {self.MAX_DCA_PER_DAY}")
+        self.logger.info(f"   🔗 Макс подряд: {self.MAX_CONSECUTIVE_DCA}")
     
-    def can_execute_dca(self, current_price: float, position_data: Dict[str, Any],
-                       balance_info: Dict[str, Any]) -> Tuple[bool, str]:
-        """🛡️ Проверка возможности выполнения DCA"""
+    def can_execute_dca(self, current_price: float, position_data: Dict[str, Any], 
+                       balance: float) -> Tuple[bool, str]:
+        """🛡️ Основная проверка возможности выполнения DCA"""
         
-        # 🚨 Проверка временной блокировки
-        if time.time() < self.blocked_until:
-            remaining = (self.blocked_until - time.time()) / 60
-            return False, f"DCA заблокирован: {self.block_reason} (осталось {remaining:.0f}мин)"
-        
-        # ⏰ Проверка минимального интервала
-        time_since_last = time.time() - self.last_dca_time
-        if time_since_last < self.MIN_INTERVAL_BETWEEN_DCA:
-            remaining = (self.MIN_INTERVAL_BETWEEN_DCA - time_since_last) / 60
-            return False, f"Слишком рано для DCA (осталось {remaining:.0f}мин)"
-        
-        # 📊 Проверка количества подряд идущих DCA
-        consecutive_count = self._count_consecutive_dca()
-        if consecutive_count >= self.MAX_CONSECUTIVE_DCA:
-            return False, f"Достигнут лимит DCA подряд: {consecutive_count}/{self.MAX_CONSECUTIVE_DCA}"
-        
-        # 📅 Проверка дневного лимита
-        daily_count = self._count_daily_dca()
-        if daily_count >= self.MAX_DCA_PER_DAY:
-            return False, f"Достигнут дневной лимит DCA: {daily_count}/{self.MAX_DCA_PER_DAY}"
-        
-        # 💰 Проверка размера позиции
-        if position_data and 'quantity' in position_data:
-            current_position_value = position_data['quantity'] * current_price
-            total_balance = balance_info.get('total_value', 0)
+        try:
+            # Сброс дневных счетчиков
+            self._reset_daily_counters_if_needed()
             
-            if total_balance > 0:
-                position_percentage = current_position_value / total_balance
-                if position_percentage >= self.MAX_POSITION_SIZE_WITH_DCA:
-                    return False, f"Позиция слишком большая: {position_percentage*100:.1f}% >= {self.MAX_POSITION_SIZE_WITH_DCA*100:.0f}%"
-        
-        # 📈 Проверка тренда (если есть убыток > 8%, блокируем DCA)
-        if position_data and 'avg_price' in position_data:
-            avg_price = position_data['avg_price']
-            loss_percent = (current_price - avg_price) / avg_price
+            # Проверка временной блокировки
+            if self._is_temporarily_blocked():
+                return False, f"Временная блокировка: {self.block_reason}"
             
-            if loss_percent <= -0.08:  # Убыток больше 8%
-                # Временная блокировка на 2 часа
-                self._block_dca_temporarily(2 * 3600, f"Большой убыток: {loss_percent*100:.1f}%")
-                return False, f"DCA заблокирован из-за большого убытка: {loss_percent*100:.1f}%"
-        
-        return True, "DCA разрешена"
+            # 1. Проверка дневного лимита
+            if self.daily_dca_count >= self.MAX_DCA_PER_DAY:
+                self._set_block("Достигнут дневной лимит DCA", 24*3600)
+                return False, f"Дневной лимит: {self.daily_dca_count}/{self.MAX_DCA_PER_DAY}"
+            
+            # 2. Проверка последовательных DCA
+            if self.consecutive_dca_count >= self.MAX_CONSECUTIVE_DCA:
+                self._set_block("Слишком много DCA подряд", 4*3600)
+                return False, f"Лимит подряд: {self.consecutive_dca_count}/{self.MAX_CONSECUTIVE_DCA}"
+            
+            # 3. Проверка интервала между DCA
+            if self._get_minutes_since_last_dca() < self.MIN_DCA_INTERVAL_MINUTES:
+                remaining_minutes = self.MIN_DCA_INTERVAL_MINUTES - self._get_minutes_since_last_dca()
+                return False, f"Кулдаун: {remaining_minutes:.0f} мин"
+            
+            # 4. Проверка убытка позиции
+            if position_data and position_data.get('quantity', 0) > 0:
+                avg_price = position_data.get('avg_price', 0)
+                if avg_price > 0:
+                    loss_percentage = (avg_price - current_price) / avg_price
+                    if loss_percentage > self.LOSS_BLOCK_THRESHOLD:
+                        self._set_block(f"Убыток {loss_percentage*100:.1f}% превышает порог", 2*3600)
+                        return False, f"Блокировка по убытку: {loss_percentage*100:.1f}%"
+            
+            return True, "Все проверки пройдены"
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка проверки DCA лимитов: {e}")
+            return False, f"Ошибка проверки: {str(e)}"
     
-    def register_dca_execution(self, price: float, quantity: float, 
-                              result: str = "success") -> None:
-        """📝 Регистрация выполненной DCA операции"""
+    def register_dca_success(self, price: float, quantity: float) -> None:
+        """📊 Регистрация успешной DCA"""
         
-        dca_record = {
-            'timestamp': time.time(),
-            'price': price,
-            'quantity': quantity,
-            'result': result,
-            'datetime': datetime.now().isoformat()
-        }
-        
-        self.dca_history.append(dca_record)
+        self.daily_dca_count += 1
+        self.consecutive_dca_count += 1
         self.last_dca_time = time.time()
         
-        # Чистим старые записи (старше 7 дней)
-        cutoff_time = time.time() - (7 * 24 * 3600)
-        self.dca_history = [r for r in self.dca_history if r['timestamp'] > cutoff_time]
-        
-        self.logger.info(f"📝 DCA зарегистрирована: {quantity:.6f} по {price:.8f}")
-        self.logger.info(f"   📊 Подряд: {self._count_consecutive_dca()}/{self.MAX_CONSECUTIVE_DCA}")
-        self.logger.info(f"   📅 За день: {self._count_daily_dca()}/{self.MAX_DCA_PER_DAY}")
+        self.logger.info(f"📊 DCA зарегистрирована:")
+        self.logger.info(f"   📊 Дневной счетчик: {self.daily_dca_count}")
+        self.logger.info(f"   🔗 Подряд: {self.consecutive_dca_count}")
     
     def register_successful_sell(self) -> None:
-        """✅ Регистрация успешной продажи (сбрасывает счетчики)"""
+        """✅ Регистрация успешной продажи - сбрасывает счетчики"""
         
-        # Добавляем маркер успешной продажи
-        sell_record = {
-            'timestamp': time.time(),
-            'type': 'successful_sell',
-            'datetime': datetime.now().isoformat()
-        }
+        self.consecutive_dca_count = 0
+        self.last_successful_sell_time = time.time()
         
-        self.dca_history.append(sell_record)
+        # Снимаем блокировку если она была по убытку
+        if self.is_blocked and "убыток" in self.block_reason.lower():
+            self._clear_block()
         
-        # Снимаем временные блокировки при успешной продаже
-        if time.time() < self.blocked_until:
-            self.logger.info("✅ Блокировка DCA снята из-за успешной продажи")
-            self.blocked_until = 0
-            self.block_reason = ""
-        
-        self.logger.info("✅ Успешная продажа зарегистрирована, счетчики DCA сброшены")
+        self.logger.info(f"✅ Успешная продажа: DCA счетчик подряд сброшен")
     
-    def _count_consecutive_dca(self) -> int:
-        """📊 Подсчет подряд идущих DCA операций"""
+    def _reset_daily_counters_if_needed(self) -> None:
+        """🔄 Сброс дневных счетчиков при смене дня"""
         
-        if not self.dca_history:
-            return 0
-        
-        consecutive = 0
-        # Идем с конца истории
-        for record in reversed(self.dca_history):
-            if record.get('type') == 'successful_sell':
-                break  # Прерываем на успешной продаже
-            elif 'quantity' in record and record.get('result') == 'success':
-                consecutive += 1
-            else:
-                break
-        
-        return consecutive
+        today = datetime.now().date()
+        if self.last_dca_date != today:
+            old_count = self.daily_dca_count
+            self.daily_dca_count = 0
+            self.last_dca_date = today
+            
+            if old_count > 0:
+                self.logger.info(f"🔄 Дневной счетчик DCA сброшен: {old_count} -> 0")
     
-    def _count_daily_dca(self) -> int:
-        """📅 Подсчет DCA операций за сегодня"""
-        
-        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        today_timestamp = today_start.timestamp()
-        
-        daily_count = 0
-        for record in self.dca_history:
-            if (record['timestamp'] >= today_timestamp and 
-                'quantity' in record and 
-                record.get('result') == 'success'):
-                daily_count += 1
-        
-        return daily_count
+    def _get_minutes_since_last_dca(self) -> float:
+        """⏰ Получение минут с последней DCA"""
+        if self.last_dca_time == 0:
+            return float('inf')
+        return (time.time() - self.last_dca_time) / 60
     
-    def _block_dca_temporarily(self, duration_seconds: int, reason: str) -> None:
-        """🚨 Временная блокировка DCA"""
+    def _set_block(self, reason: str, duration_seconds: int) -> None:
+        """🚫 Установка временной блокировки"""
         
-        self.blocked_until = time.time() + duration_seconds
+        self.is_blocked = True
         self.block_reason = reason
+        self.block_until = time.time() + duration_seconds
         
-        hours = duration_seconds / 3600
-        self.logger.warning(f"🚨 DCA заблокирована на {hours:.1f}ч: {reason}")
+        self.logger.warning(f"🚫 DCA ЗАБЛОКИРОВАНА: {reason}")
+    
+    def _clear_block(self) -> None:
+        """✅ Снятие блокировки"""
+        
+        if self.is_blocked:
+            self.is_blocked = False
+            self.block_reason = ""
+            self.block_until = 0
+            self.logger.info(f"✅ Блокировка DCA снята")
+    
+    def _is_temporarily_blocked(self) -> bool:
+        """🚫 Проверка временной блокировки"""
+        
+        if not self.is_blocked:
+            return False
+        
+        if time.time() >= self.block_until:
+            self._clear_block()
+            return False
+        
+        return True
     
     def get_dca_status(self) -> Dict[str, Any]:
-        """📊 Текущий статус DCA лимитера"""
+        """📊 Получение статуса DCA лимитера"""
         
-        status = {
-            'consecutive_dca': self._count_consecutive_dca(),
-            'max_consecutive': self.MAX_CONSECUTIVE_DCA,
-            'daily_dca': self._count_daily_dca(),
-            'max_daily': self.MAX_DCA_PER_DAY,
-            'is_blocked': time.time() < self.blocked_until,
-            'block_reason': self.block_reason if time.time() < self.blocked_until else "",
-            'time_since_last_dca': time.time() - self.last_dca_time,
-            'min_interval': self.MIN_INTERVAL_BETWEEN_DCA
+        self._reset_daily_counters_if_needed()
+        
+        return {
+            'system_active': True,
+            'is_blocked': self.is_blocked,
+            'block_reason': self.block_reason,
+            'daily_dca_count': self.daily_dca_count,
+            'consecutive_dca_count': self.consecutive_dca_count,
+            'max_daily_dca': self.MAX_DCA_PER_DAY,
+            'max_consecutive_dca': self.MAX_CONSECUTIVE_DCA,
+            'minutes_since_last_dca': round(self._get_minutes_since_last_dca(), 1)
         }
-        
-        if status['is_blocked']:
-            status['block_remaining_minutes'] = (self.blocked_until - time.time()) / 60
-        
-        return status
