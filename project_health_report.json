@@ -1,0 +1,21 @@
+{
+  "timestamp": "2025-08-04T12:18:40.506114",
+  "total_issues": 6,
+  "critical_issues": 1,
+  "categories": {
+    "migration_artifacts": 1,
+    "backup_directories": 1,
+    "duplicate_files": 0,
+    "old_patch_files": 0,
+    "temp_files": 0,
+    "broken_migrations": 0,
+    "outdated_configs": 0,
+    "unused_scripts": 2,
+    "log_files": 2,
+    "cache_files": 0
+  },
+  "recommendations": [
+    "\u0423\u0434\u0430\u043b\u0438\u0442\u0435 \u0430\u0440\u0442\u0435\u0444\u0430\u043a\u0442\u044b \u043c\u0438\u0433\u0440\u0430\u0446\u0438\u0438 \u0434\u043b\u044f \u043e\u0447\u0438\u0441\u0442\u043a\u0438 \u043f\u0440\u043e\u0435\u043a\u0442\u0430",
+    "\u0410\u0440\u0445\u0438\u0432\u0438\u0440\u0443\u0439\u0442\u0435 \u0438\u043b\u0438 \u0443\u0434\u0430\u043b\u0438\u0442\u0435 \u0441\u0442\u0430\u0440\u044b\u0435 \u0431\u044d\u043a\u0430\u043f\u044b"
+  ]
+}
