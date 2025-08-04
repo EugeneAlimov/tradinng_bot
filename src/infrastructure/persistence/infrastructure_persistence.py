@@ -192,7 +192,6 @@ class FileRepository(IRepository[T], Generic[T]):
         backup_file = self.backup_path / backup_filename
         
         if self.file_path.exists():
-        if self.file_path.exists():
             async with self._lock:
                 # Копируем файл
                 import shutil

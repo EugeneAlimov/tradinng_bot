@@ -1,0 +1,80 @@
+{
+  "stage": 1,
+  "name": "Анализ и планирование",
+  "execution_time_minutes": 0.05,
+  "timestamp": "2025-08-04 17:22:05",
+  "results": {
+    "inventory": {
+      "success": true,
+      "metrics": {
+        "total_components": 324,
+        "legacy_components": 6,
+        "critical_components": 7,
+        "legacy_percentage": 1.8518518518518516,
+        "total_complexity": 2209,
+        "avg_complexity": 6.82,
+        "total_lines": 93062,
+        "avg_component_size": 287.23,
+        "total_dependencies": 1774,
+        "avg_dependencies": 5.48,
+        "coupling_ratio": 0.017
+      },
+      "issues_count": 198,
+      "critical_path_length": 7,
+      "recommendations_count": 6
+    },
+    "architecture": {
+      "success": true,
+      "contexts_count": 4,
+      "total_components": 23,
+      "layer_distribution": {
+        "core": 4,
+        "domain": 6,
+        "application": 4,
+        "presentation": 3,
+        "infrastructure": 6
+      },
+      "estimated_days": 11,
+      "estimated_lines": 6060
+    },
+    "dependencies": {
+      "success": true,
+      "components_count": 282,
+      "dependencies_count": 5234,
+      "cycles_count": 0,
+      "critical_path_length": 7,
+      "coupling_ratio": 18.56,
+      "migration_batches": 4
+    },
+    "integration": {
+      "success": true,
+      "readiness_score": 80.0,
+      "readiness_level": "ready",
+      "total_checks": 20,
+      "passed_checks": 16,
+      "critical_issues": 0,
+      "warnings": 4
+    }
+  },
+  "overall_success": true,
+  "next_steps": [
+    "📁 Создайте структуру директорий новой архитектуры",
+    "🎯 Начните Этап 2: Создание ядра (Core слой)",
+    "🏗️ Реализуйте интерфейсы и базовые модели",
+    "💉 Настройте Dependency Injection",
+    "🧪 Добавьте unit тесты для критических компонентов"
+  ],
+  "critical_findings": [
+    "📊 Найдено 198 проблем в компонентах",
+    "🔗 Высокая связанность (коэффициент 18.56)"
+  ],
+  "recommendations": [
+    "🔗 Разбейте высокосвязанные компоненты на модули",
+    "📜 Создайте адаптеры для постепенной миграции legacy кода",
+    "🏗️ Начните с реализации Core слоя (интерфейсы, модели)",
+    "💉 Внедрите Dependency Injection для управления зависимостями",
+    "🧪 Добавьте unit тесты перед рефакторингом",
+    "📚 Обновите документацию архитектуры",
+    "🔍 Проводите code review для новых компонентов"
+  ]
+}
