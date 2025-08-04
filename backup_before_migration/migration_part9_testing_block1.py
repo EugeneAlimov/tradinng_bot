@@ -1,4 +1,88 @@
 #!/usr/bin/env python3
+"""🧪 Миграция Part 9A - Базовая система тестирования"""
+import logging
+from pathlib import Path
+
+class Migration:
+    """🧪 Миграция базовой системы тестирования"""
+    
+    def __init__(self, project_root: Path):
+        self.project_root = project_root
+        self.tests_dir = project_root / "tests"
+        self.logger = logging.getLogger(__name__)
+    
+    def execute(self) -> bool:
+        """🚀 Выполнение миграции"""
+        try:
+            self.logger.info("🧪 Создание базовой системы тестирования...")
+            
+            # Создаем структуру директорий
+            self._create_directory_structure()
+            
+            # Создаем конфигурацию pytest
+            self._create_pytest_config()
+            
+            # Создаем базовые фикстуры
+            self._create_base_fixtures()
+            
+            self.logger.info("✅ Базовая система тестирования создана")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка создания тестов: {e}")
+            return False
+    
+    def _create_directory_structure(self):
+        """📁 Создание структуры директорий"""
+        dirs_to_create = [
+            self.tests_dir,
+            self.tests_dir / "unit",
+            self.tests_dir / "integration", 
+            self.tests_dir / "performance",
+            self.tests_dir / "fixtures",
+            self.tests_dir / "mocks",
+        ]
+        
+        for dir_path in dirs_to_create:
+            dir_path.mkdir(parents=True, exist_ok=True)
+            
+            # Создаем __init__.py
+            init_file = dir_path / "__init__.py"
+            if not init_file.exists():
+                init_file.write_text('"""🧪 Тесты торговой системы"""\n')
+    
+    def _create_pytest_config(self):
+        """⚙️ Создание конфигурации pytest"""
+        # pytest.ini
+        pytest_ini_content = '''[tool:pytest]
+testpaths = tests
+python_files = test_*.py
+python_classes = Test*
+python_functions = test_*
+addopts = 
+    -v
+    --tb=short
+    --strict-markers
+    --disable-warnings
+    --cov=src
+    --cov-report=html
+    --cov-report=term-missing
+markers =
+    unit: Unit tests
+    integration: Integration tests
+    performance: Performance tests
+    slow: Slow tests that may take more time
+    api: Tests that require API connection
+    legacy: Tests for legacy code compatibility
+    dca: DCA strategy tests
+    risk: Risk management tests
+'''
+        pytest_ini_file = self.project_root / "pytest.ini"
+        pytest_ini_file.write_text(pytest_ini_content)
+    
+    def _create_base_fixtures(self):
+        """🔧 Создание базовых фикстур"""
+        conftest_content = '''#!/usr/bin/env python3
 """🧪 Базовые фикстуры для тестирования"""
 import pytest
 import sys
@@ -141,3 +225,13 @@ class TestUtils:
 def test_utils():
     """🛠️ Фикстура утилит"""
     return TestUtils()
+'''
+        
+        conftest_file = self.tests_dir / "conftest.py"
+        conftest_file.write_text(conftest_content)
+
+if __name__ == "__main__":
+    import sys
+    migration = Migration(Path("."))
+    success = migration.execute()
+    sys.exit(0 if success else 1)

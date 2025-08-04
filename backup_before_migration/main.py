@@ -1,198 +1,65 @@
 #!/usr/bin/env python3
-"""🚀 Новая точка входа торговой системы"""
+"""🚀 Главная точка входа торгового бота v4.1-refactored"""
 
 import sys
 import os
 import argparse
-import asyncio
-
 from pathlib import Path
 
 # Добавляем src в путь
-src_path = Path(__file__).parent / "src"
-sys.path.insert(0, str(src_path))
+sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-# Добавляем в main.py новый режим enhanced
-async def run_enhanced_mode(args):
-    """🚀 Запуск улучшенного режима"""
-    print("🚀 Запуск улучшенного режима с новой инфраструктурой...")
-
-    try:
-        from hybrid_bot_enhanced import EnhancedHybridBot
-
-        bot = EnhancedHybridBot()
-        await bot.initialize()
-
-        print("✅ Улучшенный бот инициализирован")
-        print("📊 Дашборд доступен на http://localhost:8080")
-
-        await bot.run()
-
-    except Exception as e:
-        print(f"❌ Ошибка улучшенного режима: {e}")
-        return False
-
-    return True
-
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="🤖 DOGE Trading Bot v4.1-refactored")
-
-    parser.add_argument(
-        '--mode', '-m',
-        choices=['new', 'legacy', 'hybrid', 'enhanced'],  # Добавляем enhanced
-        default='enhanced',  # Меняем по умолчанию
-        help='Режим работы'
-    )
-
-    """📋 Парсинг аргументов командной строки"""
-    parser = argparse.ArgumentParser(description="🤖 DOGE Trading Bot v4.1-refactored")
-
-    parser.add_argument(
-        '--mode', '-m',
-        choices=['new', 'legacy', 'hybrid'],
-        default='hybrid',
-        help='Режим работы: new (новая архитектура), legacy (старый бот), hybrid (адаптер)'
-    )
-
-    parser.add_argument(
-        '--profile', '-p',
-        choices=['conservative', 'balanced', 'aggressive'],
-        default='balanced',
-        help='Профиль торговли'
-    )
-
-    parser.add_argument(
-        '--config', '-c',
-        help='Путь к файлу конфигурации'
-    )
-
-    parser.add_argument(
-        '--validate', '-v',
-        action='store_true',
-        help='Только валидация конфигурации'
-    )
-
-    parser.add_argument(
-        '--test-mode', '-t',
-        action='store_true',
-        help='Тестовый режим без реальных сделок'
-    )
-
-    return parser.parse_args()
-
-async def run_new_architecture(args):
-    """🆕 Запуск новой архитектуры"""
-    print("🆕 Запуск новой архитектуры...")
-    print("⚠️ Новая архитектура находится в разработке")
-    print("🔄 Переключаемся на гибридный режим")
-    return await run_hybrid_mode(args)
-
-async def run_legacy_mode(args):
-    """📜 Запуск старого бота"""
-    print("📜 Запуск в legacy режиме...")
-
-    try:
-        # Пытаемся запустить старый бот
-        if Path("hybrid_bot.py").exists():
-            from hybrid_bot import HybridTradingBot
-            bot = HybridTradingBot()
-        elif Path("bot.py").exists():
-            from bot import TradingBot
-            bot = TradingBot()
-        else:
-            raise ImportError("Старые файлы бота не найдены")
-
-        print("✅ Старый бот загружен, запускаем...")
-        bot.run()
-
-    except ImportError as e:
-        print(f"❌ Ошибка загрузки старого бота: {e}")
-        print("💡 Попробуйте режим --mode hybrid")
-        return False
-    except Exception as e:
-        print(f"❌ Ошибка запуска: {e}")
-        return False
-
-    return True
-
-async def run_hybrid_mode(args):
-    """🎭 Запуск в гибридном режиме"""
-    print("🎭 Запуск в гибридном режиме...")
-
-    try:
-        # Загружаем новую конфигурацию
-        from config.settings import get_settings
-        settings = get_settings()
-        settings.validate()
-
-        print("✅ Новая конфигурация загружена")
-
-        # Загружаем адаптер
-        from adapters import LegacyBotAdapter
-        adapter = LegacyBotAdapter(use_hybrid=True)
-
-        print("🔄 Запуск через адаптер...")
-
-        # Простой цикл для демонстрации
-        cycles = 0
-        while cycles < 5:  # Ограничиваем для теста
-            try:
-                result = await adapter.run_trading_cycle()
-                print(f"📊 Цикл {cycles + 1}: {result.get('reason', 'OK')}")
-
-                cycles += 1
-                await asyncio.sleep(10)  # 10 секунд между циклами
-
-            except KeyboardInterrupt:
-                print("\n⌨️ Остановка по Ctrl+C")
-                break
-            except Exception as e:
-                print(f"❌ Ошибка цикла: {e}")
-                break
-
-        print("✅ Гибридный режим завершен")
-        return True
-
-    except Exception as e:
-        print(f"❌ Ошибка гибридного режима: {e}")
-        print("🔄 Пытаемся запустить legacy режим...")
-        return await run_legacy_mode(args)
-
-async def validate_configuration(args):
-    """✅ Валидация конфигурации"""
-    print("✅ Валидация конфигурации...")
-
-    try:
-        from config.settings import get_settings
-        settings = get_settings()
-        settings.validate()
-
-        print("✅ Конфигурация корректна")
-        print(f"📊 Профиль: {getattr(settings, 'profile_name', 'unknown')}")
-        print(f"💱 API ключ: {settings.exmo_api_key[:8]}..." if settings.exmo_api_key else "❌ API ключ не настроен")
-
-        return True
-
-    except Exception as e:
-        print(f"❌ Ошибка конфигурации: {e}")
-        return False
-
-
-async def main():
-    args = parse_arguments()
-
+def main():
+    parser = argparse.ArgumentParser(description="Торговый бот DOGE v4.1-refactored")
+    parser.add_argument("--mode", choices=["hybrid", "legacy", "new"], 
+                       default="hybrid", help="Режим работы")
+    parser.add_argument("--validate", action="store_true", help="Проверка конфигурации")
+    
+    args = parser.parse_args()
+    
+    print("🚀 ТОРГОВЫЙ БОТ DOGE v4.1-refactored")
+    print("=" * 40)
+    
     if args.validate:
-        return await validate_configuration(args)
-
-    if args.mode == 'new':
-        return await run_new_architecture(args)
-    elif args.mode == 'legacy':
-        return await run_legacy_mode(args)
-    elif args.mode == 'hybrid':
-        return await run_hybrid_mode(args)
-    elif args.mode == 'enhanced':  # Новый режим
-        return await run_enhanced_mode(args)
+        print("✅ Проверка конфигурации...")
+        try:
+            from config.settings import get_settings
+            settings = get_settings()
+            settings.validate()
+            print("✅ Конфигурация валидна")
+            return
+        except Exception as e:
+            print(f"❌ Ошибка конфигурации: {e}")
+            sys.exit(1)
+    
+    if args.mode == "legacy":
+        print("🔄 Запуск в legacy режиме...")
+        try:
+            # Попытка запуска старого бота
+            if os.path.exists("main_old.py"):
+                exec(open("main_old.py").read())
+            else:
+                print("❌ Legacy файлы не найдены")
+        except Exception as e:
+            print(f"❌ Ошибка legacy режима: {e}")
+    
+    elif args.mode == "hybrid":
+        print("🔧 Запуск в гибридном режиме...")
+        try:
+            # Здесь будет импорт гибридного бота
+            print("⚠️ Гибридный режим в разработке")
+            print("💡 Используйте --mode legacy для старого бота")
+        except Exception as e:
+            print(f"❌ Ошибка гибридного режима: {e}")
+    
+    elif args.mode == "new":
+        print("🆕 Запуск новой архитектуры...")
+        try:
+            # Здесь будет импорт нового бота
+            print("⚠️ Новая архитектура в разработке")
+            print("💡 Используйте --mode legacy для старого бота")
+        except Exception as e:
+            print(f"❌ Ошибка новой архитектуры: {e}")
 
 if __name__ == "__main__":
-    exit_code = asyncio.run(main())
-    sys.exit(exit_code)
+    main()

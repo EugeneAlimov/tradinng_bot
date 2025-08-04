@@ -1,12 +1,64 @@
-# created by virtualenv automatically
-.venv/bin
-.venv
-.idea
+# 🙈 Git ignore для торгового бота
+
+# Конфиденциальные файлы
 .env
+*.key
+*.secret
+
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Тестирование
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+coverage.xml
+*.cover
+
+# Среды разработки
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Логи и данные
+logs/
+*.log
 data/
-services/__pycache__/
-trading_bot_recovery.log
-Пары и лимиты для EXMO.txt
-Сколько было денег.txt
-logs
+*.db
+
+# Системные файлы
+.DS_Store
+Thumbs.db
+
+# Временные файлы
+*.tmp
+*.backup
+diagnostic_report.json

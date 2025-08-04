@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  trading-bot:
+    build: .
+    container_name: doge-trading-bot
+    environment:
+      - TRADING_MODE=paper
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./.env:/app/.env:ro
+    restart: unless-stopped
