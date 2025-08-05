@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-"""🧪 Unit тесты моделей данных"""
 import pytest
 from decimal import Decimal
 from datetime import datetime

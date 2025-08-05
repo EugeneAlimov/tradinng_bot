@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""🏗️ Базовые модели данных торговой системы - Core слой"""
-
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal

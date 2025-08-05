@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-"""🔄 Восстановление из бэкапа"""
 import shutil
 import sys
 from pathlib import Path

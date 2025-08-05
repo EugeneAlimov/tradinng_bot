@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""🎯 Адаптер стратегий"""
-
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 

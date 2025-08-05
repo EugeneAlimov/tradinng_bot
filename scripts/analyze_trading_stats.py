@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-"""📊 Анализ торговой статистики"""
 import json
 from pathlib import Path
 from datetime import datetime, timedelta

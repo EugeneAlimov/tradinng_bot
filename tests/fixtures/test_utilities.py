@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-"""🛠️ Утилиты для тестирования"""
 from decimal import Decimal
 from datetime import datetime, timedelta
 import json

@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""🚨 Система исключений торговой системы - Core слой"""
-
 from typing import Optional, Dict, Any, List, Callable
 from decimal import Decimal
 from datetime import datetime

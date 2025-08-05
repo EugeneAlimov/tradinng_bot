@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""💉 Dependency Injection контейнер - Core слой"""
-
 from typing import Dict, Any, Type, Optional, List, Callable, TypeVar, get_type_hints, Union
 from dataclasses import dataclass, field
 from enum import Enum

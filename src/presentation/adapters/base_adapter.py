@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""🔧 Базовый адаптер для совместимости"""
-
 import logging
 import asyncio
 from abc import ABC, abstractmethod

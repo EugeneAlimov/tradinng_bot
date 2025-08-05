@@ -1,7 +1,3 @@
-# Интерфейсы будут созданы
-#!/usr/bin/env python3
-"""🎯 Основные интерфейсы торговой системы - Core слой"""
-
 from abc import ABC, abstractmethod
 from typing import Protocol, Dict, Any, Optional, List, Union, AsyncIterator
 from decimal import Decimal

@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""🛡️ Безопасный адаптер для тестирования"""
-
 import asyncio
 from typing import Any, Dict, Optional
 from decimal import Decimal

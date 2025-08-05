@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-"""🧪 Расширенные фикстуры для DCA и стратегий"""
 import pytest
 from decimal import Decimal
 from datetime import datetime, timedelta

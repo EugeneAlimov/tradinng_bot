@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""🧪 Тесты конфигурации"""
-
 import pytest
 import sys
 from pathlib import Path

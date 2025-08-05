@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-"""🧪 Unit тесты DCA стратегии"""
 import pytest
 from decimal import Decimal
 from datetime import datetime

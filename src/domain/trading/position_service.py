@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""📊 Сервис управления позициями - Domain слой"""
-
 from typing import Optional, List, Dict, Any, Tuple
 from decimal import Decimal
 from datetime import datetime, timedelta

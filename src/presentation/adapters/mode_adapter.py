@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""🎛️ Адаптер режимов работы"""
-
 import asyncio
 from typing import Dict, Any, Optional
 from datetime import datetime

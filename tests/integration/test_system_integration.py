@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-"""🧪 Integration тесты системы"""
 import pytest
 import asyncio
 from unittest.mock import Mock

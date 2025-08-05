@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""🎯 Главный адаптер системы"""
-
 import asyncio
 from typing import Any, Dict, Optional, List
 from datetime import datetime

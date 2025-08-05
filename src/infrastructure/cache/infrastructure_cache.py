@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""💾 Инфраструктурный слой - Система кэширования"""
-
 import time
 import asyncio
 import pickle

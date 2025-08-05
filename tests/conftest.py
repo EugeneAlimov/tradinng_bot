@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-"""🧪 Базовые фикстуры для тестирования"""
 import pytest
 import sys
 from pathlib import Path

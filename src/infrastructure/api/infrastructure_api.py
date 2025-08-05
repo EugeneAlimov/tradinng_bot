@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""🌐 Инфраструктурный слой - API клиенты"""
-
 import time
 import logging
 import hashlib

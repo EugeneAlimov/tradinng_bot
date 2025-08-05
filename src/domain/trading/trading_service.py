@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""📈 Торговый сервис - Domain слой"""
-
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
 from datetime import datetime, timedelta

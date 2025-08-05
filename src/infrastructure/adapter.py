@@ -1,7 +1,3 @@
-# src/infrastructure/adapter.py
-#!/usr/bin/env python3
-"""🔗 Адаптер для интеграции новой инфраструктуры с существующим ботом"""
-
 import asyncio
 import logging
 from typing import Dict, Any, Optional

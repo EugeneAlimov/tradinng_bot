@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""🤖 Адаптер для старого бота"""
-
 import sys
 import asyncio
 from typing import Any, Dict, Optional, List

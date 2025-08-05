@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""🛠️ Утилиты для адаптеров"""
-
 import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Callable

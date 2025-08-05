@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""🧪 Базовые тесты"""
-
 import pytest
 import asyncio
 

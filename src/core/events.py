@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""📡 Система событий торговой системы - Core слой"""
-
 from typing import Dict, Any, List, Callable, Optional, Type, Set, AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime

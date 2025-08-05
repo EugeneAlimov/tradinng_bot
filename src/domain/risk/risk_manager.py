@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""🛡️ Сервис управления рисками - Domain слой (Часть 1)"""
-
 from typing import Optional, Dict, Any, List, Tuple
 from decimal import Decimal
 from datetime import datetime, timedelta

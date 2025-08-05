@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-"""🔍 Диагностика системы"""
 import sys
 import subprocess
 from pathlib import Path

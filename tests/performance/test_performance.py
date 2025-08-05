@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-"""🧪 Performance тесты"""
 import pytest
 import time
 import asyncio
