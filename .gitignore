@@ -62,3 +62,14 @@ Thumbs.db
 *.tmp
 *.backup
 diagnostic_report.json
+# Cleanup backups
+backup_cleanup_*/
+# Legacy files (if any remain)
+*_legacy.py
+*_old.py
+# Application specific
+src/application/services/*.pyc
+# Analytics exports
+analytics_export_*
+# Temporary migration files
+migration_temp_*

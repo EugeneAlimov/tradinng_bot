@@ -1,26 +1,22 @@
-# 🛠️ Зависимости для разработки
-
-# Тестирование
+# Development dependencies
 pytest>=7.0.0
 pytest-asyncio>=0.21.0
 pytest-cov>=4.0.0
-pytest-mock>=3.10.0
-pytest-benchmark>=4.0.0
+black>=22.0.0
+isort>=5.10.0
+flake8>=4.0.0
+mypy>=0.991
+pre-commit>=2.20.0
 
-# Форматирование и линтинг
-black>=23.0.0
-isort>=5.12.0
-flake8>=6.0.0
-mypy>=1.0.0
-pre-commit>=3.0.0
+# Documentation
+sphinx>=5.0.0
+sphinx-rtd-theme>=1.0.0
 
-# Документация
-sphinx>=6.0.0
-sphinx-rtd-theme>=1.2.0
+# Testing utilities
+factory-boy>=3.2.0
+freezegun>=1.2.0
+responses>=0.22.0
 
-# Профилирование
+# Performance profiling
 memory-profiler>=0.60.0
-
-# Дополнительные инструменты
-watchdog>=3.0.0  # Мониторинг файлов
-rich>=13.0.0     # Красивый вывод в консоль
+line-profiler>=4.0.0

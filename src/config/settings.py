@@ -1078,3 +1078,52 @@ def require_config_validation(func):
             raise ConfigurationError(f"Configuration validation failed: {'; '.join(errors)}")
         return func(*args, **kwargs)
     return wrapper
+
+
+# Добавьте эти строки в КОНЕЦ файла src/config/settings.py
+# после всех существующих функций:
+
+# ================= ALIAS ФУНКЦИИ =================
+
+def get_settings() -> TradingSystemSettings:
+    """📋 Получение настроек (alias для get_current_config)"""
+    return get_current_config()
+
+
+# Экспорт всех основных функций для удобства импорта
+__all__ = [
+    # Основные классы
+    'TradingSystemSettings',
+    'TradingProfile',
+    'Environment',
+    'APISettings',
+    'TradingSettings',
+    'RiskSettings',
+    'DCASettings',
+    'StrategySettings',
+    'SystemSettings',
+
+    # Провайдеры и фабрики
+    'ConfigProvider',
+    'ConfigFactory',
+    'ConfigManager',
+    'ConfigValidator',
+    'ConfigContext',
+
+    # Основные функции
+    'get_settings',  # Основная функция для импорта
+    'get_current_config',
+    'get_global_config',
+    'load_config',
+    'set_global_config',
+    'get_config_manager',
+    'update_config_setting',
+    'validate_current_config',
+
+    # Декораторы
+    'with_config',
+    'require_config_validation',
+
+    # Константы
+    'ConfigConstants'
+]
