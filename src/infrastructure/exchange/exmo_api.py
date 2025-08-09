@@ -1,42 +1,17 @@
+# src/infrastructure/exchange/exmo_api.py
 from __future__ import annotations
 
-import time
-import hmac
 import hashlib
+import hmac
 import json
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, List, Tuple
-from urllib.parse import urlencode
+from decimal import Decimal
+from typing import Any, Dict, List, Optional
 
 import requests
-from decimal import Decimal, InvalidOperation
 
-from src.config.env import load_env, env_str
-
-
-# ======== ВСПОМОГАТЕЛЬНОЕ ========
-
-def _d(x: Any) -> Decimal:
-    try:
-        if isinstance(x, Decimal):
-            return x
-        return Decimal(str(x))
-    except (InvalidOperation, ValueError):
-        return Decimal("0")
-
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-def __post_init__(self) -> None:
-    # Если ключи не заданы — пробуем взять из .env
-    if not self.creds.api_key or not self.creds.api_secret:
-        load_env()
-        self.creds.api_key = self.creds.api_key or env_str("EXMO_API_KEY", "")
-        self.creds.api_secret = self.creds.api_secret or env_str("EXMO_API_SECRET", "")
-    # Если включена торговля, ключи обязательны
-    if self.allow_trading and (not self.creds.api_key or not self.creds.api_secret):
-        raise RuntimeError("EXMO creds are not set")
+from .http_utils import SimpleTTLCache, RateLimiter, with_retries
 
 
 @dataclass
@@ -49,204 +24,174 @@ class ExmoCredentials:
 class ExmoApi:
     """
     Лёгкий клиент EXMO (по умолчанию read-only).
-    Реализованы безопасные публичные и приватные методы ТОЛЬКО-ДЛЯ-ЧТЕНИЯ.
-    Торговые методы отключены, пока allow_trading=False.
+    Публичные и приватные методы. Торговые выключены, пока allow_trading=False.
     """
     creds: ExmoCredentials = field(default_factory=ExmoCredentials)
     base_url: str = "https://api.exmo.com/v1.1"
-    timeout: float = 10.0
-    user_agent: str = "clean-crypto-bot/0.1 (+paper; read-only)"
-    allow_trading: bool = False  # ← защита от случайной торговли
+    timeout: float = 15.0
+    user_agent: str = "clean-crypto-bot/0.1"
+    allow_trading: bool = False  # безопасность
 
-    _session: requests.Session = field(default_factory=requests.Session, init=False)
+    # настройки кэша/лимитов
+    cache_ttls: Dict[str, float] = field(default_factory=lambda: {
+        # endpoint -> TTL seconds
+        "ticker": 1.0,
+        "order_book": 0.5,
+        "trades": 0.5,
+        "candles": 0.5,
+        "kline": 0.5,
+        "ohlcv": 0.5,
+        "ping": 0.5,
+        # приватные сознательно не кэшируем по умолчанию
+    })
+    public_min_interval: float = 0.25   # ~4 rps
+    private_min_interval: float = 0.5   # ~2 rps
+    retry_attempts: int = 3
 
-    # ---------- HTTP CORE ----------
+    def __post_init__(self) -> None:
+        self._session = requests.Session()
+        self._session.headers.update({"User-Agent": self.user_agent})
+        self._cache = SimpleTTLCache(max_items=2048)
+        self._rl_public = RateLimiter(self.public_min_interval)
+        self._rl_private = RateLimiter(self.private_min_interval)
 
-    def _headers_public(self) -> Dict[str, str]:
-        return {"User-Agent": self.user_agent}
-
-    def _headers_private(self, payload: Dict[str, Any]) -> Dict[str, str]:
+    # ── низкоуровневые HTTP ─────────────────────────────────────────────
+    def _sign_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not self.creds.api_key or not self.creds.api_secret:
             raise RuntimeError("EXMO creds are not set")
-
-        body = urlencode(payload)
-        sign = hmac.new(
-            self.creds.api_secret.encode("utf-8"),
-            body.encode("utf-8"),
-            hashlib.sha512,
-        ).hexdigest()
-        return {
-            "User-Agent": self.user_agent,
+        payload = dict(payload)
+        payload["nonce"] = int(time.time() * 1000)
+        b = "&".join(f"{k}={payload[k]}" for k in sorted(payload))
+        sig = hmac.new(self.creds.api_secret.encode(), b.encode(), hashlib.sha512).hexdigest()
+        headers = {
             "Key": self.creds.api_key,
-            "Sign": sign,
+            "Sign": sig,
             "Content-Type": "application/x-www-form-urlencoded",
         }
+        return {"data": b, "headers": headers}
 
-    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        url = f"{self.base_url}/{path}"
-        r = self._session.get(url, params=params, headers=self._headers_public(), timeout=self.timeout)
-        r.raise_for_status()
-        return r.json()
+    def _public_get(self, endpoint: str, params: Optional[Dict[str, Any]] = None, use_cache: bool = True) -> Any:
+        url = f"{self.base_url}/{endpoint}"
+        ttl = self.cache_ttls.get(endpoint, 0.0) if use_cache else 0.0
 
-    def _post_private(self, path: str, payload: Optional[Dict[str, Any]] = None) -> Any:
-        url = f"{self.base_url}/{path}"
-        data = dict(payload or {})
-        data.setdefault("nonce", _now_ms())
-        headers = self._headers_private(data)
-        r = self._session.post(url, data=data, headers=headers, timeout=self.timeout)
-        r.raise_for_status()
-        js = r.json()
-        # Некоторые приватные ручки EXMO возвращают {"result": False, "error": "..."}
-        if isinstance(js, dict) and js.get("result") is False and js.get("error"):
-            raise RuntimeError(f"EXMO API error: {js.get('error')}")
-        return js
+        def _do():
+            self._rl_public.wait()
+            r = self._session.get(url, params=params, timeout=self.timeout)
+            r.raise_for_status()
+            data = r.json()
+            # форматы у v1.1 разные: иногда {"result":...,"error":...}, иногда сразу объект
+            if isinstance(data, dict) and "error" in data and data.get("error"):
+                raise RuntimeError(f"EXMO error: {data.get('error')}")
+            return data
 
-    # ---------- PUBLIC (market data) ----------
+        if ttl > 0:
+            cached = self._cache.get("GET", url, params)
+            if cached is not None:
+                return cached
+            data = with_retries(_do, attempts=self.retry_attempts)
+            self._cache.set("GET", url, params, data, ttl)
+            return data
+        else:
+            return with_retries(_do, attempts=self.retry_attempts)
 
+    def _private_post(self, endpoint: str, payload: Optional[Dict[str, Any]] = None) -> Any:
+        url = f"{self.base_url}/{endpoint}"
+        payload = payload or {}
+
+        def _do():
+            self._rl_private.wait()
+            signed = self._sign_payload(payload)
+            r = self._session.post(url, headers=signed["headers"], data=signed["data"], timeout=self.timeout)
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, dict):
+                raise RuntimeError("Malformed EXMO response")
+            # приватные ответы почти всегда {"result": True/False, "error": "...", ...}
+            if data.get("error"):
+                raise RuntimeError(f"EXMO error: {data['error']}")
+            # некоторые методы кладут полезную нагрузку в поля без "result"
+            return data
+
+        return with_retries(_do, attempts=self.retry_attempts)
+
+    # ── публичные методы ───────────────────────────────────────────────
     def ping(self) -> bool:
-        """
-        Простейшая проверка доступности API.
-        Реально у EXMO нет /ping в v1.1, поэтому используем /currency.
-        """
+        # ping'а в v1.1 нет, эмулируем быстрым /ticker с cache TTL
         try:
-            _ = self._get("currency")
+            _ = self.ticker()
             return True
         except Exception:
             return False
 
-    def ticker(self) -> Dict[str, Any]:
-        """Возвращает агрегированный тикер по всем парам."""
-        return self._get("ticker")
+    def ticker(self) -> Dict[str, Dict[str, str]]:
+        return self._public_get("ticker", params=None, use_cache=True)
 
-    def ticker_pair(self, pair: str) -> Dict[str, Any]:
-        """
-        Тикер по конкретной паре. Пример пары: 'DOGE_EUR'.
-        Возвращает словарь по этой паре или пустой, если нет.
-        """
-        data = self.ticker()
-        return data.get(pair, {}) if isinstance(data, dict) else {}
+    def ticker_pair(self, pair: str) -> Dict[str, str]:
+        tk = self.ticker()
+        return tk.get(pair, {}) if isinstance(tk, dict) else {}
 
     def order_book(self, pair: str, limit: int = 50) -> Dict[str, Any]:
-        """
-        Стакан заявок. EXMO v1.1: order_book?pair=BTC_USD
-        """
-        params = {"pair": pair, "limit": int(limit)}
-        return self._get("order_book", params=params)
+        return self._public_get("order_book", params={"pair": pair, "limit": int(limit)}, use_cache=True)
 
     def trades(self, pair: str, limit: int = 100) -> List[Dict[str, Any]]:
-        """
-        Последние сделки по паре. EXMO v1.1: trades?pair=BTC_USD
-        Ответ формата: {"BTC_USD": [{trade}, ...]}
-        """
-        params = {"pair": pair}
-        data = self._get("trades", params=params)
-        arr = data.get(pair) if isinstance(data, dict) else None
-        return arr if isinstance(arr, list) else []
+        # В v1.1 публичные trades — endpoint 'trades', параметр pair и limit
+        raw = self._public_get("trades", params={"pair": pair, "limit": int(limit)}, use_cache=True)
+        # формат: {"PAIR":[{...}, ...]} либо {"result":...,"error":...}
+        if isinstance(raw, dict) and pair in raw:
+            return raw[pair]
+        return []
 
-    # ---------- PRIVATE (read-only) ----------
+    # В проекте уже реализованы обёртки под свечи:
+    def candles(self, pair: str, timeframe: str, limit: int = 200) -> List[Dict[str, Any]]:
+        # совместим с вашим текущим адаптером (пусть остаётся как есть у вас на стороне)
+        # здесь просто прокидываем к универсальному kline-эндпоинту, если он есть.
+        return self.kline(pair=pair, timeframe=timeframe, limit=limit)
 
-    def user_info(self) -> Dict[str, Any]:
-        """Сводная инфа по аккаунту (read-only)."""
-        return self._post_private("user_info")
+    def kline(self, pair: str, timeframe: str, limit: int = 200) -> List[Dict[str, Any]]:
+        # Если у вас уже есть рабочий эндпоинт (например, v1.1/candles), используйте его тут.
+        # Ниже — заглушка: пробуем общий "candles" (если есть), иначе возвращаем пусто.
+        try:
+            data = self._public_get("candles", params={"symbol": pair, "resolution": timeframe, "limit": int(limit)}, use_cache=True)
+            # ожидаем формат [{ts,open,high,low,close,volume}, ...]
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+        return []
 
+    def ohlcv(self, pair: str, timeframe: str, limit: int = 200) -> List[List[Any]]:
+        # Совместимость с вашим текущим кодом (список списков).
+        try:
+            data = self._public_get("ohlcv", params={"symbol": pair, "resolution": timeframe, "limit": int(limit)}, use_cache=True)
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+        return []
+
+    # ── приватные методы (read-only) ───────────────────────────────────
     def user_balances(self) -> Dict[str, Decimal]:
-        """
-        Доступные балансы по валютам.
-        Пример user_info: {"balances": {"USD":"10.5","DOGE":"100.0"}, ...}
-        """
-        ui = self.user_info()
-        bals = ui.get("balances") if isinstance(ui, dict) else None
-        if not isinstance(bals, dict):
-            return {}
-        return {k: _d(v) for k, v in bals.items()}
+        raw = self._private_post("user_info")
+        # форматы у EXMO различаются; ожидаем balances в "balances" или "balances":{"USD":"..."}
+        balances = raw.get("balances") or raw.get("wallet") or {}
+        out: Dict[str, Decimal] = {}
+        for k, v in balances.items():
+            try:
+                out[k] = Decimal(str(v))
+            except Exception:
+                out[k] = Decimal("0")
+        return out
 
-    def user_open_orders(self, pair: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Открытые ордера. Если pair=None — по всем.
-        """
-        if pair:
-            return self._post_private("user_open_orders", {"pair": pair})
-        return self._post_private("user_open_orders")
+    def user_open_orders(self, pair: str) -> Dict[str, Any]:
+        return self._private_post("user_open_orders", {"pair": pair})
 
     def user_trades(self, pair: str, limit: int = 100) -> List[Dict[str, Any]]:
-        """
-        История сделок по паре. EXMO: user_trades?pair=...
-        Некоторые поля: type (buy/sell), price, quantity, amount, commission_amount, date
-        """
-        payload = {"pair": pair, "limit": int(limit)}
-        data = self._post_private("user_trades", payload)
-        arr = data.get(pair) if isinstance(data, dict) else None
-        return arr if isinstance(arr, list) else []
-
-    # ---------- GUARDED trading (disabled by default) ----------
-
-    def place_order(self, pair: str, side: str, quantity: Decimal, price: Optional[Decimal] = None, order_type: str = "market") -> Dict[str, Any]:
-        """
-        Торговля ЗАПРЕЩЕНА по умолчанию. Вызов бросит ошибку, если allow_trading == False.
-        Если когда-нибудь захочешь включить — проставь allow_trading=True и реализуй маппинг
-        на exmo метод 'order_create'.
-        """
-        if not self.allow_trading:
-            raise RuntimeError("Trading is disabled (allow_trading=False). This client is read-only.")
-        raise NotImplementedError("Enable and implement when you are ready to trade for real.")
-
-    def cancel_order(self, order_id: str) -> Dict[str, Any]:
-        if not self.allow_trading:
-            raise RuntimeError("Trading is disabled (allow_trading=False). This client is read-only.")
-        raise NotImplementedError("Enable and implement when you are ready to trade for real.")
-
-    # ---------- УТИЛИТЫ-ПАРСЕРЫ (по желанию) ----------
-
-    @staticmethod
-    def parse_ticker_price(ticker_entry: Dict[str, Any]) -> Decimal:
-        """
-        Из ticker_entry достаёт последнюю цену (если есть).
-        У EXMO в /ticker обычно ключи: 'last_trade', 'buy_price', 'sell_price', ...
-        """
-        if not isinstance(ticker_entry, dict):
-            return Decimal("0")
-        for key in ("last_trade", "buy_price", "sell_price", "last_price"):
-            v = ticker_entry.get(key)
-            if v is not None:
-                val = _d(v)
-                if val > 0:
-                    return val
-        return Decimal("0")
-
-    @staticmethod
-    def parse_trades_to_ohlc(
-        trades: List[Dict[str, Any]],
-        bucket_ms: int,
-        max_bars: int,
-    ) -> List[Tuple[int, Decimal, Decimal, Decimal, Decimal]]:
-        """
-        Грубая агрегация сделок в OHLC по размерам «ведра» (bucket_ms).
-        Нужна если захочешь свечи из /trades.
-        """
-        if not trades:
-            return []
-        # ожидаем у сделки time или date (секунды) и price
-        # EXMO обычно даёт "date" (unix seconds) и "price" как строку.
-        buckets: Dict[int, List[Decimal]] = {}
-        for t in trades:
-            ts_s = int(t.get("date", 0))
-            if not ts_s:
-                continue
-            ts_ms = ts_s * 1000
-            price = _d(t.get("price"))
-            if price <= 0:
-                continue
-            slot = (ts_ms // bucket_ms) * bucket_ms
-            buckets.setdefault(slot, []).append(price)
-
-        ohlc: List[Tuple[int, Decimal, Decimal, Decimal, Decimal]] = []
-        for slot in sorted(buckets.keys())[-max_bars:]:
-            prices = buckets[slot]
-            if not prices:
-                continue
-            o = prices[0]
-            h = max(prices)
-            l = min(prices)
-            c = prices[-1]
-            ohlc.append((slot, o, h, l, c))
-        return ohlc
+        raw = self._private_post("user_trades", {"pair": pair, "limit": int(limit)})
+        # формат обычно {"result":True, "error":"", "trades":[{...}]}
+        trades = raw.get("trades")
+        if isinstance(trades, list):
+            return trades
+        # иногда {"PAIR":[...]}
+        if pair in raw and isinstance(raw[pair], list):
+            return raw[pair]
+        return []
