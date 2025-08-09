@@ -3,9 +3,6 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 import os
 
-from src.config.env import load_env, env_str
-
-
 @dataclass
 class RiskCfg:
     position_size_usd: Decimal = Decimal(os.getenv("RISK_POSITION_SIZE_USD", "50"))
@@ -21,18 +18,4 @@ class Settings:
     risk: RiskCfg = field(default_factory=RiskCfg)
 
 def get_settings() -> Settings:
-    """
-    Singleton настроек. Подхватывает EXMO ключи из .env/окружения,
-    если они не заданы в коде.
-    """
-    global SETTINGS_SINGLETON
-    if SETTINGS_SINGLETON is not None:
-        return SETTINGS_SINGLETON
-    # Загружаем .env (если установлен python-dotenv)
-    load_env()
-    s = Settings()
-    # Если в коде пусто — подхватываем из окружения
-    s.api_key = s.api_key or env_str("EXMO_API_KEY", "")
-    s.api_secret = s.api_secret or env_str("EXMO_API_SECRET", "")
-    SETTINGS_SINGLETON = s
-    return s
+    return Settings()
