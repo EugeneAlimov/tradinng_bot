@@ -142,31 +142,90 @@ class ExmoApi:
         return []
 
     # В проекте уже реализованы обёртки под свечи:
-    def candles(self, pair: str, timeframe: str, limit: int = 200) -> List[Dict[str, Any]]:
-        # совместим с вашим текущим адаптером (пусть остаётся как есть у вас на стороне)
-        # здесь просто прокидываем к универсальному kline-эндпоинту, если он есть.
-        return self.kline(pair=pair, timeframe=timeframe, limit=limit)
-
-    def kline(self, pair: str, timeframe: str, limit: int = 200) -> List[Dict[str, Any]]:
-        # Если у вас уже есть рабочий эндпоинт (например, v1.1/candles), используйте его тут.
-        # Ниже — заглушка: пробуем общий "candles" (если есть), иначе возвращаем пусто.
+    def candles(self, pair: str, timeframe: str = "1m", limit: int = 50):
+        """
+        Базовые свечи. Ходим только в "candles" эндпоинт и НИКУДА неfallback-аем,
+        чтобы избежать рекурсии. Возвращаем [] если пусто/ошибка.
+        Ожидаемый ответ: list[dict] с ключами ts/open/high/low/close/volume (как у нас в проекте).
+        Если придёт list[list], нормализуем.
+        """
         try:
-            data = self._public_get("candles", params={"symbol": pair, "resolution": timeframe, "limit": int(limit)}, use_cache=True)
-            # ожидаем формат [{ts,open,high,low,close,volume}, ...]
+            # ❶ Подстрой путь под твой рабочий эндпоинт.
+            # Раньше у нас candles работал — вероятно, это был "candles" или "candles_history".
+            data = self._public_get("candles", params={"symbol": pair, "interval": timeframe, "limit": limit})
             if isinstance(data, list):
+                if data and isinstance(data[0], list):
+                    # нормализуем [ts,o,h,l,c,v] → dict
+                    return [
+                        {"ts": int(r[0]), "open": str(r[1]), "high": str(r[2]),
+                         "low": str(r[3]), "close": str(r[4]), "volume": str(r[5])}
+                        for r in data
+                    ]
                 return data
+        except RuntimeError as e:
+            # если это "API function do not exist" — не ретраимся бесконечно
+            if "do not exist" in str(e):
+                return []
         except Exception:
             pass
         return []
 
-    def ohlcv(self, pair: str, timeframe: str, limit: int = 200) -> List[List[Any]]:
-        # Совместимость с вашим текущим кодом (список списков).
+    def kline(self, pair: str, timeframe: str = "1m", limit: int = 50):
+        """
+        Агрегированные свечи. Если пусто — НЕТ взаимного вызова candles здесь.
+        Возвращаем [] при ошибке/пустом ответе.
+        """
         try:
-            data = self._public_get("ohlcv", params={"symbol": pair, "resolution": timeframe, "limit": int(limit)}, use_cache=True)
+            data = self._public_get("kline", params={"symbol": pair, "interval": timeframe, "limit": limit})
             if isinstance(data, list):
+                # может быть уже dict-список или list[list]
+                if data and isinstance(data[0], list):
+                    return [
+                        {"ts": int(r[0]), "open": str(r[1]), "high": str(r[2]),
+                         "low": str(r[3]), "close": str(r[4]), "volume": str(r[5])}
+                        for r in data
+                    ]
                 return data
+        except RuntimeError as e:
+            if "do not exist" in str(e):
+                return []
         except Exception:
             pass
+        return []
+
+    def ohlcv(self, pair: str, timeframe: str = "1m", limit: int = 50):
+        """
+        Унифицированная обёртка: пробуем нативный ohlcv.
+        Если пусто — fallback → kline, и только если снова пусто — fallback → candles.
+        Никакой обратной рекурсии.
+        """
+        try:
+            data = self._public_get("ohlcv", params={"symbol": pair, "interval": timeframe, "limit": limit})
+            if isinstance(data, list) and data:
+                if isinstance(data[0], list):
+                    return [
+                        {"ts": int(r[0]), "open": str(r[1]), "high": str(r[2]),
+                         "low": str(r[3]), "close": str(r[4]), "volume": str(r[5])}
+                        for r in data
+                    ]
+                return data
+        except RuntimeError as e:
+            if "do not exist" not in str(e):
+                # если это не 'do not exist' — просто сваливаемся на kline
+                pass
+        except Exception:
+            pass
+
+        # fallback 1: kline
+        kl = self.kline(pair=pair, timeframe=timeframe, limit=limit)
+        if kl:
+            return kl
+
+        # fallback 2: candles
+        cd = self.candles(pair=pair, timeframe=timeframe, limit=limit)
+        if cd:
+            return cd
+
         return []
 
     # ── приватные методы (read-only) ───────────────────────────────────
