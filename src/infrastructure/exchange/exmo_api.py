@@ -1,256 +1,294 @@
-# src/infrastructure/exchange/exmo_api.py
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
+import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from .http_utils import SimpleTTLCache, RateLimiter, with_retries
+from .http_utils import with_retries
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Вспомогалки
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _is_debug() -> bool:
+    v = os.getenv("EXMO_DEBUG", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _dbg(msg: str) -> None:
+    if _is_debug():
+        print(msg)
+
+
+def _ts_utc() -> int:
+    return int(datetime.now(timezone.utc).timestamp())
+
+
+def _map_resolution(tf: str | int) -> int:
+    """
+    EXMO candles_history принимает resolution в МИНУТАХ (int).
+    Поддержим строки '1m','3m','5m','15m','30m','1h','4h','1d' и т.п.
+    """
+    if isinstance(tf, int):
+        return max(1, tf)
+    s = str(tf).strip().lower()
+    if s.endswith("m"):
+        return max(1, int(s[:-1] or "1"))
+    if s.endswith("h"):
+        return max(1, int(s[:-1] or "1") * 60)
+    if s.endswith("d"):
+        return max(1, int(s[:-1] or "1") * 60 * 24)
+    # fallback: попробовать как int
+    try:
+        return max(1, int(s))
+    except Exception:
+        return 1
+
+
+def _redact(s: str, keep: int = 4) -> str:
+    if not s:
+        return ""
+    if len(s) <= keep:
+        return "*" * len(s)
+    return s[:keep] + "…" + "*" * (len(s) - keep)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Модель кредов
+# ──────────────────────────────────────────────────────────────────────────────
 @dataclass
 class ExmoCredentials:
     api_key: str = ""
     api_secret: str = ""
 
 
-@dataclass
+# ──────────────────────────────────────────────────────────────────────────────
+# Клиент EXMO (v1.1)
+# ──────────────────────────────────────────────────────────────────────────────
 class ExmoApi:
-    """
-    Лёгкий клиент EXMO (по умолчанию read-only).
-    Публичные и приватные методы. Торговые выключены, пока allow_trading=False.
-    """
-    creds: ExmoCredentials = field(default_factory=ExmoCredentials)
     base_url: str = "https://api.exmo.com/v1.1"
-    timeout: float = 15.0
-    user_agent: str = "clean-crypto-bot/0.1"
-    allow_trading: bool = False  # безопасность
 
-    # настройки кэша/лимитов
-    cache_ttls: Dict[str, float] = field(default_factory=lambda: {
-        # endpoint -> TTL seconds
-        "ticker": 1.0,
-        "order_book": 0.5,
-        "trades": 0.5,
-        "candles": 0.5,
-        "kline": 0.5,
-        "ohlcv": 0.5,
-        "ping": 0.5,
-        # приватные сознательно не кэшируем по умолчанию
-    })
-    public_min_interval: float = 0.25   # ~4 rps
-    private_min_interval: float = 0.5   # ~2 rps
-    retry_attempts: int = 3
-
-    def __post_init__(self) -> None:
+    def __init__(self, creds: ExmoCredentials, *, allow_trading: bool = False, timeout: float = 10.0, retry_attempts: int = 3):
+        self.creds = creds
+        self.allow_trading = allow_trading  # пока не используем для write-методов
+        self.timeout = timeout
+        self.retry_attempts = retry_attempts
         self._session = requests.Session()
-        self._session.headers.update({"User-Agent": self.user_agent})
-        self._cache = SimpleTTLCache(max_items=2048)
-        self._rl_public = RateLimiter(self.public_min_interval)
-        self._rl_private = RateLimiter(self.private_min_interval)
+        self._session.headers.update({"User-Agent": "clean-crypto-bot/0.1"})
 
-    # ── низкоуровневые HTTP ─────────────────────────────────────────────
-    def _sign_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        if not self.creds.api_key or not self.creds.api_secret:
-            raise RuntimeError("EXMO creds are not set")
-        payload = dict(payload)
-        payload["nonce"] = int(time.time() * 1000)
-        b = "&".join(f"{k}={payload[k]}" for k in sorted(payload))
-        sig = hmac.new(self.creds.api_secret.encode(), b.encode(), hashlib.sha512).hexdigest()
+    # ── HTTP низкоуровневые ───────────────────────────────────────────────────
+    def _make_url(self, path: str) -> str:
+        p = path.lstrip("/")
+        # защита от двойного v1.1/… (на случай если передали '/v1.1/candles_history')
+        if p.startswith("v1.1/"):
+            p = p[5:]
+        return f"{self.base_url}/{p}"
+
+    def _public_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        url = self._make_url(path)
+
+        def _do():
+            if _is_debug():
+                print(f"[EXMO] → GET {url} params= {params}")
+            r = self._session.get(url, params=params, timeout=self.timeout)
+            if _is_debug():
+                print(f"[EXMO] ← {path} status= {r.status_code}")
+            r.raise_for_status()
+            data = r.json()
+            # некоторые старые эндпоинты при ошибке отдают {"error": "..."}
+            if isinstance(data, dict) and data.get("error"):
+                if _is_debug():
+                    print(f"[EXMO]   error: {data.get('error')}")
+                raise RuntimeError(f"EXMO error: {data.get('error')}")
+            if _is_debug():
+                # не спамим полнотекстом — только первые ~800 байт
+                try:
+                    body_preview = json.dumps(data)[:800]
+                    print(f"[EXMO]   body: {body_preview}{'...(trunc)' if len(body_preview) == 800 else ''}")
+                except Exception:
+                    pass
+            return data
+
+        def _on_retry(i, err):
+            print(f"[EXMO]   retry {i+1}: {type(err).__name__}: {err}")
+
+        return with_retries(_do, attempts=self.retry_attempts, on_retry=_on_retry)
+
+    def _private_post(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        url = self._make_url(path)
+        params = dict(params or {})
+        params["nonce"] = int(time.time() * 1000)
+
+        body = "&".join(f"{k}={params[k]}" for k in sorted(params))
+        secret = self.creds.api_secret.encode("utf-8")
+        sign_bin = hmac.new(secret, body.encode("utf-8"), hashlib.sha512).digest()
+        sign = base64.b64encode(sign_bin).decode("ascii")
+
         headers = {
             "Key": self.creds.api_key,
-            "Sign": sig,
+            "Sign": sign,
             "Content-Type": "application/x-www-form-urlencoded",
         }
-        return {"data": b, "headers": headers}
-
-    def _public_get(self, endpoint: str, params: Optional[Dict[str, Any]] = None, use_cache: bool = True) -> Any:
-        url = f"{self.base_url}/{endpoint}"
-        ttl = self.cache_ttls.get(endpoint, 0.0) if use_cache else 0.0
 
         def _do():
-            self._rl_public.wait()
-            r = self._session.get(url, params=params, timeout=self.timeout)
+            if _is_debug():
+                red_api = _redact(self.creds.api_key)
+                print(f"[EXMO] → POST {url} body= {body} headers.Key={red_api}")
+            r = self._session.post(url, data=params, headers=headers, timeout=self.timeout)
+            if _is_debug():
+                print(f"[EXMO] ← {path} status= {r.status_code}")
             r.raise_for_status()
             data = r.json()
-            # форматы у v1.1 разные: иногда {"result":...,"error":...}, иногда сразу объект
-            if isinstance(data, dict) and "error" in data and data.get("error"):
-                raise RuntimeError(f"EXMO error: {data.get('error')}")
+            # у приватных success=false|true
+            if isinstance(data, dict) and not data.get("success", True):
+                err = data.get("error") or "unknown error"
+                if _is_debug():
+                    print(f"[EXMO]   error: {err}")
+                raise RuntimeError(f"EXMO error: {err}")
             return data
 
-        if ttl > 0:
-            cached = self._cache.get("GET", url, params)
-            if cached is not None:
-                return cached
-            data = with_retries(_do, attempts=self.retry_attempts)
-            self._cache.set("GET", url, params, data, ttl)
-            return data
-        else:
-            return with_retries(_do, attempts=self.retry_attempts)
+        def _on_retry(i, err):
+            print(f"[EXMO]   retry {i+1}: {type(err).__name__}: {err}")
 
-    def _private_post(self, endpoint: str, payload: Optional[Dict[str, Any]] = None) -> Any:
-        url = f"{self.base_url}/{endpoint}"
-        payload = payload or {}
+        return with_retries(_do, attempts=self.retry_attempts, on_retry=_on_retry)
 
-        def _do():
-            self._rl_private.wait()
-            signed = self._sign_payload(payload)
-            r = self._session.post(url, headers=signed["headers"], data=signed["data"], timeout=self.timeout)
-            r.raise_for_status()
-            data = r.json()
-            if not isinstance(data, dict):
-                raise RuntimeError("Malformed EXMO response")
-            # приватные ответы почти всегда {"result": True/False, "error": "...", ...}
-            if data.get("error"):
-                raise RuntimeError(f"EXMO error: {data['error']}")
-            # некоторые методы кладут полезную нагрузку в поля без "result"
-            return data
-
-        return with_retries(_do, attempts=self.retry_attempts)
-
-    # ── публичные методы ───────────────────────────────────────────────
+    # ── Публичные методы ──────────────────────────────────────────────────────
     def ping(self) -> bool:
-        # ping'а в v1.1 нет, эмулируем быстрым /ticker с cache TTL
         try:
             _ = self.ticker()
             return True
         except Exception:
             return False
 
-    def ticker(self) -> Dict[str, Dict[str, str]]:
-        return self._public_get("ticker", params=None, use_cache=True)
+    def ticker(self) -> Dict[str, Any]:
+        # v1 ticker
+        return self._public_get("ticker")
 
-    def ticker_pair(self, pair: str) -> Dict[str, str]:
+    def ticker_pair(self, pair: str) -> Dict[str, Any]:
         tk = self.ticker()
         return tk.get(pair, {}) if isinstance(tk, dict) else {}
 
-    def order_book(self, pair: str, limit: int = 50) -> Dict[str, Any]:
-        return self._public_get("order_book", params={"pair": pair, "limit": int(limit)}, use_cache=True)
+    def order_book(self, pair: str, *, limit: int = 20) -> Dict[str, Any]:
+        return self._public_get("order_book", params={"pair": pair, "limit": limit})
 
-    def trades(self, pair: str, limit: int = 100) -> List[Dict[str, Any]]:
-        # В v1.1 публичные trades — endpoint 'trades', параметр pair и limit
-        raw = self._public_get("trades", params={"pair": pair, "limit": int(limit)}, use_cache=True)
-        # формат: {"PAIR":[{...}, ...]} либо {"result":...,"error":...}
-        if isinstance(raw, dict) and pair in raw:
-            return raw[pair]
+    def trades(self, pair: str, *, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Публичные сделки. На EXMO v1.1 — /trades?pair=... Возвращает dict {pair: [{...}, ...]}
+        """
+        data = self._public_get("trades", params={"pair": pair, "limit": limit})
+        rows = data.get(pair) if isinstance(data, dict) else None
+        if isinstance(rows, list):
+            return rows
         return []
 
-    # В проекте уже реализованы обёртки под свечи:
-    def candles(self, pair: str, timeframe: str = "1m", limit: int = 50):
+    # ── Свечи (через candles_history) ─────────────────────────────────────────
+    def _calc_from_to_by_limit(self, resolution_min: int, limit: int) -> Tuple[int, int]:
         """
-        Базовые свечи. Ходим только в "candles" эндпоинт и НИКУДА неfallback-аем,
-        чтобы избежать рекурсии. Возвращаем [] если пусто/ошибка.
-        Ожидаемый ответ: list[dict] с ключами ts/open/high/low/close/volume (как у нас в проекте).
-        Если придёт list[list], нормализуем.
+        Чтобы получить N последних свечей через candles_history (который ожидает диапазон),
+        считаем to=now, from=to - resolution*limit минут.
         """
-        try:
-            # ❶ Подстрой путь под твой рабочий эндпоинт.
-            # Раньше у нас candles работал — вероятно, это был "candles" или "candles_history".
-            data = self._public_get("candles", params={"symbol": pair, "interval": timeframe, "limit": limit})
-            if isinstance(data, list):
-                if data and isinstance(data[0], list):
-                    # нормализуем [ts,o,h,l,c,v] → dict
-                    return [
-                        {"ts": int(r[0]), "open": str(r[1]), "high": str(r[2]),
-                         "low": str(r[3]), "close": str(r[4]), "volume": str(r[5])}
-                        for r in data
-                    ]
-                return data
-        except RuntimeError as e:
-            # если это "API function do not exist" — не ретраимся бесконечно
-            if "do not exist" in str(e):
-                return []
-        except Exception:
-            pass
-        return []
+        to_ts = _ts_utc()
+        span_sec = resolution_min * 60 * max(1, int(limit))
+        frm_ts = to_ts - span_sec
+        return frm_ts, to_ts
 
-    def kline(self, pair: str, timeframe: str = "1m", limit: int = 50):
+    def candles(self, *, pair: str, timeframe: str | int, limit: int = 100) -> List[Dict[str, Any]]:
         """
-        Агрегированные свечи. Если пусто — НЕТ взаимного вызова candles здесь.
-        Возвращаем [] при ошибке/пустом ответе.
+        Унифицированный возврат списка словарей:
+          [{ts, open, high, low, close, volume}, ...]
+        Берём данные из /candles_history.
         """
-        try:
-            data = self._public_get("kline", params={"symbol": pair, "interval": timeframe, "limit": limit})
-            if isinstance(data, list):
-                # может быть уже dict-список или list[list]
-                if data and isinstance(data[0], list):
-                    return [
-                        {"ts": int(r[0]), "open": str(r[1]), "high": str(r[2]),
-                         "low": str(r[3]), "close": str(r[4]), "volume": str(r[5])}
-                        for r in data
-                    ]
-                return data
-        except RuntimeError as e:
-            if "do not exist" in str(e):
-                return []
-        except Exception:
-            pass
-        return []
+        res = _map_resolution(timeframe)
+        frm, to = self._calc_from_to_by_limit(res, limit)
 
-    def ohlcv(self, pair: str, timeframe: str = "1m", limit: int = 50):
+        params = {"symbol": pair, "resolution": res, "from": frm, "to": to}
+        _dbg(f"[EXMO] probe: candles_history params= {params}")
+
+        data = self._public_get("candles_history", params=params)
+        candles = data.get("candles") if isinstance(data, dict) else None
+        if not isinstance(candles, list):
+            _dbg("[EXMO]   no luck: empty rows")
+            return []
+
+        out: List[Dict[str, Any]] = []
+        for r in candles:
+            # r: {"t": 1754815800000, "o": 0.2, "c":..., "h":..., "l":..., "v": 248.29}
+            try:
+                ts = int(int(r["t"]) // 1000)
+                out.append({
+                    "ts": ts,
+                    "open": str(r["o"]),
+                    "high": str(r["h"]),
+                    "low": str(r["l"]),
+                    "close": str(r["c"]),
+                    "volume": str(r.get("v", "")),
+                })
+            except Exception:
+                continue
+
+        _dbg(f"[EXMO]   candles_history OK rows={len(out)}")
+        return out
+
+    def kline(self, *, pair: str, timeframe: str | int, limit: int = 100) -> List[Dict[str, Any]]:
+        # Для совместимости оставим отдельное имя, но используем candles_history
+        return self.candles(pair=pair, timeframe=timeframe, limit=limit)
+
+    def ohlcv(self, *, pair: str, timeframe: str | int, limit: int = 100) -> List[List[Any]]:
         """
-        Унифицированная обёртка: пробуем нативный ohlcv.
-        Если пусто — fallback → kline, и только если снова пусто — fallback → candles.
-        Никакой обратной рекурсии.
+        Возврат в виде списков: [[ts, o, h, l, c, v], ...]
+        На базе candles_history.
         """
-        try:
-            data = self._public_get("ohlcv", params={"symbol": pair, "interval": timeframe, "limit": limit})
-            if isinstance(data, list) and data:
-                if isinstance(data[0], list):
-                    return [
-                        {"ts": int(r[0]), "open": str(r[1]), "high": str(r[2]),
-                         "low": str(r[3]), "close": str(r[4]), "volume": str(r[5])}
-                        for r in data
-                    ]
-                return data
-        except RuntimeError as e:
-            if "do not exist" not in str(e):
-                # если это не 'do not exist' — просто сваливаемся на kline
-                pass
-        except Exception:
-            pass
+        rows = self.candles(pair=pair, timeframe=timeframe, limit=limit)
+        ohlcv_rows: List[List[Any]] = []
+        for r in rows:
+            try:
+                ohlcv_rows.append([
+                    int(r["ts"]),
+                    str(r["open"]),
+                    str(r["high"]),
+                    str(r["low"]),
+                    str(r["close"]),
+                    str(r.get("volume", "")),
+                ])
+            except Exception:
+                continue
+        return ohlcv_rows
 
-        # fallback 1: kline
-        kl = self.kline(pair=pair, timeframe=timeframe, limit=limit)
-        if kl:
-            return kl
-
-        # fallback 2: candles
-        cd = self.candles(pair=pair, timeframe=timeframe, limit=limit)
-        if cd:
-            return cd
-
-        return []
-
-    # ── приватные методы (read-only) ───────────────────────────────────
+    # ── Приватные (read-only) ─────────────────────────────────────────────────
     def user_balances(self) -> Dict[str, Decimal]:
-        raw = self._private_post("user_info")
-        # форматы у EXMO различаются; ожидаем balances в "balances" или "balances":{"USD":"..."}
-        balances = raw.get("balances") or raw.get("wallet") or {}
+        data = self._private_post("user_info")
+        balances = data.get("balances") if isinstance(data, dict) else None
+        if not isinstance(balances, dict):
+            return {}
         out: Dict[str, Decimal] = {}
         for k, v in balances.items():
             try:
-                out[k] = Decimal(str(v))
+                out[str(k)] = Decimal(str(v))
             except Exception:
-                out[k] = Decimal("0")
+                out[str(k)] = Decimal("0")
         return out
 
-    def user_open_orders(self, pair: str) -> Dict[str, Any]:
-        return self._private_post("user_open_orders", {"pair": pair})
+    def user_open_orders(self, pair: Optional[str] = None) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        if pair:
+            params["pair"] = pair
+        return self._private_post("user_open_orders", params=params)
 
-    def user_trades(self, pair: str, limit: int = 100) -> List[Dict[str, Any]]:
-        raw = self._private_post("user_trades", {"pair": pair, "limit": int(limit)})
-        # формат обычно {"result":True, "error":"", "trades":[{...}]}
-        trades = raw.get("trades")
-        if isinstance(trades, list):
-            return trades
-        # иногда {"PAIR":[...]}
-        if pair in raw and isinstance(raw[pair], list):
-            return raw[pair]
+    def user_trades(self, pair: str, *, limit: int = 100) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"pair": pair, "limit": limit}
+        data = self._private_post("user_trades", params=params)
+        # Формат EXMO: { "trades": [ { ... }, ... ] } ИЛИ список сразу.
+        rows = data.get("trades") if isinstance(data, dict) else data
+        if isinstance(rows, list):
+            return rows
         return []

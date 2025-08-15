@@ -1,87 +1,57 @@
-# src/infrastructure/exchange/http_utils.py
 from __future__ import annotations
 
-import json
+import os
 import time
-import threading
-from typing import Any, Dict, Tuple, Optional, Callable
+import traceback
+from typing import Callable, Iterable, Optional, Type, Tuple
 
-class SimpleTTLCache:
+
+def _is_debug() -> bool:
+    v = os.getenv("EXMO_DEBUG", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def with_retries(
+    fn: Callable[[], any],
+    *,
+    attempts: int = 3,
+    backoff_base: float = 0.5,
+    retry_exceptions: Tuple[Type[BaseException], ...] = (Exception,),
+    on_retry: Optional[Callable[[int, BaseException], None]] = None,
+):
     """
-    Очень простой in-memory TTL-кэш (потокобезопасный).
-    Ключом делаем tuple (method, url, frozen_params_json).
+    Универсальный ретраер для HTTP-вызывалок.
+
+    - attempts: сколько всего попыток (>=1)
+    - backoff_base: базовая задержка, далее экспонента (base * 2**i)
+    - retry_exceptions: какие исключения считаем ретраябельными
+    - on_retry(i, err): колбэк перед сном перед (i+1)-й попыткой
     """
-    def __init__(self, max_items: int = 1024):
-        self._data: Dict[Tuple[str, str, str], Tuple[float, Any]] = {}
-        self._lock = threading.Lock()
-        self._max = max_items
+    if attempts < 1:
+        attempts = 1
 
-    @staticmethod
-    def _freeze_params(params: Optional[Dict[str, Any]]) -> str:
-        if not params:
-            return "{}"
-        # сортируем ключи, чтобы одинаковые словари давали одинаковую строку
-        return json.dumps(params, sort_keys=True, separators=(",", ":"))
-
-    def get(self, method: str, url: str, params: Optional[Dict[str, Any]]) -> Optional[Any]:
-        key = (method.upper(), url, self._freeze_params(params))
-        now = time.time()
-        with self._lock:
-            item = self._data.get(key)
-            if not item:
-                return None
-            expires_at, value = item
-            if expires_at < now:
-                self._data.pop(key, None)
-                return None
-            return value
-
-    def set(self, method: str, url: str, params: Optional[Dict[str, Any]], value: Any, ttl: float) -> None:
-        key = (method.upper(), url, self._freeze_params(params))
-        exp = time.time() + max(0.0, ttl)
-        with self._lock:
-            if len(self._data) >= self._max:
-                # простая эвикция: зачистим просроченные/старые
-                now = time.time()
-                dead = [k for k, (e, _) in self._data.items() if e < now]
-                for k in dead:
-                    self._data.pop(k, None)
-                if len(self._data) >= self._max:
-                    # удалим произвольно один элемент
-                    self._data.pop(next(iter(self._data)), None)
-            self._data[key] = (exp, value)
-
-
-class RateLimiter:
-    """
-    Простой рейткеппер: гарантирует минимальный интервал между запросами.
-    Отдельный инстанс — для public и для private.
-    """
-    def __init__(self, min_interval_sec: float):
-        self._min = float(min_interval_sec)
-        self._lock = threading.Lock()
-        self._last_ts = 0.0
-
-    def wait(self) -> None:
-        with self._lock:
-            now = time.time()
-            delta = now - self._last_ts
-            if delta < self._min:
-                time.sleep(self._min - delta)
-            self._last_ts = time.time()
-
-
-def with_retries(fn: Callable[[], Any], attempts: int = 3, backoff_base: float = 0.25) -> Any:
-    """
-    Универсальный ретрайзер. Повторяет вызов fn() при сетевых/серверных сбоях.
-    Исключения от fn пробрасывает после исчерпания попыток.
-    """
-    last_err = None
+    last_err: Optional[BaseException] = None
     for i in range(attempts):
         try:
             return fn()
-        except Exception as e:
+        except retry_exceptions as e:
             last_err = e
-            time.sleep(backoff_base * (2 ** i))
-    if last_err:
-        raise last_err
+            # последняя попытка — пробрасываем ошибку
+            if i == attempts - 1:
+                break
+            if on_retry:
+                try:
+                    on_retry(i, e)
+                except Exception:
+                    # не роняем ретраер, даже если колбэк сломался
+                    pass
+            # экспоненциальный бэкофф
+            delay = backoff_base * (2 ** i)
+            if _is_debug():
+                print(f"[retry] attempt {i+1}/{attempts} failed: {type(e).__name__}: {e}. sleep {delay:.3f}s")
+                # короткий трейс в дебаге
+                traceback.print_exc()
+            time.sleep(delay)
+
+    assert last_err is not None
+    raise last_err

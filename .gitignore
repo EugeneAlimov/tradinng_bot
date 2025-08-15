@@ -73,3 +73,6 @@ src/application/services/*.pyc
 analytics_export_*
 # Temporary migration files
 migration_temp_*
+
+
+Archive.zip

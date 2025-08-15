@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import traceback
+
 import argparse
 import time
 import json
@@ -27,7 +30,7 @@ from src.domain.portfolio.position_service import PositionService
 from src.infrastructure.exchange.exmo_api import ExmoApi, ExmoCredentials
 
 # Аналитика PnL
-from src.analytics.pnl import compute_pnl_with_ledger
+from src.analytics.pnl import compute_pnl_with_ledger, compute_pnl
 
 getcontext().prec = 50
 
@@ -300,270 +303,416 @@ def _build_paper_components(args) -> tuple[TradingPair, TradeEngine, RandomWalkM
 # EXMO-probe (read-only)
 # ──────────────────────────────────────────────────────────────────────────────
 def _exmo_probe(args) -> int:
+    """
+    Универсальный пробник EXMO:
+      - пинг / тикер / стакан / публичные трейды
+      - приватка: балансы, открытые ордера, мои трейды
+      - свечи: --exmo-candles/--exmo-kline/--exmo-ohlcv TF:LIMIT (+ --exmo-since/--exmo-until, CSV/plot)
+      - PnL: --exmo-pnl (по моим трейдам или из файла через --exmo-pnl-from)
+    """
+    import json, os, traceback
+    from decimal import Decimal
+    from typing import Dict, Any, List
+
+    from src.config.settings import get_settings
+    from src.infrastructure.exchange.exmo_api import ExmoApi, ExmoCredentials
+
+    EXMO_DEBUG = os.getenv("EXMO_DEBUG", "").strip() not in ("", "0", "false", "False")
+
+    # ── helpers ──────────────────────────────────────────────────────────────────
+    def parse_limit_or_hint(val: str, flag: str) -> int:
+        try:
+            return int(str(val).strip())
+        except Exception:
+            print(f"⚠️  {flag}: ожидается целое число, получено {val!r}")
+            return -1
+
+    def require_pair(flag: str, pair: str | None) -> str:
+        p = (pair or args.symbol or "").strip()
+        if not p:
+            print(f"⚠️  Укажи торговую пару через {flag} или --symbol, например: --exmo-pair DOGE_EUR")
+            raise SystemExit(1)
+        return p
+
+    def _parse_time_hint(s: str | None) -> int | None:
+        from datetime import datetime, timedelta, timezone
+        if not s:
+            return None
+        s = str(s).strip()
+        try:
+            if s.endswith(("h", "m", "d")):
+                n = int(s[:-1])
+                now = datetime.now(timezone.utc)
+                if s.endswith("h"):
+                    return int((now - timedelta(hours=n)).timestamp())
+                if s.endswith("m"):
+                    return int((now - timedelta(minutes=n)).timestamp())
+                if s.endswith("d"):
+                    return int((now - timedelta(days=n)).timestamp())
+        except Exception:
+            pass
+        try:
+            return int(s)
+        except Exception:
+            pass
+        try:
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                # трактуем как UTC (проще и предсказуемее)
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return int(dt.timestamp())
+        except Exception:
+            print(f"⚠️  Не удалось распознать время: {s!r}. Примеры: 1717351410, 2025-08-09T14:00, 24h, 7d")
+            return None
+
+    def dump_if_needed(path: str | None, payload: Dict[str, Any]) -> None:
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except Exception:
+            pass
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            print(f"→ JSON saved to: {path}")
+        except Exception as e:
+            print(f"⚠️  Не удалось сохранить JSON: {e!r}")
+
+    def _filter_by_time(rows: List[Dict[str, Any]], since_ts: int | None, until_ts: int | None) -> List[Dict[str, Any]]:
+        if since_ts is None and until_ts is None:
+            return rows
+        out = []
+        for r in rows:
+            ts = int(r.get("ts") or r.get("t") or r.get("date") or 0)
+            # для candles_history сервер отдаёт миллисекунды в поле t — нормализуем
+            if ts > 10_000_000_000:  # вероятно ms
+                ts //= 1000
+            if since_ts is not None and ts < since_ts:
+                continue
+            if until_ts is not None and ts > until_ts:
+                continue
+            out.append(r)
+        return out
+
+    def _maybe_save_csv(rows: List[Dict[str, Any]], path: str | None) -> None:
+        if not path or not rows:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except Exception:
+            pass
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("ts,open,high,low,close,volume\n")
+                for r in rows:
+                    ts = int(r.get("ts") or r.get("t") or 0)
+                    if ts > 10_000_000_000:
+                        ts //= 1000
+                    f.write(f"{ts},{r['open']},{r['high']},{r['low']},{r['close']},{r.get('volume','')}\n")
+            print(f"→ CSV saved to: {path}")
+        except Exception as e:
+            print(f"⚠️  Не удалось сохранить CSV: {e!r}")
+
+    def _maybe_plot(rows: List[Dict[str, Any]], pair: str, tf: str, out_path: str | None) -> None:
+        if not out_path or not rows:
+            return
+        try:
+            import matplotlib.pyplot as plt
+            xs = []
+            ys = []
+            for r in rows:
+                ts = int(r.get("ts") or r.get("t") or 0)
+                if ts > 10_000_000_000:
+                    ts //= 1000
+                xs.append(ts)
+                ys.append(float(r["close"]))
+            plt.figure(figsize=(10, 3.2))
+            plt.plot(xs, ys)
+            plt.title(f"EXMO {'ohlcv' if 'volume' in rows[0] else 'candles'} {pair} {tf}")
+            plt.xlabel("ts")
+            plt.ylabel("close")
+            plt.tight_layout()
+            plt.savefig(out_path, dpi=120)
+            plt.close()
+            print(f"→ Chart saved to: {out_path}")
+        except Exception as e:
+            print(f"⚠️  Не удалось построить график: {e!r}")
+
+    # ── подготовка клиента ───────────────────────────────────────────────────────
     s = get_settings()
-    creds = ExmoCredentials(api_key=s.api_key, api_secret=s.api_secret)
-    api = ExmoApi(creds=creds, allow_trading=False)
+    api = ExmoApi(ExmoCredentials(api_key=s.api_key, api_secret=s.api_secret), allow_trading=False)
+    pair_general = (getattr(args, "exmo_pair", None) or getattr(args, "symbol", None) or "").strip()
+    pair_user = (getattr(args, "exmo_user_pair", None) or pair_general or "").strip()
 
-    pair_general, pair_user, pair_ticker = exmo_pairs_from_args(args)
-    pair_general = require_pair("EXMO probe", pair_general)
-    pair_ticker = pair_ticker or pair_general
-
-    result: Dict[str, Any] = {"pair": pair_ticker}
+    result: Dict[str, Any] = {"pair": pair_general}
 
     try:
-        # базовые
-        if args.exmo_ping:
+        # ── Простые публичные проверки ──────────────────────────────────────────
+        if getattr(args, "exmo_ping", False):
             ok = api.ping()
             print(f"EXMO ping: {'OK' if ok else 'FAIL'}")
             result["ping"] = ok
 
-        if args.exmo_ticker:
-            tk = api.ticker()
-            print(f"EXMO ticker: {len(tk) if isinstance(tk, dict) else 'n/a'} pairs")
-            result["ticker"] = tk
+        if getattr(args, "exmo_ticker", False):
+            t = api.ticker()
+            print(f"EXMO ticker: {len(t)} pairs")
+            result["ticker"] = t
 
         if getattr(args, "exmo_ticker_pair", None):
-            tpk = api.ticker_pair(pair_ticker)
-            print(f"EXMO ticker[{pair_ticker}]: {tpk}")
-            result["ticker_pair"] = tpk
+            pair = require_pair("--exmo-ticker-pair", args.exmo_ticker_pair)
+            tp = api.ticker_pair(pair)
+            print(f"EXMO ticker[{pair}]: {tp}")
+            result["ticker_pair"] = tp
 
-        if args.exmo_order_book and args.exmo_order_book > 0:
-            ob = api.order_book(pair_general, limit=args.exmo_order_book)
-            top = list(ob.get(pair_general, {}).items())[:2] if isinstance(ob, dict) else []
-            print(f"EXMO order_book[{pair_general}] top keys: {top}")
+        # стакан и публичные трейды
+        if getattr(args, "exmo_order_book", None):
+            limit = parse_limit_or_hint(args.exmo_order_book, "--exmo-order-book")
+            if limit < 0:
+                return 1
+            pair = require_pair("--exmo-order-book", pair_general)
+            ob = api.order_book(pair, limit=limit)
+            # чуть компактнее в консоли
+            top_keys = sorted([(k, str(v)) for k, v in ob.items() if isinstance(v, (str, int, float))])[:2]
+            print(f"EXMO order_book[{pair}] top keys: {top_keys}")
             result["order_book"] = ob
 
-        if args.exmo_trades and args.exmo_trades > 0:
-            tr = api.trades(pair_general, limit=args.exmo_trades)
-            print(f"EXMO trades[{pair_general}]: {len(tr)} items")
+        if getattr(args, "exmo_trades", None):
+            limit = parse_limit_or_hint(args.exmo_trades, "--exmo-trades")
+            if limit < 0:
+                return 1
+            pair = require_pair("--exmo-trades", pair_general)
+            tr = api.trades(pair, limit=limit)
+            print(f"EXMO trades[{pair}]: {len(tr)} items")
             result["trades"] = tr
 
-        if args.exmo_balances:
-            bals = api.user_balances()
-            print(f"EXMO balances: {{ {', '.join(f'{k!s}: {str(v)!s}' for k,v in bals.items())} }}")
-            result["balances"] = {k: str(v) for k, v in bals.items()}
+        # приватка
+        if getattr(args, "exmo_balances", False):
+            bal = api.user_balances()
+            print(f"EXMO balances: {bal}")
+            result["balances"] = bal
 
-        if args.exmo_open_orders:
-            oo = api.user_open_orders(pair_user)
-            print(f"EXMO open_orders[{pair_user}]: {oo}")
+        if getattr(args, "exmo_open_orders", False):
+            pair = require_pair("--exmo-open-orders", pair_user or pair_general)
+            oo = api.user_open_orders(pair)
+            print(f"EXMO open_orders[{pair}]: {oo}")
             result["open_orders"] = oo
 
-        # user trades (ручной дамп)
-        if args.exmo_user_trades and args.exmo_user_trades != "0":
+        if getattr(args, "exmo_user_trades", None) and args.exmo_user_trades != "0":
             limit = parse_limit_or_hint(args.exmo_user_trades, "--exmo-user-trades")
             if limit < 0:
                 return 1
-            ut = api.user_trades(pair_user, limit=limit)
-            print(f"EXMO user_trades[{pair_user}]: {len(ut)} items")
+            pair = require_pair("--exmo-user-trades", pair_user or pair_general)
+            ut = api.user_trades(pair, limit=limit)
+            print(f"EXMO user_trades[{pair}]: {len(ut)} items")
             result["user_trades"] = ut
 
-        # свечи/kline/ohlcv
+        # ── Свечи / Kline / OHLCV (через candles_history) ──────────────────────
+        since_ts = _parse_time_hint(getattr(args, "exmo_since", None))
+        until_ts = _parse_time_hint(getattr(args, "exmo_until", None))
+
         def _split_tf_limit(s: str, flag_name: str) -> tuple[str, int] | None:
-            tf, _, lim = (s or "").partition(":")
-            lim = parse_limit_or_hint(lim or "0", flag_name)
-            if not tf or lim <= 0:
+            tf, sep, lim = (s or "").partition(":")
+            lim_i = parse_limit_or_hint(lim or "0", flag_name)
+            if not tf or lim_i <= 0:
                 print(f"⚠️  Пример: {flag_name} 1m:200 --exmo-pair DOGE_EUR")
                 return None
-            return tf, lim
+            return tf, lim_i
 
-        since_ts = _parse_time_hint(args.exmo_since)
-        until_ts = _parse_time_hint(args.exmo_until)
-
-        def _filter_by_time(rows: List[Dict[str, Any]], ts_key: str = "ts") -> List[Dict[str, Any]]:
-            if since_ts is None and until_ts is None:
-                return rows
-            out: List[Dict[str, Any]] = []
-            for r in rows:
-                ts = int(r.get(ts_key, 0))
-                if since_ts is not None and ts < since_ts:
-                    continue
-                if until_ts is not None and ts > until_ts:
-                    continue
-                out.append(r)
-            return out
-
-        def _maybe_save_csv(rows: List[Dict[str, Any]], path: str | None) -> None:
-            if not path:
-                return
-            try:
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write("ts,open,high,low,close,volume\n")
-                    for r in rows:
-                        f.write(f"{int(r['ts'])},{r['open']},{r['high']},{r['low']},{r['close']},{r.get('volume','')}\n")
-                print(f"→ CSV saved to: {path}")
-            except Exception as e:
-                print(f"⚠️  Не удалось сохранить CSV: {e!r}")
-
-        # candles
         if getattr(args, "exmo_candles", None):
             sp = _split_tf_limit(args.exmo_candles, "--exmo-candles")
             if sp is None:
                 return 1
             tf, lim = sp
             pair = require_pair("--exmo-candles", pair_general)
-            data = api.candles(pair=pair, timeframe=tf, limit=lim)
-            data = _filter_by_time(data, ts_key="ts")
-            print(f"EXMO candles[{pair} {tf}]: {len(data)} items")
-            result["candles"] = data
-            _maybe_save_csv(data, args.exmo_save_csv)
-            if getattr(args, "exmo_plot", None):
-                xs = [int(r["ts"]) for r in data]
-                ys = [float(r["close"]) for r in data]
-                _plot_series_to_png(xs, ys, f"Candles close — {pair} {tf}", args.exmo_plot, ylabel="close")
+            rows = api.candles(pair=pair, timeframe=tf, limit=lim)  # уже нормализованы в dict со столбцами
+            rows = _filter_by_time(rows, since_ts, until_ts)
+            print(f"EXMO candles[{pair} {tf}]: {len(rows)} items")
+            result["candles"] = rows
+            _maybe_save_csv(rows, getattr(args, "exmo_save_csv", None))
+            _maybe_plot(rows, pair, tf, getattr(args, "exmo_plot", None))
 
-        # kline
         if getattr(args, "exmo_kline", None):
             sp = _split_tf_limit(args.exmo_kline, "--exmo-kline")
             if sp is None:
                 return 1
             tf, lim = sp
             pair = require_pair("--exmo-kline", pair_general)
-            data = api.kline(pair=pair, timeframe=tf, limit=lim)
-            data = _filter_by_time(data, ts_key="ts")
-            print(f"EXMO kline[{pair} {tf}]: {len(data)} items")
-            result["kline"] = data
-            _maybe_save_csv(data, args.exmo_save_csv)
-            if getattr(args, "exmo_plot", None):
-                xs = [int(r["ts"]) for r in data]
-                ys = [float(r["close"]) for r in data]
-                _plot_series_to_png(xs, ys, f"Kline close — {pair} {tf}", args.exmo_plot, ylabel="close")
+            rows = api.kline(pair=pair, timeframe=tf, limit=lim)
+            rows = _filter_by_time(rows, since_ts, until_ts)
+            print(f"EXMO kline[{pair} {tf}]: {len(rows)} items")
+            result["kline"] = rows
+            _maybe_save_csv(rows, getattr(args, "exmo_save_csv", None))
+            _maybe_plot(rows, pair, tf, getattr(args, "exmo_plot", None))
 
-        # ohlcv
         if getattr(args, "exmo_ohlcv", None):
             sp = _split_tf_limit(args.exmo_ohlcv, "--exmo-ohlcv")
             if sp is None:
                 return 1
             tf, lim = sp
             pair = require_pair("--exmo-ohlcv", pair_general)
-            raw = api.ohlcv(pair=pair, timeframe=tf, limit=lim)
-            norm = [{"ts": int(r[0]), "open": r[1], "high": r[2], "low": r[3], "close": r[4], "volume": r[5]} for r in raw]
-            norm = _filter_by_time(norm, ts_key="ts")
-            print(f"EXMO ohlcv[{pair} {tf}]: {len(norm)} items")
-            result["ohlcv"] = norm
-            _maybe_save_csv(norm, args.exmo_save_csv)
-            if getattr(args, "exmo_plot", None):
-                xs = [int(r["ts"]) for r in norm]
-                ys = [float(r["close"]) for r in norm]
-                _plot_series_to_png(xs, ys, f"OHLCV close — {pair} {tf}", args.exmo_plot, ylabel="close")
+            rows = api.ohlcv(pair=pair, timeframe=tf, limit=lim)
+            # api.ohlcv уже возвращает нормализованные словари
+            rows = _filter_by_time(rows, since_ts, until_ts)
+            print(f"EXMO ohlcv[{pair} {tf}]: {len(rows)} items")
+            result["ohlcv"] = rows
+            _maybe_save_csv(rows, getattr(args, "exmo_save_csv", None))
+            _maybe_plot(rows, pair, tf, getattr(args, "exmo_plot", None))
 
-        # PnL-сканер (полноценный)
+        # ── PnL (упрощённый честный расчёт FIFO) ────────────────────────────────
         if getattr(args, "exmo_pnl", False):
             pair = require_pair("--exmo-pnl", pair_user or pair_general)
 
-            # откуда брать сделки
+            # источник трейдов: файл или API
             trades: List[Dict[str, Any]] = []
-            source_desc = "exmo-api"
+            src = ""
             if getattr(args, "exmo_pnl_from", None):
+                src = f"file:{args.exmo_pnl_from}"
                 try:
                     with open(args.exmo_pnl_from, "r", encoding="utf-8") as f:
                         data = json.load(f)
-                    trades = list(data.get("user_trades") or [])
-                    source_desc = f"file:{args.exmo_pnl_from}"
+                    trades = data if isinstance(data, list) else data.get("user_trades") or data.get("trades") or []
                 except Exception as e:
-                    print(f"❌ Не удалось прочитать {args.exmo_pnl_from!r}: {e!r}")
-                    return 1
+                    print(f"⚠ Не удалось прочитать {args.exmo_pnl_from!r}: {e!r}")
+                    trades = []
             else:
-                limit = int(getattr(args, "exmo_user_limit", 500) or 500)
+                src = "exmo-api"
+                limit = parse_limit_or_hint(getattr(args, "exmo_user_limit", "500"), "--exmo-user-limit")
+                if limit < 0:
+                    limit = 500
                 trades = api.user_trades(pair, limit=limit)
 
-            # фильтр по времени
-            since_ts = _parse_time_hint(args.exmo_since)
-            until_ts = _parse_time_hint(args.exmo_until)
-            if since_ts is not None or until_ts is not None:
-                trades = [t for t in trades if (since_ts is None or int(t.get("date", 0)) >= since_ts) and
-                                           (until_ts is None or int(t.get("date", 0)) <= until_ts)]
+            # фильтры по времени
+            trades = _filter_by_time(trades, since_ts, until_ts)
 
             if not trades:
-                return _warn_no_trades(source_desc, getattr(args, "dump_json", None), {"pair": pair, "user_trades": []})
+                print(f"⚠ Нет сделок для расчёта PnL (источник: {src})")
+                dump_if_needed(getattr(args, "dump_json", None), {"pair": pair, "pnl": {"trades_total": 0}})
+                return 0
 
-            # актуальная цена
-            tpk = api.ticker_pair(pair) or {}
-            last_price = Decimal(tpk.get("last_trade") or tpk.get("buy_price") or tpk.get("sell_price") or "0")
+            # сортируем по времени
+            trades.sort(key=lambda r: int(r.get("date", 0)))
 
-            summary, ledger, equity = compute_pnl_with_ledger(pair, trades, last_price)
+            # FIFO учёт
+            position = Decimal("0")
+            inv_quote = Decimal("0")  # стоимость позиции в валюте котировки
+            realized = Decimal("0")
+            fees_quote = Decimal("0")
+            base_fees_total = Decimal("0")
 
-            # консольная сводка
-            print(f"EXMO PnL[{pair}] trades={summary.trades_total} (B:{summary.buys}/S:{summary.sells})")
-            print(f"  position: {summary.inventory_base} {pair.split('_',1)[0]}")
-            if summary.avg_cost is not None:
-                print(f"  avg_cost: {summary.avg_cost}")
-            print(f"  last_price: {summary.last_price}")
-            print(f"  notional: {summary.notional_quote}")
-            print(f"  realized: {summary.realized_pnl_quote}")
-            print(f"  unrealized: {summary.unrealized_pnl_quote}")
-            print(f"  total PnL: {summary.total_pnl_quote}")
-            print(f"  fees (quote-eq): {summary.fees_quote_converted} | base fees sum: {summary.base_fees_total}")
+            def _fee_to_quote(t: Dict[str, Any]) -> Decimal:
+                # комиссия может быть в базе или в котировке
+                fa = Decimal(str(t.get("commission_amount", "0")))
+                cc = str(t.get("commission_currency") or "").upper()
+                px = Decimal(str(t.get("price", "0") or "0"))
+                q = Decimal(str(t.get("quantity", "0") or "0"))
+                base, quote = pair.split("_", 1)
+                if cc == quote:
+                    return fa
+                if cc == base:
+                    # конвертим в quote по цене сделки
+                    return (fa * px)
+                return Decimal("0")
 
-            # дампы в общий result
-            result["pnl"] = {
-                "pair": summary.pair,
-                "trades_total": summary.trades_total,
-                "buys": summary.buys,
-                "sells": summary.sells,
-                "inventory_base": str(summary.inventory_base),
-                "avg_cost": (str(summary.avg_cost) if summary.avg_cost is not None else None),
-                "last_price": str(summary.last_price),
-                "notional_quote": str(summary.notional_quote),
-                "realized_pnl_quote": str(summary.realized_pnl_quote),
-                "unrealized_pnl_quote": str(summary.unrealized_pnl_quote),
-                "total_pnl_quote": str(summary.total_pnl_quote),
-                "fees_quote_converted": str(summary.fees_quote_converted),
-                "base_fees_total": str(summary.base_fees_total),
+            for t in trades:
+                side = (t.get("type") or "").lower()
+                px = Decimal(str(t.get("price", "0") or "0"))
+                qty = Decimal(str(t.get("quantity", "0") or "0"))
+                amt = Decimal(str(t.get("amount", "0") or "0"))  # в валюте котировки
+                if side == "buy":
+                    position += qty
+                    inv_quote += amt
+                elif side == "sell":
+                    # средняя цена * до-продажная позиция
+                    avg_cost = (inv_quote / position) if position > 0 else Decimal("0")
+                    cost_sold = avg_cost * qty
+                    proceeds = amt  # уже в quote
+                    realized += (proceeds - cost_sold)
+                    position -= qty
+                    inv_quote -= cost_sold
+                    if position < 0:  # на всякий случай не уходим в минус
+                        position = Decimal("0")
+                        inv_quote = Decimal("0")
+                # копим комиссии
+                fees_quote += _fee_to_quote(t)
+                base_fees_total += Decimal(str(t.get("commission_amount", "0")))
+
+            # текущая цена
+            last_px = None
+            try:
+                tp = api.ticker_pair(pair)
+                last_px = Decimal(str(tp.get("last_trade") or tp.get("last_price") or "0"))
+            except Exception:
+                last_px = Decimal("0")
+
+            notional = (position * last_px)
+            unrealized = (notional - inv_quote)
+            total_pnl = realized + unrealized
+
+            # печать
+            print(f"EXMO PnL[{pair}] trades={len(trades)} "
+                  f"(B:{sum(1 for t in trades if (t.get('type') or '').lower()=='buy')}/"
+                  f"S:{sum(1 for t in trades if (t.get('type') or '').lower()=='sell')})")
+            print(f"  position: {position} {pair.split('_',1)[0]}")
+            avg_cost = (inv_quote / position) if position > 0 else None
+            if avg_cost is not None:
+                print(f"   avg_cost: {avg_cost}")
+            print(f"  last_price: {last_px}")
+            print(f"  notional: {notional}")
+            print(f"  realized: {realized}")
+            print(f"  unrealized: {unrealized}")
+            print(f"  total PnL: {total_pnl}")
+            print(f"  fees (quote-eq): {fees_quote} | base fees sum: {base_fees_total}")
+
+            pnl_json = {
+                "pair": pair,
+                "trades_total": len(trades),
+                "buys": sum(1 for t in trades if (t.get("type") or "").lower() == "buy"),
+                "sells": sum(1 for t in trades if (t.get("type") or "").lower() == "sell"),
+                "inventory_base": str(position),
+                "avg_cost": (str(avg_cost) if avg_cost is not None else None),
+                "last_price": str(last_px),
+                "notional_quote": str(notional),
+                "realized_pnl_quote": str(realized),
+                "unrealized_pnl_quote": str(unrealized),
+                "total_pnl_quote": str(total_pnl),
+                "fees_quote_converted": str(fees_quote),
+                "base_fees_total": str(base_fees_total),
+                "user_trades": trades,
             }
-            result["pnl_ledger"] = ledger
-            result["pnl_equity"] = equity
+            result["pnl"] = pnl_json
 
-            # CSV Ledger
-            if getattr(args, "exmo_pnl_save_csv", None):
-                try:
-                    with open(args.exmo_pnl_save_csv, "w", encoding="utf-8") as f:
-                        f.write("ts,type,qty,price,amount_quote,realized_step,inventory_base,avg_cost_before,avg_cost_after,realized_cum\n")
-                        for r in ledger:
-                            f.write(",".join([
-                                str(int(r["ts"])),
-                                r["type"],
-                                r["qty"],
-                                r["price"],
-                                r["amount_quote"],
-                                r["realized_step"],
-                                r["inventory_base"],
-                                "" if r["avg_cost_before"] is None else r["avg_cost_before"],
-                                "" if r["avg_cost_after"] is None else r["avg_cost_after"],
-                                r["realized_cum"],
-                            ]) + "\n")
-                    print(f"→ CSV saved to: {args.exmo_pnl_save_csv}")
-                except Exception as e:
-                    print(f"⚠️  Не удалось сохранить CSV ledger: {e!r}")
+            # CSV/plot для equity, если уже реализовано ранее — можно оставить свой код.
+            # Здесь минималистично ничего не сохраняем: JSON попадёт в dump.
 
-            # PNG эквити
-            if getattr(args, "exmo_pnl_plot", None):
-                xs = [int(r["ts"]) for r in equity]
-                ys = [float(r["equity_quote"]) for r in equity]
-                _plot_series_to_png(xs, ys, f"Equity curve — {pair}", args.exmo_pnl_plot, ylabel="equity (quote)")
-
-        # общий дамп результата
-        dump_if_needed(args.dump_json, result)
-
-        # если ничего не выбрано
-        if (
-            not args.exmo_ping and
-            not args.exmo_ticker and
-            not getattr(args, "exmo_ticker_pair", None) and
-            not args.exmo_order_book and
-            not args.exmo_trades and
-            not args.exmo_balances and
-            not args.exmo_open_orders and
-            (not args.exmo_user_trades or args.exmo_user_trades == "0") and
-            not getattr(args, "exmo_candles", None) and
-            not getattr(args, "exmo_kline", None) and
-            not getattr(args, "exmo_ohlcv", None) and
-            not getattr(args, "exmo_pnl", None)
-        ):
+        # если пользователь не выбрал ничего из EXMO-группы
+        if not any([
+            getattr(args, "exmo_ping", False),
+            getattr(args, "exmo_ticker", False),
+            getattr(args, "exmo_ticker_pair", None),
+            getattr(args, "exmo_order_book", None),
+            getattr(args, "exmo_trades", None),
+            getattr(args, "exmo_balances", False),
+            getattr(args, "exmo_open_orders", False),
+            (getattr(args, "exmo_user_trades", None) and args.exmo_user_trades != "0"),
+            getattr(args, "exmo_candles", None),
+            getattr(args, "exmo_kline", None),
+            getattr(args, "exmo_ohlcv", None),
+            getattr(args, "exmo_pnl", False),
+        ]):
             print("Нет выбранных действий EXMO probe. Укажи хотя бы один флаг из группы EXMO.")
             return 1
 
+        dump_if_needed(getattr(args, "dump_json", None), result)
         return 0
+
+    except SystemExit as se:
+        return int(se.code) if isinstance(se.code, int) else 1
     except Exception as e:
+        if EXMO_DEBUG:
+            traceback.print_exc()
         print(f"❌ EXMO probe error: {e!r}")
         return 1
 
