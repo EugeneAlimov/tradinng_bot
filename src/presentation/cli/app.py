@@ -8,6 +8,9 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+import math
+from collections import defaultdict
 import matplotlib.dates as mdates
 
 from src.config.settings import get_settings
@@ -31,7 +34,7 @@ from src.infrastructure.exchange.exmo_api import ExmoApi
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Утилиты
+# Утилиты времени/ТФ
 # ──────────────────────────────────────────────────────────────────────────────
 def _parse_time_hint(s: Optional[str]) -> Optional[int]:
     """Возвращает epoch-секунды для: '1717351410', '2025-08-09T14:00', '24h'/'7d'/'90m'."""
@@ -99,78 +102,195 @@ def _tf_to_minutes(tf: str | int) -> int:
         return 1
 
 
+def _tf_to_seconds(tf: str) -> int:
+    s = str(tf).lower().strip()
+    if s.endswith("m"):
+        return int(s[:-1]) * 60
+    if s.endswith("h"):
+        return int(s[:-1]) * 3600
+    if s.endswith("d"):
+        return int(s[:-1]) * 86400
+    # число в секундах
+    return int(s)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Нормализация рядов / ресемплинг / сейвёр
+# ──────────────────────────────────────────────────────────────────────────────
+def _norm_row_any(r: Dict[str, Any]) -> Dict[str, float | int]:
+    """
+    Принимает любой формат свечи:
+      {'t':ms,'o','h','l','c','v'}  или  {'ts':sec,'open','high','low','close','volume'}
+    Возвращает нормализованный dict:
+      {'ts':sec,'o':float,'h':float,'l':float,'c':float,'v':float}
+    """
+    ts = int(r.get("ts") or r.get("t") or 0)
+    if ts > 10_000_000_000:  # миллисекунды → секунды
+        ts //= 1000
+    o = r.get("o", r.get("open"))
+    h = r.get("h", r.get("high"))
+    l = r.get("l", r.get("low"))
+    c = r.get("c", r.get("close"))
+    v = r.get("v", r.get("volume", 0.0))
+    return {"ts": ts, "o": float(o), "h": float(h), "l": float(l), "c": float(c), "v": float(v)}
+
+
+def _resample_ohlcv(rows: List[Dict[str, Any]], out_tf: str) -> List[Dict[str, Any]]:
+    """Ресемплинг OHLCV до большего ТФ: из 1m → 5m/15m/1h."""
+    if not rows:
+        return []
+    step = _tf_to_seconds(out_tf)
+    buckets: Dict[int, Dict[str, Any]] = {}
+    for r0 in rows:
+        r = _norm_row_any(r0)
+        key = (int(r["ts"]) // step) * step
+        b = buckets.get(key)
+        if not b:
+            buckets[key] = {"ts": key, "open": r["o"], "high": r["h"], "low": r["l"], "close": r["c"], "volume": r["v"]}
+        else:
+            b["high"] = max(b["high"], r["h"])
+            b["low"] = min(b["low"], r["l"])
+            b["close"] = r["c"]
+            b["volume"] = float(b["volume"]) + float(r["v"])
+    return [buckets[k] for k in sorted(buckets)]
+
+
 def _maybe_save_csv(rows: List[Dict[str, Any]], path: Optional[str]) -> None:
     if not path or not rows:
         return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write("ts,open,high,low,close,volume\n")
         for r in rows:
-            ts = int(r.get("ts") or r.get("t") or 0)
-            if ts > 10_000_000_000:
-                ts //= 1000
-            f.write(f"{ts},{r['open']},{r['high']},{r['low']},{r['close']},{r.get('volume','')}\n")
+            n = _norm_row_any(r)
+            f.write(f"{int(n['ts'])},{n['o']},{n['h']},{n['l']},{n['c']},{n['v']}\n")
     print(f"→ CSV saved to: {path}")
 
 
-def _maybe_plot(rows, title, out_path):
+# ──────────────────────────────────────────────────────────────────────────────
+# Плоттер (OHLC c фоллбеком + объём + маркеры)
+# ──────────────────────────────────────────────────────────────────────────────
+def _maybe_plot(rows, title, out_path, markers=None, show_vol=True):
+    """
+    rows: [{'t'| 'ts', 'o'|'open','h'|'high','l'|'low','c'|'close','v'|'volume'} ...]
+    markers: [{'ts':sec, 'price':float, 'kind': 'buy'|'sell'|'stop'|'take'}]
+    """
     if not out_path or not rows:
         return
     try:
         import matplotlib
-        matplotlib.use("Agg")  # неинтерактивный бэкенд
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
-        from datetime import datetime
-        logging.getLogger("matplotlib").setLevel(logging.WARNING)
+        from matplotlib.patches import Rectangle
+        from matplotlib.lines import Line2D
+        from statistics import median
 
-        xs, ys = [], []
+        # --- to parsed tuples ---
+        def to_dt(ts_sec):  # UTC
+            return datetime.fromtimestamp(float(ts_sec), tz=timezone.utc)
 
+        parsed = []
         for r in rows:
-            # Поддержка форматов: dict с t/c (API), dict с ts/close (нормализованный),
-            # а также tuple/list (ts, close)
-            if isinstance(r, (list, tuple)) and len(r) >= 2:
-                ts_sec, close = float(r[0]), float(r[1])
-            elif isinstance(r, dict):
-                # timestamp
-                if "t" in r:              # миллисекунды от EXMO API
-                    ts_sec = float(r["t"]) / 1000.0
-                elif "ts" in r:           # секунды после нормализации
-                    ts_sec = float(r["ts"])
+            n = _norm_row_any(r)
+            parsed.append((n["ts"], n["o"], n["h"], n["l"], n["c"], n["v"]))
+        parsed.sort(key=lambda x: x[0])
+
+        # макет
+        if show_vol:
+            fig, (ax, axv) = plt.subplots(2, 1, sharex=True, figsize=(14, 4.2),
+                                          gridspec_kw={"height_ratios": [4, 1]}, constrained_layout=True)
+        else:
+            fig, ax = plt.subplots(1, 1, figsize=(14, 3.4), constrained_layout=True)
+            axv = None
+
+        xs = [mdates.date2num(to_dt(ts)) for (ts, *_ ) in parsed]
+        deltas = [xs[i+1] - xs[i] for i in range(len(xs)-1)]
+        base_step = (1.0/(24*60)) if not deltas else median(deltas)
+        min_w, max_w = 0.20*base_step, 1.50*base_step
+
+        lows  = [l for (_,_,_,l,_,_) in parsed]
+        highs = [h for (_,_,h,_,_,_) in parsed]
+        y_lo, y_hi = min(lows), max(highs)
+        pad = max((y_hi - y_lo)*0.05, 1e-6)
+
+        # grid & x-axis
+        ax.grid(True, which="major", linestyle="--", alpha=0.2)
+        locator = mdates.AutoDateLocator(minticks=3, maxticks=9)
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+
+        # есть ли полноценный OHLC?
+        have_ohlc = all(
+            (o is not None and h is not None and l is not None and c is not None)
+            for (_, o, h, l, c, _) in parsed
+        )
+
+        if have_ohlc:
+            for i, (ts, o, h, l, c, v) in enumerate(parsed):
+                x = xs[i]
+                prev_step = deltas[i-1] if i > 0 else base_step
+                next_step = deltas[i] if i < len(xs)-1 else base_step
+                w = min(max(0.8 * min(prev_step, next_step), min_w), max_w)
+                color = "#2ca02c" if c >= o else "#d62728"
+                if h != l:
+                    ax.add_line(Line2D([x, x], [l, h], linewidth=1, color=color))
+                body_h = abs(c - o)
+                if body_h < 1e-12 and h == l:
+                    ax.hlines(c, x - w*0.3, x + w*0.3, linewidth=1.6, color=color)
                 else:
-                    continue
-                # close
-                if "c" in r:
-                    close = float(r["c"])
-                elif "close" in r:
-                    close = float(r["close"])
-                else:
-                    continue
-            else:
-                continue
+                    y0 = min(o, c)
+                    ax.add_patch(Rectangle((x - w/2, y0), w, max(body_h, 1e-12),
+                                           edgecolor=color, facecolor="none", linewidth=1))
+            print(f"[plot] OHLC: points={len(parsed)}  first={to_dt(parsed[0][0]).isoformat()}  last={to_dt(parsed[-1][0]).isoformat()}")
+        else:
+            xs_dt = [to_dt(ts) for (ts, *_ ) in parsed]
+            closes = [c for (*_, c, __) in parsed]
+            ax.plot(xs_dt, closes, linewidth=1.8)
+            y_lo, y_hi = min(closes), max(closes)
+            pad = max((y_hi - y_lo) * 0.05, 1e-6)
+            ax.set_ylim(y_lo - pad, y_hi + pad)
+            print(f"[plot] CLOSE: points={len(xs_dt)}  first={xs_dt[0].isoformat()}  last={xs_dt[-1].isoformat()}")
 
-            xs.append(datetime.fromtimestamp(ts_sec))
-            ys.append(close)
+        ax.set_ylim(y_lo - pad, y_hi + pad)
+        ax.set_title(f"EXMO candles {title}")
+        ax.set_ylabel("price")
 
-        if not xs:
-            raise KeyError("t/ts")
+        # markers
+        if markers:
+            for m in markers:
+                ts = int(m["ts"]); px = float(m["price"])
+                x = mdates.date2num(to_dt(ts))
+                kind = m.get("kind", "")
+                if kind == "buy":
+                    ax.plot([x], [px], "^", ms=7, mfc="#2ca02c", mec="none", alpha=0.9)
+                elif kind == "sell":
+                    ax.plot([x], [px], "v", ms=7, mfc="#d62728", mec="none", alpha=0.9)
+                elif kind == "stop":
+                    ax.plot([x], [px], "x", ms=8, mew=2, color="#d62728", alpha=0.9)
+                elif kind == "take":
+                    ax.plot([x], [px], "o", ms=6, mfc="none", mec="#2ca02c", mew=1.5, alpha=0.9)
 
-        fig = plt.figure(figsize=(12, 3.2))
-        ax = plt.gca()
-        ax.plot(xs, ys)
-        ax.set_title(title)
-        ax.set_xlabel("time")
-        ax.set_ylabel("close")
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
-        fig.autofmt_xdate()
-        plt.tight_layout()
-        plt.savefig(out_path, dpi=150)
+        # volume
+        if axv:
+            axv.grid(True, which="major", linestyle="--", alpha=0.1)
+            axv.set_ylabel("vol")
+            axv.bar([to_dt(ts) for (ts, *_ ) in parsed], [v for (*_, v) in parsed],
+                    width=0.8*base_step, align="center", alpha=0.35, color="#2ca02c", edgecolor="none")
+            axv.xaxis.set_major_locator(locator)
+            axv.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+            axv.set_xlabel("time (UTC)")
+
+        import matplotlib.pyplot as plt  # re-import for mypy
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"→ Chart saved to: {out_path}")
     except Exception as e:
         print(f"⚠️  Не удалось построить график: {e!r}")
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# EXMO candles_history (fallback нормализация)
+# ──────────────────────────────────────────────────────────────────────────────
 def _candles_via_history(api: Any, pair: str, tf: str, limit: int) -> List[Dict[str, Any]]:
     """Фоллбэк: строим нормализованные свечи через candles_history."""
     res_min = _tf_to_minutes(tf)
@@ -214,6 +334,270 @@ def _make_exmo_api() -> ExmoApi:
             return ExmoApi(api_key=api_key, api_secret=api_secret)  # type: ignore
         except Exception:
             return ExmoApi()  # type: ignore
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Примитивный БТ движок (SMA cross) + сервисные функции для отчётов
+# ──────────────────────────────────────────────────────────────────────────────
+class _SMA:
+    def __init__(self, n: int):
+        from collections import deque
+        self.n = n
+        self.q = deque()
+        self.s = 0.0
+
+    def push(self, x: float) -> Optional[float]:
+        self.q.append(x); self.s += x
+        if len(self.q) > self.n:
+            self.s -= self.q.popleft()
+        if len(self.q) == self.n:
+            return self.s / self.n
+        return None
+
+
+class _SmaCross:
+    def __init__(self, fast: int, slow: int):
+        assert fast < slow, "fast < slow"
+        self.fast = _SMA(fast)
+        self.slow = _SMA(slow)
+        self.state = None  # 'up'|'down'|None
+        self.in_pos = False
+
+    def on_price(self, px: float) -> Optional[str]:
+        f = self.fast.push(px)
+        s = self.slow.push(px)
+        if f is None or s is None:
+            return None
+        if (not self.in_pos) and f >= s and self.state != "up":
+            self.in_pos = True
+            self.state = "up"
+            return "buy"
+        if self.in_pos and f < s and self.state != "down":
+            self.in_pos = False
+            self.state = "down"
+            return "sell"
+        return None
+
+
+def _backtest_sma(
+    rows: List[Dict[str, Any]],
+    fast: int, slow: int,
+    fee_bps: float, slip_bps: float,
+    sl_bps: float, tp_bps: float,
+    start_eur: float, risk_f: float, qty_eur: float
+) -> Tuple[List[Dict[str, Any]], Dict[str, float], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Возвращает (markers, stats, trades, equity_curve).
+    trades: [{'ts_in','px_in','budget_eur','qty','ts_out','px_out','kind_out','pnl_eur','ret_bps'}]
+    equity_curve: [{'ts','equity','cash','qty','price'}]
+    """
+    if not rows:
+        return [], {}, [], []
+
+    strat = _SmaCross(fast, slow)
+    FEE = fee_bps / 1e4
+    SLIP = slip_bps / 1e4
+
+    markers: List[Dict[str, Any]] = []
+    trades: List[Dict[str, Any]] = []
+    equity_curve: List[Dict[str, Any]] = []
+
+    cash = float(start_eur)
+    qty = 0.0
+    entry_px = None
+    entry_ts = None
+    entry_budget = 0.0
+
+    def _equity(c_price: float) -> float:
+        return cash + qty * c_price
+
+    def _apply_sell(ts: int, px: float, kind: str):
+        nonlocal cash, qty, entry_px, entry_ts, entry_budget
+        px_exec = px * (1 - SLIP)
+        amount = qty * px_exec
+        fee = amount * FEE
+        cash += (amount - fee)
+        pnl_eur = (amount - fee) - entry_budget
+        ret_bps = (pnl_eur / entry_budget * 1e4) if entry_budget > 0 else 0.0
+        trades.append({
+            "ts_in": int(entry_ts), "px_in": float(entry_px), "budget_eur": float(entry_budget), "qty": float(qty),
+            "ts_out": int(ts), "px_out": float(px_exec), "kind_out": kind,
+            "pnl_eur": float(pnl_eur), "ret_bps": float(ret_bps),
+        })
+        markers.append({"ts": ts, "price": px_exec, "kind": kind})
+        qty = 0.0
+        entry_px = None
+        entry_ts = None
+        entry_budget = 0.0
+        strat.in_pos = False
+
+    for r in rows:
+        n = _norm_row_any(r)
+        ts, c, h, l = n["ts"], n["c"], n["h"], n["l"]
+
+        # SL/TP
+        if qty > 0.0 and entry_px is not None:
+            if tp_bps > 0 and h >= entry_px * (1 + tp_bps / 1e4):
+                _apply_sell(ts, entry_px * (1 + tp_bps / 1e4), "take")
+            elif sl_bps > 0 and l <= entry_px * (1 - sl_bps / 1e4):
+                _apply_sell(ts, entry_px * (1 - sl_bps / 1e4), "stop")
+
+        sig = strat.on_price(c)
+        if sig == "buy" and qty == 0.0:
+            px = c * (1 + SLIP)
+            budget = qty_eur if risk_f <= 0 else cash * risk_f
+            if budget > 0 and cash >= budget:
+                fee = budget * FEE
+                got = (budget - fee) / px
+                qty += got
+                cash -= budget
+                entry_px = px
+                entry_ts = ts
+                entry_budget = budget
+                markers.append({"ts": ts, "price": px, "kind": "buy"})
+        elif sig == "sell" and qty > 0.0:
+            _apply_sell(ts, c, "sell")
+
+        equity_curve.append({"ts": int(ts), "equity": _equity(c), "cash": cash, "qty": qty, "price": c})
+
+    equity = equity_curve[-1]["equity"] if equity_curve else start_eur
+    stats = {"cash": round(cash, 6), "equity": round(equity, 6)}
+    return markers, stats, trades, equity_curve
+
+
+def _bt_metrics(trades: List[Dict[str, Any]], equity: List[Dict[str, Any]]) -> Dict[str, float]:
+    if not equity:
+        return {}
+    start = equity[0]["equity"]; end = equity[-1]["equity"]
+    secs = max(1, int(equity[-1]["ts"]) - int(equity[0]["ts"]))
+    sec_year = 365 * 24 * 3600
+    cagr = (end / start) ** (sec_year / secs) - 1 if secs > 0 and start > 0 else 0.0
+
+    # баровые доходности для Sharpe
+    rets = []
+    for i in range(1, len(equity)):
+        e0, e1 = equity[i-1]["equity"], equity[i]["equity"]
+        if e0 > 0:
+            rets.append((e1 - e0) / e0)
+    import statistics
+    if len(rets) >= 2:
+        # оценка периода по медиане расстояний между барами
+        dts = [equity[i]["ts"] - equity[i-1]["ts"] for i in range(1, len(equity))]
+        bar_sec = max(1, int(statistics.median(dts)))
+        periods_per_year = sec_year / bar_sec
+        sharpe = (statistics.mean(rets) / (statistics.pstdev(rets) or 1e-12)) * math.sqrt(periods_per_year)
+    else:
+        sharpe = 0.0
+
+    # max drawdown
+    peak = equity[0]["equity"]
+    max_dd = 0.0
+    for p in equity:
+        val = p["equity"]
+        peak = max(peak, val)
+        dd = (val - peak) / (peak or 1.0)
+        max_dd = min(max_dd, dd)
+    max_dd_pct = abs(max_dd)
+
+    # по сделкам
+    n = len(trades)
+    wins = [t for t in trades if t["pnl_eur"] > 0]
+    losses = [t for t in trades if t["pnl_eur"] < 0]
+    win_rate = (len(wins) / n) if n else 0.0
+    sum_win = sum(t["pnl_eur"] for t in wins)
+    sum_loss = abs(sum(t["pnl_eur"] for t in losses))
+    profit_factor = (sum_win / sum_loss) if sum_loss > 0 else float("inf") if sum_win > 0 else 0.0
+    total_pnl = (end - start)
+
+    return {
+        "start": float(start), "end": float(end), "total_pnl": float(total_pnl),
+        "trades": float(n), "win_rate": float(win_rate),
+        "profit_factor": float(profit_factor), "max_drawdown": float(max_dd_pct),
+        "sharpe": float(sharpe), "cagr": float(cagr),
+    }
+
+
+def _save_trades_csv(trades: List[Dict[str, Any]], path: Optional[str]) -> None:
+    if not path or not trades:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ts_in,px_in,budget_eur,qty,ts_out,px_out,kind_out,pnl_eur,ret_bps\n")
+        for t in trades:
+            f.write(f"{t['ts_in']},{t['px_in']},{t['budget_eur']},{t['qty']},{t['ts_out']},{t['px_out']},{t['kind_out']},{t['pnl_eur']},{t['ret_bps']}\n")
+    print(f"→ Trades CSV saved to: {path}")
+
+
+def _save_equity_csv(eq: List[Dict[str, Any]], path: Optional[str]) -> None:
+    if not path or not eq:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ts,equity,cash,qty,price\n")
+        for p in eq:
+            f.write(f"{p['ts']},{p['equity']},{p['cash']},{p['qty']},{p['price']}\n")
+    print(f"→ Equity CSV saved to: {path}")
+
+
+def _plot_equity(eq: List[Dict[str, Any]], out_path: Optional[str]) -> None:
+    if not out_path or not eq:
+        return
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        xs = [datetime.fromtimestamp(int(p["ts"]), tz=timezone.utc) for p in eq]
+        ys = [p["equity"] for p in eq]
+        fig, ax = plt.subplots(1, 1, figsize=(12, 3.2), constrained_layout=True)
+        ax.plot(xs, ys, linewidth=1.6)
+        ax.set_title("Backtest Equity Curve (EUR)")
+        ax.set_xlabel("time (UTC)")
+        ax.set_ylabel("equity")
+        ax.grid(True, linestyle="--", alpha=0.25)
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3, maxticks=9))
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(ax.xaxis.get_major_locator()))
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"→ Equity chart saved to: {out_path}")
+    except Exception as e:
+        print(f"⚠️  Не удалось построить график equity: {e!r}")
+
+
+def _run_backtest_sma(rows: List[Dict[str, Any]], fast: int, slow: int, args, save: bool = False) -> Dict[str, Any]:
+    """Обёртка: прогон SMA, расчёт метрик, опц. сохранения файлов. Подходит для оптимизации."""
+    markers, stats, trades, eq = _backtest_sma(
+        rows, fast, slow,
+        fee_bps=float(args.fee_bps), slip_bps=float(args.slip_bps),
+        sl_bps=float(args.sl_bps), tp_bps=float(args.tp_bps),
+        start_eur=float(args.start_eur), risk_f=float(args.risk_f), qty_eur=float(args.qty_eur),
+    )
+    metrics = _bt_metrics(trades, eq)
+
+    if save:
+        _save_trades_csv(trades, args.save_trades)
+        _save_equity_csv(eq, args.save_equity)
+        _plot_equity(eq, args.plot_equity)
+        if args.save_report:
+            os.makedirs(os.path.dirname(args.save_report) or ".", exist_ok=True)
+            with open(args.save_report, "w", encoding="utf-8") as f:
+                json.dump({"stats": stats, "metrics": metrics}, f, ensure_ascii=False, indent=2)
+            print(f"→ Report JSON saved to: {args.save_report}")
+
+    return {"markers": markers, "metrics": metrics, "stats": stats}
+
+
+def _metric_value(metrics: Dict[str, float], name: str) -> float:
+    if name == "sharpe":
+        return metrics.get("sharpe", 0.0)
+    if name == "pnl":
+        return metrics.get("end", 0.0) - metrics.get("start", 0.0)
+    if name == "pf":
+        return metrics.get("profit_factor", 0.0)
+    if name == "dd":
+        return -metrics.get("max_drawdown", 0.0)  # меньше — лучше
+    if name == "winrate":
+        return metrics.get("win_rate", 0.0)
+    return 0.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -275,6 +659,33 @@ def _build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--exmo-pnl-save-csv", type=str, default=None)
     ex.add_argument("--exmo-pnl-plot", type=str, default=None)
 
+    # Ресемплинг/бэктест/отчёты
+    ex.add_argument("--resample", type=str, default=None, help="Ресемплинг TF, напр. 5m/15m/1h")
+    ex.add_argument("--backtest", action="store_true", help="Запустить бэктест SMA на загруженных свечах")
+    ex.add_argument("--fee-bps", type=float, default=10.0)
+    ex.add_argument("--slip-bps", type=float, default=0.0)
+    ex.add_argument("--sl-bps", type=float, default=0.0)
+    ex.add_argument("--tp-bps", type=float, default=0.0)
+    ex.add_argument("--start-eur", type=float, default=1000.0)
+    ex.add_argument("--risk-f", type=float, default=0.0, help="Доля капитала на сделку (если >0, qty-eur игнорим)")
+    ex.add_argument("--qty-eur", type=float, default=0.0, help="Фикс. размер позиции в EUR (если risk-f==0)")
+    ex.add_argument("--save-trades", type=str, default=None)
+    ex.add_argument("--save-equity", type=str, default=None)
+    ex.add_argument("--plot-equity", type=str, default=None)
+    ex.add_argument("--save-report", type=str, default=None)
+
+    # Грид-оптимизация SMA
+    ex.add_argument("--optimize-sma", type=str, default=None,
+                    help='Грид, напр.: "fast=5:60:5,slow=20:240:10"')
+    ex.add_argument("--opt-metric", type=str, default="sharpe",
+                    choices=["sharpe", "pnl", "pf", "dd", "winrate"])
+    ex.add_argument("--opt-top", type=int, default=10)
+    ex.add_argument("--opt-plot", type=str, default=None, help="PNG теплокарта fast×slow")
+
+    # Walk-forward
+    ex.add_argument("--walkforward", type=int, default=0,
+                    help="Кол-во разбиений ряда для WF. 0=выкл")
+
     return p
 
 
@@ -297,7 +708,7 @@ def _build_paper_components(args):
         start_price=args.start_price,
         drift_bps=args.drift_bps,
         vol_bps=args.vol_bps,
-        seed=args.rw_seed,
+        seed=args.rw_seede if hasattr(args, "rw_seede") else args.rw_seed,
         tick_seconds=args.tick_seconds,
     )
 
@@ -385,7 +796,7 @@ def _run_exmo_probe(args) -> int:
         tf, lim = _split_tf_limit(flag_value)
 
         if name == "ohlcv" and hasattr(api, "ohlcv"):
-            rows = api.ohlcv(pair=pair_general, timeframe=tf, limit=lim)  # список списков
+            rows = api.ohlcv(pair=pair_general, timeframe=tf, limit=lim)  # список списков — оставим как есть
             result[name] = rows
             return
 
@@ -395,13 +806,153 @@ def _run_exmo_probe(args) -> int:
             rows = _candles_via_history(api, pair_general, tf, lim)
 
         rows = _filter_time(rows)
+
+        # --- ресемплинг, если просили ---
+        tf_label = tf
+        if args.resample:
+            rows = _resample_ohlcv(rows, args.resample)
+            tf_label = args.resample
+
+        # --- бэктест SMA (маркеры/сделки/метрики) ---
+        plot_markers = None
+        if args.backtest:
+            bt = _run_backtest_sma(rows, int(args.fast), int(args.slow), args, save=True)
+            m = bt["metrics"]
+            print(f"[bt] equity={bt['stats'].get('equity')}  trades={int(m.get('trades',0))} "
+                  f"win_rate={m.get('win_rate',0):.2%}  pf={m.get('profit_factor',0):.2f}  "
+                  f"dd={m.get('max_drawdown',0):.2%}  sharpe={m.get('sharpe',0):.2f}")
+            plot_markers = bt.get("markers")
+
         result[name] = rows
         _maybe_save_csv(rows, args.exmo_save_csv if name != "ohlcv" else None)
-        _maybe_plot(rows, f"{pair_general} {tf}", args.exmo_plot if name != "ohlcv" else None)
+        _maybe_plot(rows, f"{pair_general} {tf_label}", args.exmo_plot if name != "ohlcv" else None,
+                    markers=plot_markers, show_vol=True)
 
     _candles_like(args.exmo_candles, "candles")
     _candles_like(args.exmo_kline, "kline")
     _candles_like(args.exmo_ohlcv, "ohlcv")
+
+    # Если просили оптимизацию / WF — используем последнюю загруженную сводку свечей
+    base_rows = result.get("candles") or result.get("kline")
+    if base_rows:
+        # нормализуем ключи (на случай "o/h/l/c/v"):
+        norm = []
+        for r in base_rows:
+            norm.append({
+                "ts": int(r.get("ts") or r.get("t") or 0) if int(r.get("ts") or r.get("t") or 0) < 10_000_000_000 else int(r.get("ts") or r.get("t"))//1000,
+                "open": float(r.get("open", r.get("o"))),
+                "high": float(r.get("high", r.get("h"))),
+                "low":  float(r.get("low",  r.get("l"))),
+                "close":float(r.get("close", r.get("c"))),
+                "volume":float(r.get("volume", r.get("v", 0.0))),
+            })
+        norm.sort(key=lambda x: x["ts"])
+        rows_rs = _resample_ohlcv(norm, args.resample) if args.resample else norm
+
+        # ── Грид-оптимизация SMA
+        if args.optimize_sma:
+            (fmin, fmax, fstep), (smin, smax, sstep) = _parse_grid(args.optimize_sma)
+            best = []
+            heat = {}
+
+            for fast in range(fmin, fmax + 1, fstep):
+                for slow in range(smin, smax + 1, sstep):
+                    if fast >= slow:
+                        continue
+                    st = _run_backtest_sma(rows_rs, fast, slow, args, save=False)
+                    score = _metric_value(st["metrics"], args.opt_metric)
+                    best.append((score, fast, slow, st))
+                    heat[(fast, slow)] = score
+
+            best.sort(reverse=True, key=lambda x: x[0])
+            top = best[:max(1, args.opt_top)]
+
+            print("[opt] top by", args.opt_metric)
+            for i, (score, f, s, st) in enumerate(top, 1):
+                m = st["metrics"]
+                print(f"  {i:>2}. fast={f:>3} slow={s:>3}  score={score:.4f}  "
+                      f"pnl={m['end']-m['start']:.4f}  sharpe={m.get('sharpe',0):.2f}  dd={m.get('max_drawdown',0):.3%}")
+
+            # JSON отчёт для оптимизации
+            if args.save_report:
+                out = {
+                    "grid": {"fast": [fmin, fmax, fstep], "slow": [smin, smax, sstep]},
+                    "metric": args.opt_metric,
+                    "top": [{
+                        "fast": f, "slow": s, "score": sc, "metrics": st["metrics"]
+                    } for (sc, f, s, st) in top]
+                }
+                os.makedirs(os.path.dirname(args.save_report) or ".", exist_ok=True)
+                with open(args.save_report, "w", encoding="utf-8") as f:
+                    json.dump(out, f, ensure_ascii=False, indent=2)
+                print(f"→ Report JSON saved to: {args.save_report}")
+
+            # теплокарта
+            if args.opt_plot:
+                try:
+                    import matplotlib
+                    matplotlib.use("Agg")
+                    import matplotlib.pyplot as plt
+                    import numpy as np
+                    fvals = list(range(fmin, fmax + 1, fstep))
+                    svals = list(range(smin, smax + 1, sstep))
+                    Z = np.full((len(fvals), len(svals)), np.nan)
+                    for i, fv in enumerate(fvals):
+                        for j, sv in enumerate(svals):
+                            if (fv, sv) in heat:
+                                Z[i, j] = heat[(fv, sv)]
+                    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+                    im = ax.imshow(Z, aspect="auto", origin="lower",
+                                   extent=[smin, smax, fmin, fmax])
+                    ax.set_xlabel("slow"); ax.set_ylabel("fast")
+                    ax.set_title(f"Optimization heatmap ({args.opt_metric})")
+                    fig.colorbar(im, ax=ax)
+                    plt.tight_layout(); plt.savefig(args.opt_plot, dpi=150); plt.close(fig)
+                    print(f"→ Opt heatmap saved to: {args.opt_plot}")
+                except Exception as e:
+                    print(f"⚠️  Не удалось построить теплокарту: {e!r}")
+
+            # Если одновременно дали --exmo-plot — дорисуем бары с лучшими маркерами
+            if args.exmo_plot and top:
+                _, f_best, s_best, st = top[0]
+                _maybe_plot(rows_rs, f"{pair_general} {args.resample or ''}".strip(),
+                            args.exmo_plot, markers=st.get("markers", []), show_vol=True)
+
+        # ── Walk-Forward поверх оптимизации
+        if args.walkforward and args.optimize_sma:
+            k = max(2, int(args.walkforward))
+            n = len(rows_rs); seg = n // k
+            wf_rows = [rows_rs[i * seg:(i + 1) * seg] for i in range(k - 1)] + [rows_rs[(k - 1) * seg:]]
+            wf_out = []
+            (fmin, fmax, fstep), (smin, smax, sstep) = _parse_grid(args.optimize_sma)
+            for idx, chunk in enumerate(wf_rows, 1):
+                if len(chunk) < 40:
+                    continue
+                mid = len(chunk) // 2
+                train, test = chunk[:mid], chunk[mid:]
+                best = None; best_score = -1e9
+                for fast in range(fmin, fmax + 1, fstep):
+                    for slow in range(smin, smax + 1, sstep):
+                        if fast >= slow:
+                            continue
+                        st_tr = _run_backtest_sma(train, fast, slow, args, save=False)
+                        sc = _metric_value(st_tr["metrics"], args.opt_metric)
+                        if sc > best_score:
+                            best_score, best = sc, (fast, slow)
+                fast, slow = best
+                st_te = _run_backtest_sma(test, fast, slow, args, save=False)
+                wf_out.append({"seg": idx, "fast": fast, "slow": slow, "metrics": st_te["metrics"]})
+
+            print("[wf] segments:", len(wf_out))
+            for w in wf_out:
+                m = w["metrics"]
+                print(f"  seg={w['seg']}  fast={w['fast']} slow={w['slow']}  "
+                      f"pnl={m['end']-m['start']:.4f} sharpe={m.get('sharpe',0):.2f} dd={m.get('max_drawdown',0):.3%}")
+
+            if args.save_report:
+                with open(args.save_report, "w", encoding="utf-8") as f:
+                    json.dump({"walkforward": wf_out}, f, ensure_ascii=False, indent=2)
+                print(f"→ Report JSON saved to: {args.save_report}")
 
     # приватка
     if args.exmo_balances:
@@ -420,7 +971,7 @@ def _run_exmo_probe(args) -> int:
 
     # дамп результата
     if args.dump_json:
-        os.makedirs(os.path.dirname(args.dump_json), exist_ok=True)
+        os.makedirs(os.path.dirname(args.dump_json) or ".", exist_ok=True)
         with open(args.dump_json, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2, default=str)
         print(f"→ JSON saved to: {args.dump_json}")
@@ -456,7 +1007,7 @@ def run_cli() -> None:
         args.exmo_candles, args.exmo_kline, args.exmo_ohlcv, args.exmo_balances,
         args.exmo_open_orders, args.exmo_trades, args.exmo_order_book,
         args.exmo_ticker, args.exmo_ticker_pair, args.exmo_user_trades, args.exmo_pnl
-    ]):
+    ]) or args.backtest or args.optimize_sma or args.walkforward:
         raise SystemExit(_run_exmo_probe(args))
 
     # Совместимость со «старым» режимом запроса свечей по from/to
