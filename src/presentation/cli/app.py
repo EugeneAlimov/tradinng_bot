@@ -1,373 +1,383 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-CLI для EXMO SMA-бота/бэктестера.
-"""
-
 from __future__ import annotations
-import argparse, json, os, sys
-from typing import Any, Dict
+
+import argparse
 import os
+import sys
+import time
+from typing import Optional, Tuple
 
 import pandas as pd
 
-# ——— Импорты, устойчивые к разным способам запуска ———
-try:
-    # запуск как пакет: python -m src.presentation.cli.app
-    from ...integrations.exmo import fetch_exmo_candles, resample_ohlcv
-    from ...core.backtest import run_backtest_sma
-    from ...analysis.optimize import (
-        optimize_sma_grid, optimize_sma_grid_oos,
-        walk_forward_sma, optimize_risk_grid,
-    )
-    from ...plot.plots import plot_ohlc_with_volume, plot_equity, plot_sma_heatmap
-except Exception:
-    # запуск из корня проекта: python main.py
-    from src.integrations.exmo import fetch_exmo_candles, resample_ohlcv
-    from src.core.backtest import run_backtest_sma
-    from src.analysis.optimize import (
-        optimize_sma_grid, optimize_sma_grid_oos,
-        walk_forward_sma, optimize_risk_grid,
-    )
-    from src.plot.plots import plot_ohlc_with_volume, plot_equity, plot_sma_heatmap
-
-
-def _format_pf_for_console(pf: Any) -> str:
-    if isinstance(pf, str) and pf.lower() == "inf":
-        return "∞"
+# ===== попытка взять функции из интеграции EXMO; если нет — дадим простые фолбэки =====
+def _try_import_exmo_utils():
+    # абсолютный путь (чаще всего у вас так и есть)
     try:
-        return f"{float(pf):.2f}"
+        from src.integrations.exmo import (
+            fetch_exmo_candles as _f,
+            resample_ohlcv as _r,
+            normalize_resample_rule as _n,
+        )
+        return _f, _r, _n
     except Exception:
-        return str(pf)
+        pass
+    # относительный путь: из src/presentation/cli -> к src/integrations
+    try:
+        from ...integrations.exmo import (
+            fetch_exmo_candles as _f,
+            resample_ohlcv as _r,
+            normalize_resample_rule as _n,
+        )
+        return _f, _r, _n
+    except Exception:
+        return None, None, None
 
 
-def print_bt_summary(report: Dict[str, Any]) -> None:
-    m = report.get("metrics", {})
-    pf_str = _format_pf_for_console(m.get("profit_factor", 0))
-    print(
-        f"[bt] equity={m.get('end', 0):.6f}  "
-        f"trades={int(m.get('trades', 0))}  "
-        f"win_rate={m.get('win_rate', 0):.2f}%  "
-        f"pf={pf_str}  "
-        f"dd={m.get('max_drawdown', 0) * 100:.2f}%  "
-        f"sharpe={m.get('sharpe', 0):.2f}"
-    )
+_FEXMO, _RESAMPLE, _NORM = _try_import_exmo_utils()
 
 
-def main():
-    p = argparse.ArgumentParser(description="EXMO SMA bot / backtester")
+def fetch_exmo_candles(pair: str, span: str, verbose: bool = False) -> pd.DataFrame:
+    """
+    Тонкая обёртка над src.integrations.exmo.fetch_exmo_candles.
+    Здесь держим только маршрутизацию импорта, без сетевой логики.
+    """
+    if _FEXMO is None:
+        raise RuntimeError("integrations.exmo.fetch_exmo_candles отсутствует. "
+                           "Установите файл src/integrations/exmo.py или поправьте импорты.")
+    return _FEXMO(pair, span, verbose=verbose)
+
+
+def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    if _RESAMPLE is None:
+        # Простой фолбэк на случай отсутствия интеграции
+        if not rule:
+            return df.copy()
+        x = df.copy()
+        x = x.set_index("time")
+        o = x["open"].resample(rule).first()
+        h = x["high"].resample(rule).max()
+        l = x["low"].resample(rule).min()
+        c = x["close"].resample(rule).last()
+        v = x["volume"].resample(rule).sum()
+        y = pd.DataFrame({"open": o, "high": h, "low": l, "close": c, "volume": v})
+        y = y.dropna().reset_index()
+        return y
+    return _RESAMPLE(df, rule)
+
+
+def normalize_resample_rule(rule: str) -> str:
+    if _NORM is not None:
+        return _NORM(rule)
+    # Фолбэк: приводим частые варианты к современным псевдонимам pandas
+    if not rule:
+        return ""
+    r = str(rule).strip().lower()
+    # поддержим 5m / 15m / 1h / 4h / 1d и т.п.
+    if r.endswith("m"):
+        return f"{int(r[:-1])}min"
+    if r.endswith("min"):
+        return r
+    if r.endswith("h"):
+        return f"{int(r[:-1])}h"
+    if r.endswith("d"):
+        return f"{int(r[:-1])}d"
+    return r
+
+
+# ===== маленькие утилиты, которые также использует live_trade =====
+def _parse_span(span: str) -> Tuple[str, int]:
+    tf, n = span.split(":")
+    return tf.strip().lower(), int(n)
+
+
+def _tf_seconds(tf: str) -> int:
+    tf = tf.strip().lower()
+    if tf.endswith("m"): return int(tf[:-1]) * 60
+    if tf.endswith("h"): return int(tf[:-1]) * 3600
+    if tf.endswith("d"): return int(tf[:-1]) * 86400
+    raise ValueError(f"Unsupported TF {tf!r}")
+
+
+# ===== лёгкие режимы: observe и paper =====
+def run_live_observe(
+    pair: str, span: str, resample_rule: str,
+    fast: int, slow: int,
+    poll_sec: Optional[int] = None,
+    heartbeat_sec: int = 60,
+    live_log: Optional[str] = None,
+) -> None:
+    tf, _ = _parse_span(span)
+    tf_sec = _tf_seconds(tf)
+    poll = int(poll_sec or max(5, tf_sec // 2))
+    rule = normalize_resample_rule(resample_rule) if resample_rule else ""
+
+    print(f"[live] observe {pair} {span} resample={rule or '—'} fast={fast} slow={slow} poll={poll}s")
+
+    import csv, os
+    def _append_csv(path: str, row: dict) -> None:
+        if not path:
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        write_header = not os.path.exists(path)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if write_header:
+                w.writeheader()
+            w.writerow(row)
+
+    last_ts = None
+    next_hb = time.time() + max(heartbeat_sec, 0)
+    try:
+        while True:
+            df = fetch_exmo_candles(pair, span, verbose=False)
+            if df.empty:
+                time.sleep(poll); continue
+            if rule:
+                df = resample_ohlcv(df, rule)
+            df["sma_fast"] = df["close"].rolling(fast, min_periods=fast).mean()
+            df["sma_slow"] = df["close"].rolling(slow, min_periods=slow).mean()
+            if len(df) < max(fast, slow) + 1:
+                time.sleep(poll); continue
+
+            bar = df.iloc[-1]
+            ts = bar["time"]
+            if last_ts is not None and ts <= last_ts:
+                time.sleep(poll); continue
+            last_ts = ts
+
+            c = float(bar["close"])
+            f = float(df["sma_fast"].iloc[-1])
+            s = float(df["sma_slow"].iloc[-1])
+
+            print(f"[live] {ts.isoformat()} tick  close={c:.6f}  f={f:.6f}  s={s:.6f}")
+            _append_csv(live_log or "", {"time": ts.isoformat(), "close": c, "sma_fast": f, "sma_slow": s})
+
+            if heartbeat_sec > 0 and time.time() >= next_hb:
+                print(f"[live] hb @ {ts.isoformat()}")
+                next_hb = time.time() + heartbeat_sec
+
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        print("[live] stopped.")
+
+
+def run_live_paper(
+    pair: str, span: str, resample_rule: str,
+    fast: int, slow: int,
+    *,
+    start_eur: float,
+    qty_eur: float,
+    position_pct: float,
+    fee_bps: float,
+    slip_bps: float,
+    poll_sec: Optional[int],
+    heartbeat_sec: int,
+) -> None:
+    """
+    Упрощённый paper-режим: только учет позиции и equity, без комиссий биржи.
+    Пишет CSV: data/live_paper_equity.csv
+    """
+    import csv, os
+
+    tf, _ = _parse_span(span)
+    tf_sec = _tf_seconds(tf)
+    poll = int(poll_sec or max(5, tf_sec // 2))
+    rule = normalize_resample_rule(resample_rule) if resample_rule else ""
+
+    equity_csv = "data/live_paper_equity.csv"
+    os.makedirs("data", exist_ok=True)
+
+    def _append_csv(path: str, row: dict) -> None:
+        write_header = not os.path.exists(path)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if write_header:
+                w.writeheader()
+            w.writerow(row)
+
+    pos_qty = 0.0
+    cash_eur = float(start_eur)
+    avg_price = 0.0
+
+    print(f"[paper] {pair} {span} resample={rule or '—'} fast={fast} slow={slow} start={start_eur:.2f} fee={fee_bps}bps slip={slip_bps}bps")
+
+    last_ts = None
+    next_hb = time.time() + max(heartbeat_sec, 0)
+
+    try:
+        while True:
+            df = fetch_exmo_candles(pair, span, verbose=False)
+            if df.empty:
+                time.sleep(poll); continue
+            if rule:
+                df = resample_ohlcv(df, rule)
+
+            df["sma_fast"] = df["close"].rolling(fast, min_periods=fast).mean()
+            df["sma_slow"] = df["close"].rolling(slow, min_periods=slow).mean()
+            if len(df) < max(fast, slow) + 2:
+                time.sleep(poll); continue
+
+            ts = df["time"].iloc[-1]
+            if last_ts is not None and ts <= last_ts:
+                time.sleep(poll); continue
+            last_ts = ts
+
+            c  = float(df["close"].iloc[-1])
+            fp = float(df["sma_fast"].iloc[-2])
+            sp = float(df["sma_slow"].iloc[-2])
+            fc = float(df["sma_fast"].iloc[-1])
+            sc = float(df["sma_slow"].iloc[-1])
+
+            sig = None
+            if fp <= sp and fc > sc: sig = "buy"
+            if fp >= sp and fc < sc: sig = "sell"
+
+            if sig == "buy":
+                equity_now = cash_eur + pos_qty * c
+                use = qty_eur if qty_eur > 0 else (equity_now * max(0.0, position_pct) / 100.0)
+                if use > 0:
+                    buy_qty = use / c
+                    avg_price = (pos_qty * avg_price + buy_qty * c) / max(pos_qty + buy_qty, 1e-9)
+                    pos_qty += buy_qty
+                    cash_eur -= buy_qty * c
+
+            elif sig == "sell" and pos_qty > 0:
+                sell_qty = pos_qty
+                cash_eur += sell_qty * c
+                pos_qty = 0.0
+                avg_price = 0.0
+
+            equity = cash_eur + pos_qty * c
+            print(f"[paper] {ts.isoformat()} tick equity={equity:.2f} pos={pos_qty:.6f}")
+            _append_csv(equity_csv, {"time": ts.isoformat(), "equity": equity})
+
+            if heartbeat_sec > 0 and time.time() >= next_hb:
+                print(f"[paper] {ts.isoformat()} hb equity={equity:.2f} pos={pos_qty:.6f}")
+                next_hb = time.time() + heartbeat_sec
+
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        print("[paper] stopped.")
+
+
+# ===== CLI =====
+def _load_env_file(path: str) -> None:
+    if not path:
+        return
+    if not os.path.exists(path):
+        print(f"[env] warning: file not found: {path}")
+        return
+    loaded = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            v = v.strip()
+            os.environ[k.strip()] = v
+            loaded[k.strip()] = v
+    ek = os.environ.get("EXMO_API_KEY") or os.environ.get("EXMO_KEY") or ""
+    es = os.environ.get("EXMO_API_SECRET") or os.environ.get("EXMO_SECRET") or ""
+    # зеркалим в EXMO_KEY/EXMO_SECRET
+    if ek and not os.environ.get("EXMO_KEY"): os.environ["EXMO_KEY"] = ek
+    if es and not os.environ.get("EXMO_SECRET"): os.environ["EXMO_SECRET"] = es
+    print(f"[env] .env=ok EXMO_KEY={'∅' if not ek else str(len(ek))+' chars, ****'+ek[-4:]} EXMO_SECRET={'∅' if not es else str(len(es))+' chars, ****'+es[-4:]}")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--env-file", default="", help=".env с EXMO_KEY/EXMO_SECRET (или EXMO_API_KEY/EXMO_API_SECRET).")
     p.add_argument("--exmo-pair", default="DOGE_EUR")
-    p.add_argument("--exmo-candles", default="1m:600")
-    p.add_argument("--resample", default="")
-    p.add_argument("--backtest", action="store_true")
-    p.add_argument("--fast", type=int, default=10)
-    p.add_argument("--slow", type=int, default=30)
+    p.add_argument("--exmo-candles", default="1m:600", help="TF:count, напр. 1m:600")
+    p.add_argument("--resample", default="", help="пример: 5m / 15m / 1h")
+    p.add_argument("--fast", type=int, default=6)
+    p.add_argument("--slow", type=int, default=25)
+
+    # общие риск/объём параметры
+    p.add_argument("--start-eur", type=float, default=1000.0)
+    p.add_argument("--qty-eur", type=float, default=0.0)
+    p.add_argument("--position-pct", type=float, default=0.0)
     p.add_argument("--fee-bps", type=float, default=10.0)
     p.add_argument("--slip-bps", type=float, default=2.0)
-    p.add_argument("--start-eur", type=float, default=1000.0)
-    p.add_argument("--qty-eur", type=float, default=200.0)
-    p.add_argument("--warmup-bars", type=int, default=0)
-    p.add_argument("--atr-period", type=int, default=14)
-    p.add_argument("--atr-mult", type=float, default=0.0)
-    p.add_argument("--tp-bps", type=float, default=0.0)
-    p.add_argument("--position-pct", type=float, default=0.0)
     p.add_argument("--price-tick", type=float, default=0.0)
     p.add_argument("--qty-step", type=float, default=0.0)
     p.add_argument("--min-quote", type=float, default=0.0)
-    p.add_argument("--risk-pct", type=float, default=0.0)
-    p.add_argument("--atr-pctl-min", type=float, default=None)
-    p.add_argument("--atr-pctl-max", type=float, default=None)
 
-    # выводы/плоты
-    p.add_argument("--save-trades", default="")
-    p.add_argument("--save-equity", default="")
-    p.add_argument("--save-report", default="")
-    p.add_argument("--exmo-plot", default="")
-    p.add_argument("--plot-equity", default="")
-    p.add_argument("--plot-signals", action="store_true")
-
-    # оптимизации/оценки
-    p.add_argument("--optimize-sma", action="store_true")
-    p.add_argument("--fast-range", default="5:30:1")
-    p.add_argument("--slow-range", default="20:120:5")
-    p.add_argument("--optimize-out", default="data/sma_grid.csv")
-    p.add_argument("--heatmap-out", default="data/sma_heatmap.png")
-    p.add_argument("--heatmap-metric", choices=["sharpe", "end", "total_pnl"], default="sharpe")
-
-    p.add_argument("--oos-split", type=float, default=0.0)
-    p.add_argument("--oos-out", default="")
-
-    p.add_argument("--walkforward", action="store_true")
-    p.add_argument("--wf-window", type=int, default=2000)
-    p.add_argument("--wf-step", type=int, default=500)
-    p.add_argument("--wf-out", default="data/walkforward.csv")
-
-    p.add_argument("--optimize-risk", action="store_true")
-    p.add_argument("--atr-range", default="0.0:3.0:0.5")
-    p.add_argument("--tp-range", default="0:120:10")
-    p.add_argument("--risk-out", default="data/risk_grid.csv")
-
-    # ---- LIVE mods ----
+    # live режимы
     p.add_argument("--live", choices=["observe", "paper", "trade"], default="")
-    p.add_argument("--poll-sec", type=int, default=0)
-    p.add_argument("--live-log", default="")
-    p.add_argument("--heartbeat-sec", type=int, default=0)
+    p.add_argument("--poll-sec", type=int, default=15)
+    p.add_argument("--heartbeat-sec", type=int, default=60)
+    p.add_argument("--live-log", default="", help="CSV для observe-логов (опционально)")
+
+    # поведение live-trade
+    p.add_argument("--confirm-live-trade", action="store_true")
     p.add_argument("--align-on-state", action="store_true")
     p.add_argument("--enter-on-start", action="store_true")
-    p.add_argument("--fok-wait-sec", type=float, default=3.0,
-                   help="Seconds to wait before cancelling unfilled limit (soft FOK).")
-    p.add_argument("--reprice-attempts", type=int, default=0,
-                   help="If >0, re-place order with increased slip if not filled.")
-    p.add_argument("--reprice-step-bps", type=float, default=5.0,
-                   help="Slip increment per attempt in bps when re-pricing.")
+    p.add_argument("--fok-wait-sec", type=float, default=3.0)
+    p.add_argument("--reprice-attempts", type=int, default=0)
+    p.add_argument("--reprice-step-bps", type=float, default=5.0)
     p.add_argument("--aggr-limit", action="store_true",
                    help="Peg limit to best ask/bid (uses order_book) for immediate fills.")
-    p.add_argument("--aggr-ticks", type=int, default=1,
-                   help="Extra ticks over best ask (buy) / under best bid (sell) when aggr-limit is on.")
+    p.add_argument("--aggr-ticks", type=int, default=1)
     p.add_argument("--force-entry", choices=["", "buy", "sell"], default="",
-                   help="Force a single entry on the next bar regardless of regime (for testing).")
+                   help="Одноразовый вход/выход поверх сигналов (для теста связи).")
 
-    # дневной риск/перерыв (общие с paper)
+    # зарезервированные (пока не используем)
     p.add_argument("--max-daily-loss-bps", type=float, default=0.0)
     p.add_argument("--cooldown-bars", type=int, default=0)
 
-    # trade safety + ключи
-    p.add_argument("--confirm-live-trade", action="store_true",
-                   help="Required to actually place real orders.")
-    p.add_argument("--exmo-key", default="", help="EXMO API key (optional, prefer env EXMO_KEY)")
-    p.add_argument("--exmo-secret", default="", help="EXMO API secret (optional, prefer env EXMO_SECRET)")
-    p.add_argument("--env-file", default=".env",
-                   help="Path to .env file with EXMO_KEY/EXMO_SECRET (loaded automatically).")
-
-    # --------------------------------------------
-
     args = p.parse_args()
 
-    # ---- .env autoload (до любого режима) ----
-    try:
-        from ...utils.env import load_env_file
-    except Exception:
-        from src.utils.env import load_env_file
+    if args.env_file:
+        _load_env_file(args.env_file)
 
-    loaded_count, loaded_map = load_env_file(args.env_file or ".env", override=False)
+    pair = args.exmo_pair
+    span = args.exmo_candles
+    rule = args.resample
 
-    # коалесим ключи, если кто-то назвал их иначе
-    def _coalesce_env(target: str, aliases: list[str]) -> None:
-        if os.environ.get(target):  # уже есть — не трогаем
-            return
-        for a in aliases:
-            if os.environ.get(a):
-                os.environ[target] = os.environ[a]
-                break
-
-    _coalesce_env("EXMO_KEY", ["EXMO_API_KEY", "EXMO_PUBLIC_KEY", "EXMO_KEY_ID"])
-    _coalesce_env("EXMO_SECRET", ["EXMO_API_SECRET", "EXMO_PRIVATE_KEY", "EXMO_SECRET_KEY"])
-
-    # короткая диагностика (маскируем значения)
-    ek = os.environ.get("EXMO_KEY", "")
-    es = os.environ.get("EXMO_SECRET", "")
-
-    def _mask(s: str) -> str:
-        if not s: return "∅"
-        return f"{len(s)} chars, ****{s[-4:]}"
-
-    print(f"[env] .env={'ok' if loaded_count > 0 else 'skip'} "
-          f"EXMO_KEY={_mask(ek)} EXMO_SECRET={_mask(es)}")
-    # ------------------------------------------
-
-    # 1) данные
-    df = fetch_exmo_candles(args.exmo_pair, args.exmo_candles)
-    if args.resample:
-        df = resample_ohlcv(df, args.resample)
-
-    # LIVE OBSERVE
-    # ---- LIVE dispatcher ----
     if args.live == "observe":
-        try:
-            from ..live import run_live_observe
-        except Exception:
-            from src.presentation.live import run_live_observe
         run_live_observe(
-            pair=args.exmo_pair, span=args.exmo_candles, resample_rule=args.resample,
-            fast=args.fast, slow=args.slow, poll_sec=args.poll_sec or None,
-            log_csv=args.live_log, heartbeat_sec=args.heartbeat_sec
+            pair=pair, span=span, resample_rule=rule,
+            fast=args.fast, slow=args.slow,
+            poll_sec=args.poll_sec, heartbeat_sec=args.heartbeat_sec,
+            live_log=args.live_log or None,
         )
         return
 
     if args.live == "paper":
-        try:
-            from ..paper import run_live_paper
-        except Exception:
-            from src.presentation.paper import run_live_paper
         run_live_paper(
-            pair=args.exmo_pair, span=args.exmo_candles, resample_rule=args.resample,
+            pair=pair, span=span, resample_rule=rule,
             fast=args.fast, slow=args.slow,
             start_eur=args.start_eur, qty_eur=args.qty_eur, position_pct=args.position_pct,
             fee_bps=args.fee_bps, slip_bps=args.slip_bps,
-            price_tick=args.price_tick, qty_step=args.qty_step, min_quote=args.min_quote,
-            poll_sec=args.poll_sec or None, heartbeat_sec=args.heartbeat_sec,
-            max_daily_loss_bps=args.max_daily_loss_bps, cooldown_bars=args.cooldown_bars,
-            align_on_state=args.align_on_state, enter_on_start=args.enter_on_start,
+            poll_sec=args.poll_sec, heartbeat_sec=args.heartbeat_sec,
         )
         return
 
     if args.live == "trade":
-        try:
-            from ..trade import run_live_trade
-        except Exception:
-            from src.presentation.trade import run_live_trade
+        # импортим здесь, чтобы не тянуть зависимости раньше времени
+        from ..live_trade import run_live_trade
         run_live_trade(
-            pair=args.exmo_pair, span=args.exmo_candles, resample_rule=args.resample,
+            pair=pair, span=span, resample_rule=rule,
             fast=args.fast, slow=args.slow,
             start_eur=args.start_eur, qty_eur=args.qty_eur, position_pct=args.position_pct,
             fee_bps=args.fee_bps, slip_bps=args.slip_bps,
             price_tick=args.price_tick, qty_step=args.qty_step, min_quote=args.min_quote,
-            poll_sec=args.poll_sec or None, heartbeat_sec=args.heartbeat_sec,
+            poll_sec=args.poll_sec, heartbeat_sec=args.heartbeat_sec,
             max_daily_loss_bps=args.max_daily_loss_bps, cooldown_bars=args.cooldown_bars,
             confirm_live_trade=args.confirm_live_trade,
             align_on_state=args.align_on_state, enter_on_start=args.enter_on_start,
-            api_key=args.exmo_key, api_secret=args.exmo_secret, fok_wait_sec=args.fok_wait_sec,
+            fok_wait_sec=args.fok_wait_sec,
             reprice_attempts=args.reprice_attempts, reprice_step_bps=args.reprice_step_bps,
-            aggr_limit=args.aggr_limit, aggr_ticks=args.aggr_ticks, force_entry=args.force_entry,
+            aggr_limit=args.aggr_limit, aggr_ticks=args.aggr_ticks,
+            force_entry=args.force_entry,
         )
-
-    # -------------------------
-
-    # 2) режимы оптимизаций/оценок
-    if args.optimize_sma:
-        grid = optimize_sma_grid(
-            df,
-            fast_range=args.fast_range, slow_range=args.slow_range,
-            fee_bps=args.fee_bps, slip_bps=args.slip_bps,
-            start_eur=args.start_eur, qty_eur=args.qty_eur,
-            out_csv=args.optimize_out, warmup_bars=args.warmup_bars,
-        )
-        print(f"→ Grid CSV saved to: {args.optimize_out}")
-        if args.heatmap_out:
-            plot_sma_heatmap(grid, metric=args.heatmap_metric, out_png=args.heatmap_out,
-                             title=f"SMA {args.exmo_pair} ({args.heatmap_metric})")
-            print(f"→ Heatmap saved to: {args.heatmap_out}")
         return
 
-    if args.oos_split and args.oos_split > 0.0:
-        oos = optimize_sma_grid_oos(
-            df,
-            fast_range=args.fast_range, slow_range=args.slow_range,
-            fee_bps=args.fee_bps, slip_bps=args.slip_bps,
-            start_eur=args.start_eur, qty_eur=args.qty_eur,
-            metric=args.heatmap_metric, train_ratio=args.oos_split,
-            warmup_bars=args.warmup_bars,
-        )
-        best, tm = oos["best"], oos["test_metrics"]
-        pf_str = _format_pf_for_console(tm.get("profit_factor", 0))
-        print(f"[oos] train_ratio={args.oos_split:.2f}  best=({best['fast']},{best['slow']}) "
-              f"train_{args.heatmap_metric}={best['metric_train']:.4f}  "
-              f"test_end={tm.get('end', 0):.6f}  pnl={tm.get('total_pnl', 0):.6f}  "
-              f"pf={pf_str}  dd={tm.get('max_drawdown', 0) * 100:.2f}%  sharpe={tm.get('sharpe', 0):.2f}")
-        if args.oos_out:
-            os.makedirs(os.path.dirname(args.oos_out), exist_ok=True)
-            with open(args.oos_out, "w") as f:
-                json.dump(oos, f, indent=2, ensure_ascii=False)
-            print(f"→ OOS JSON saved to: {args.oos_out}")
-        return
-
-    if args.walkforward:
-        wf = walk_forward_sma(
-            df,
-            fast_range=args.fast_range, slow_range=args.slow_range,
-            fee_bps=args.fee_bps, slip_bps=args.slip_bps,
-            start_eur=args.start_eur, qty_eur=args.qty_eur,
-            window_bars=args.wf_window, step_bars=args.wf_step,
-            metric=args.heatmap_metric, warmup_bars=args.warmup_bars,
-        )
-        os.makedirs(os.path.dirname(args.wf_out), exist_ok=True)
-        wf.to_csv(args.wf_out, index=False)
-        print(f"→ Walk-forward CSV saved to: {args.wf_out}")
-        return
-
-    if args.optimize_risk:
-        rg = optimize_risk_grid(
-            df, fast=args.fast, slow=args.slow,
-            fee_bps=args.fee_bps, slip_bps=args.slip_bps,
-            start_eur=args.start_eur, qty_eur=args.qty_eur,
-            atr_range=args.atr_range, tp_range=args.tp_range,
-            metric=args.heatmap_metric, warmup_bars=args.warmup_bars,
-        )
-        os.makedirs(os.path.dirname(args.risk_out), exist_ok=True)
-        rg.to_csv(args.risk_out, index=False)
-        print(f"→ Risk grid CSV saved to: {args.risk_out}")
-        key = args.heatmap_metric
-        rg[key] = pd.to_numeric(rg[key], errors="coerce")
-        top = rg.sort_values(key, ascending=False).head(5)
-        print("[risk-grid top5]")
-        for _, r in top.iterrows():
-            pf_str = _format_pf_for_console(r.get("pf", 0))
-            print(f"  atr_mult={r['atr_mult']}, tp_bps={int(r['tp_bps'])}, "
-                  f"{key}={r[key]:.4f}, pf={pf_str}, dd={float(r['dd']) * 100:.2f}%, trades={int(r['trades'])}")
-        return
-
-    # 3) обычный бэктест
-    trades_df = pd.DataFrame();
-    equity_df = pd.DataFrame();
-    report: Dict[str, Any] = {}
-    if args.backtest:
-        trades_df, equity_df, report = run_backtest_sma(
-            df, fast=args.fast, slow=args.slow,
-            start_eur=args.start_eur, qty_eur=args.qty_eur,
-            fee_bps=args.fee_bps, slip_bps=args.slip_bps,
-            warmup_bars=args.warmup_bars,
-            atr_period=args.atr_period, atr_mult=args.atr_mult, tp_bps=int(args.tp_bps),
-            position_pct=args.position_pct,
-            price_tick=args.price_tick, qty_step=args.qty_step, min_quote=args.min_quote,
-            risk_pct=args.risk_pct, atr_pctl_min=args.atr_pctl_min, atr_pctl_max=args.atr_pctl_max,
-        )
-        print_bt_summary(report)
-
-    # графики
-    if args.exmo_plot and not df.empty:
-        first = df["time"].iloc[0].isoformat();
-        last = df["time"].iloc[-1].isoformat()
-        print(f"[plot] OHLC: points={len(df)}  first={first}  last={last}")
-        plot_ohlc_with_volume(
-            df, args.exmo_plot,
-            f"EXMO candles {args.exmo_pair} {args.resample or args.exmo_candles}",
-            sma_overlay=(args.fast, args.slow) if args.plot_signals else None,
-            trades_df=trades_df if (args.plot_signals and not trades_df.empty) else None
-        )
-        print(f"→ Chart saved to: {args.exmo_plot}")
-
-    if args.plot_equity and not equity_df.empty:
-        plot_equity(equity_df, args.plot_equity)
-        print(f"→ Equity chart saved to: {args.plot_equity}")
-
-    # сохранения
-    if args.save_trades and not trades_df.empty:
-        os.makedirs(os.path.dirname(args.save_trades), exist_ok=True)
-        trades_df.to_csv(args.save_trades, index=False)
-        print(f"→ Trades CSV saved to: {args.save_trades}")
-
-    if args.save_equity and not equity_df.empty:
-        os.makedirs(os.path.dirname(args.save_equity), exist_ok=True)
-        equity_df.to_csv(args.save_equity, index=False)
-        print(f"→ Equity CSV saved to: {args.save_equity}")
-
-    if args.save_report and report:
-        os.makedirs(os.path.dirname(args.save_report), exist_ok=True)
-        with open(args.save_report, "w") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
-        # ещё раз — короткая сводка
-        print_bt_summary(report)
-        print(f"EXMO candles[{args.exmo_pair}] rows={len(df)}")
+    # Если сюда дошли — пользователь не выбрал live-режим
+    p.print_help()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        if os.environ.get("EXMO_DEBUG", "0").lower() in ("1", "true", "yes"):
-            import traceback;
-
-            traceback.print_exc()
-        else:
-            print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    main()
