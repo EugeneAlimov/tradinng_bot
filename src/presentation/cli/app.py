@@ -100,28 +100,29 @@ def _tf_seconds(tf: str) -> int:
     if tf.endswith("d"): return int(tf[:-1]) * 86400
     raise ValueError(f"Unsupported TF {tf!r}")
 
-def _append_live_signal_row(
-    csv_path: str,
-    ts: datetime,
-    close: float,
-    volume: float,
-    sma_fast: float,
-    sma_slow: float,
-    signal: Optional[str],
-) -> None:
-    """
-    Пишет одну строку в CSV со стабильной схемой:
-    time,close,volume,sma_fast,sma_slow,signal
 
-    - Создаёт каталог, если нужно.
-    - Гарантирует заголовок, если файл пустой/новый.
-    - Корректно форматирует числа (до 8 знаков после запятой).
-    - signal может быть '', 'none', 'buy', 'sell'.
-    """
+import os
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+
+def _append_live_signal_row(
+        csv_path: str,
+        ts: datetime,
+        close: float,
+        volume: float,
+        sma_fast: float,
+        sma_slow: float,
+        signal: Optional[str],
+) -> None:
+    """Пишет одну строку в CSV: time,close,volume,sma_fast,sma_slow,signal."""
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
     iso = ts.astimezone(timezone.utc).isoformat(timespec="seconds")
-
     sig = "" if not signal else str(signal)
 
     row = "{time},{close:.8f},{vol:.8f},{f:.8f},{s:.8f},{sig}\n".format(
@@ -141,7 +142,39 @@ def _append_live_signal_row(
         if need_header:
             f.write("time,close,volume,sma_fast,sma_slow,signal\n")
         f.write(row)
+
+
 # ===== лёгкие режимы: observe и paper =====
+def _read_last_written_ts(csv_path: Optional[str]) -> Optional[pd.Timestamp]:
+    """Возвращает последний time из CSV, если файл существует и непустой."""
+    if not csv_path or not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+        return None
+    try:
+        # читаем последнюю непустую строку
+        with open(csv_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            line = b""
+            while pos > 0:
+                pos -= 1
+                f.seek(pos)
+                ch = f.read(1)
+                if ch == b"\n" and line:
+                    break
+                line = ch + line
+        last = line.decode("utf-8").strip()
+        if not last or last.startswith("time,"):
+            return None
+        # time в первой колонке
+        ts_s = last.split(",", 1)[0].strip()
+        ts = pd.to_datetime(ts_s, utc=True, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return pd.Timestamp(ts)
+    except Exception:
+        return None
+
+
 def run_live_observe(
     pair: str,
     span: str,
@@ -153,22 +186,24 @@ def run_live_observe(
     live_log: Optional[str] = None,
 ) -> None:
     """
-    Лайв-наблюдение (без ордеров):
-    - Периодически тянет свечи EXMO.
-    - Опционально ресемплит (resample_rule: '5min', '15min', ''/None — без ресемпла).
-    - Считает SMA(fast/slow), генерит сигнал ('buy' при пересечении вверх, 'sell' при пересечении вниз, иначе 'none').
-    - Печатает состояние и, если задан live_log, пишет в CSV: time,close,volume,sma_fast,sma_slow,signal.
-    - Защита от дубликатов: в CSV пишется не более одной строки на один timestamp бара.
+    Лайв-наблюдение:
+      - тянем EXMO свечи, опционально ресемплим
+      - считаем SMA(fast/slow) и сигнал ('buy'/'sell'/'none')
+      - пишем в CSV РОВНО одну строку на бар (без дублей)
+      - печатаем в консоль тоже максимум один раз на бар (антиспам)
     """
-    # печать шапки
     rs_print = resample_rule if (resample_rule and str(resample_rule).strip()) else "—"
     print(f"[live] observe {pair} {span} resample={rs_print} fast={fast} slow={slow} poll={poll_sec}s")
 
-    last_written_ts: Optional[pd.Timestamp] = None
+    # последний записанный в CSV бар (для устойчивости к перезапуску)
+    last_written_ts: Optional[pd.Timestamp] = _read_last_written_ts(live_log)
+    # последний выведенный в консоль бар (чтобы не спамить одинаковым тиком)
+    last_printed_ts: Optional[pd.Timestamp] = None
+
     last_hb: float = time.time()
 
     def _compute_signal(f_now: float, s_now: float, f_prev: float, s_prev: float) -> str:
-        if np.isnan([f_now, s_now, f_prev, s_prev]).any():
+        if any(map(np.isnan, [f_now, s_now, f_prev, s_prev])):
             return ""
         cross_up = (f_prev <= s_prev) and (f_now > s_now)
         cross_dn = (f_prev >= s_prev) and (f_now < s_now)
@@ -180,84 +215,80 @@ def run_live_observe(
 
     try:
         while True:
-            # 1) тянем свечи
-            df = fetch_exmo_candles(pair, span)  # <- у тебя уже есть эта функция
+            # 1) загрузка и индекс времени
+            df = fetch_exmo_candles(pair, span)
             if df is None or len(df) == 0:
-                time.sleep(poll_sec)
+                time.sleep(max(1, int(poll_sec)))
                 continue
 
-            # 2) приведение времени/индекса
             if not isinstance(df.index, pd.DatetimeIndex):
                 if "time" in df.columns:
-                    df["time"] = pd.to_datetime(df["time"], utc=True)
-                    df = df.set_index("time").sort_index()
+                    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+                    df = df.set_index("time")
                 else:
-                    # без индекса времени корректно не работаем
-                    time.sleep(poll_sec)
+                    time.sleep(max(1, int(poll_sec)))
                     continue
 
-            # 3) ресемплинг (если задан)
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("UTC")
+            else:
+                df.index = df.index.tz_convert("UTC")
+            df = df.sort_index()
+
+            # 2) ресемпл при необходимости
             dfr = df
             if resample_rule and str(resample_rule).strip():
-                dfr = resample_ohlcv(df, rule=resample_rule)  # <- твой ресемплер
+                dfr = resample_ohlcv(df, rule=resample_rule)
                 if dfr is None or len(dfr) == 0:
-                    time.sleep(poll_sec)
+                    time.sleep(max(1, int(poll_sec)))
                     continue
 
-            # 4) SMA
+            # 3) SMA
             dfr = dfr.copy()
             dfr["sma_fast"] = dfr["close"].rolling(int(fast), min_periods=1).mean()
             dfr["sma_slow"] = dfr["close"].rolling(int(slow), min_periods=1).mean()
-
             if len(dfr) < 2:
-                time.sleep(poll_sec)
+                time.sleep(max(1, int(poll_sec)))
                 continue
 
-            # 5) текущий/предыдущий бар
-            last_ts = dfr.index[-1]
-            prev_ts = dfr.index[-2]
-
-            # защита от дубликатов в CSV
-            if last_written_ts is not None and pd.Timestamp(last_ts) <= pd.Timestamp(last_written_ts):
-                # но всё равно выведем в консоль и heartbeat по расписанию
-                pass
-            else:
-                last_written_ts = pd.Timestamp(last_ts)
+            last_ts = pd.Timestamp(dfr.index[-1])   # «текущий» бар
+            prev_ts = pd.Timestamp(dfr.index[-2])   # предыдущий бар
 
             close_now = float(dfr.iloc[-1]["close"])
-            vol_now = float(dfr.iloc[-1]["volume"]) if "volume" in dfr.columns else float("nan")
+            vol_now = float(dfr.iloc[-1]["volume"]) if "volume" in dfr.columns else 0.0
             f_now = float(dfr.iloc[-1]["sma_fast"])
             s_now = float(dfr.iloc[-1]["sma_slow"])
             f_prev = float(dfr.iloc[-2]["sma_fast"])
             s_prev = float(dfr.iloc[-2]["sma_slow"])
 
-            # 6) сигнал пересечения
             sig = _compute_signal(f_now, s_now, f_prev, s_prev)
 
-            # печать статуса
-            ts_iso = pd.Timestamp(last_ts).tz_convert("UTC").isoformat()
-            print(f"[live] {ts_iso} tick  close={close_now:.6f}  f={f_now:.6f}  s={s_now:.6f}")
+            # 4) Печатаем в консоль только если бар сменился
+            if (last_printed_ts is None) or (last_ts > last_printed_ts):
+                ts_iso = last_ts.tz_convert("UTC").isoformat()
+                print(f"[live] {ts_iso} tick  close={close_now:.6f}  f={f_now:.6f}  s={s_now:.6f}")
+                last_printed_ts = last_ts
 
-            # 7) запись в CSV (строго 6 колонок, один раз на бар)
-            if live_log:
+            # 5) Пишем в CSV только если бар НОВЫЙ относительно последней записи
+            if live_log and ((last_written_ts is None) or (last_ts > last_written_ts)):
                 _append_live_signal_row(
                     live_log,
-                    ts=pd.Timestamp(last_ts).to_pydatetime(),
+                    ts=last_ts.to_pydatetime(),
                     close=close_now,
-                    volume=(vol_now if np.isfinite(vol_now) else 0.0),
+                    volume=vol_now,
                     sma_fast=f_now,
                     sma_slow=s_now,
                     signal=sig,
                 )
+                last_written_ts = last_ts
 
-            # 8) heartbeat
+            # 6) heartbeat (по времени, не по барам)
             now = time.time()
             if now - last_hb >= max(5, int(heartbeat_sec)):
                 hb_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 print(f"[live] hb @ {hb_iso}")
                 last_hb = now
 
-            # 9) пауза
             time.sleep(max(1, int(poll_sec)))
     except KeyboardInterrupt:
         print("[live] stopped.")
