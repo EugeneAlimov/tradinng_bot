@@ -5,6 +5,7 @@ from typing import Dict, Any
 from src.config.settings import RiskCfg
 from datetime import datetime, timedelta
 from typing import Optional
+from datetime import date
 
 
 @dataclass
@@ -69,3 +70,53 @@ class RiskGuard:
         if reason:
             return False, reason
         return True, None
+
+
+@dataclass
+class DailyRiskState:
+    day: date
+    realized_pnl_bps: float = 0.0  # накопленный реализованный PnL за день (bps)
+
+
+class RiskService:
+    """
+    Минимально-инвазивный риск-сервис для:
+      - учёта реализованного дневного PnL в bps,
+      - блокировки НОВЫХ входов при превышении max_daily_loss_bps (выходы разрешены).
+    """
+
+    def __init__(self) -> None:
+        self._state = DailyRiskState(day=date.today())
+
+    # ====== служебное ======
+    def _ensure_today(self) -> None:
+        today = date.today()
+        if self._state.day != today:
+            self._state = DailyRiskState(day=today)
+
+    # ====== публичные методы ======
+    def add_realized_pnl_bps(self, pnl_bps: float) -> None:
+        """
+        Добавить реализованный PnL (bps). Вызывай при подтверждении сделки (обычно на выходе).
+        """
+        self._ensure_today()
+        self._state.realized_pnl_bps += float(pnl_bps or 0.0)
+
+    def get_daily_realized_bps(self) -> float:
+        """
+        Текущий реализованный PnL за сегодняшний день (bps).
+        """
+        self._ensure_today()
+        return self._state.realized_pnl_bps
+
+    def allow_new_entries(self, max_daily_loss_bps: float) -> bool:
+        """
+        Разрешать ли НОВЫЕ входы.
+        Возвращает False, если реализованный PnL <= -max_daily_loss_bps.
+        max_daily_loss_bps <= 0 => лимит выключен.
+        """
+        self._ensure_today()
+        limit = float(max_daily_loss_bps or 0.0)
+        if limit <= 0.0:
+            return True
+        return self._state.realized_pnl_bps > -abs(limit)
