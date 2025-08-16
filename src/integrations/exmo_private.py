@@ -54,25 +54,59 @@ class ExmoPrivate:
         return hmac.new(self.secret, payload, hashlib.sha512).hexdigest()
 
     def _post(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        POST c Key/Sign + nonce и надёжными ретраями.
+        - Повторяем на 429/5xx, таймаутах и типичных бизнес-ошибках (nonce/flood).
+        - Экспоненциальный бэкофф.
+        """
+        import random
         params = dict(params or {})
-        params["nonce"] = self._nonce()
-        headers = {
-            "Key": self.key,
-            "Sign": self._sign(params),
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-        url = f"{self.base_url}/{method}"
-        r = requests.post(url, data=params, headers=headers, timeout=self.timeout)
-        # EXMO возвращает 200 даже при бизнес-ошибках — проверяем тело
-        r.raise_for_status()
-        data = r.json()
-        # форматы ответов у методов разнятся; чаще есть "result" и/или "error"
-        if isinstance(data, dict) and data.get("error"):
-            raise RuntimeError(f"EXMO error: {data.get('error')}")
-        return data
+
+        def _once(payload: Dict[str, Any]) -> Dict[str, Any]:
+            payload = dict(payload)
+            payload["nonce"] = self._nonce()
+            headers = {
+                "Key": self.key,
+                "Sign": self._sign(payload),
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+            url = f"{self.base_url}/{method}"
+            r = requests.post(url, data=payload, headers=headers, timeout=self.timeout)
+            r.raise_for_status()
+            data = r.json()
+            # форматы разные; часто встречаются поля result/error
+            if isinstance(data, dict) and data.get("error"):
+                raise RuntimeError(str(data.get("error")))
+            return data
+
+        max_tries = 5
+        delay = 0.8
+        for attempt in range(1, max_tries + 1):
+            try:
+                return _once(params)
+            except requests.HTTPError as e:
+                code = e.response.status_code if e.response is not None else None
+                if code in (429, 500, 502, 503, 504) and attempt < max_tries:
+                    time.sleep(delay);
+                    delay *= 1.7;
+                    continue
+                raise
+            except (requests.Timeout, requests.ConnectionError):
+                if attempt < max_tries:
+                    time.sleep(delay);
+                    delay *= 1.7;
+                    continue
+                raise
+            except RuntimeError as e:
+                msg = str(e).lower()
+                # типичные сообщения биржи: "nonce", "flood", "too many requests"
+                if any(k in msg for k in ("nonce", "flood", "too many", "try again")) and attempt < max_tries:
+                    time.sleep(delay + random.random() * 0.5);
+                    delay *= 1.7;
+                    continue
+                raise
 
     # ===== Удобные обёртки по популярным методам =====
-
     def user_info(self) -> Dict[str, Any]:
         return self._post("user_info")
 

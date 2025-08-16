@@ -7,6 +7,7 @@ CLI для EXMO SMA-бота/бэктестера.
 from __future__ import annotations
 import argparse, json, os, sys
 from typing import Any, Dict
+import os
 
 import pandas as pd
 
@@ -106,7 +107,6 @@ def main():
     p.add_argument("--tp-range", default="0:120:10")
     p.add_argument("--risk-out", default="data/risk_grid.csv")
 
-
     # ---- LIVE mods ----
     p.add_argument("--live", choices=["observe", "paper", "trade"], default="")
     p.add_argument("--poll-sec", type=int, default=0)
@@ -122,9 +122,32 @@ def main():
                    help="Required to actually place real orders.")
     p.add_argument("--exmo-key", default="", help="EXMO API key (optional, prefer env EXMO_KEY)")
     p.add_argument("--exmo-secret", default="", help="EXMO API secret (optional, prefer env EXMO_SECRET)")
+    p.add_argument("--env-file", default=".env",
+                   help="Path to .env file with EXMO_KEY/EXMO_SECRET (loaded automatically).")
+
     # --------------------------------------------
 
     args = p.parse_args()
+
+    # ---- .env autoload (до любого режима) ----
+    try:
+        from  ...utils.env import load_env_file  # пакетный запуск
+    except Exception:
+        from src.utils.env import load_env_file  # запуск из репо
+
+    loaded_count, loaded_map = load_env_file(args.env_file or ".env", override=False)
+
+    # короткая диагностика без утечки секрета
+    ek = os.environ.get("EXMO_KEY", "")
+    es = os.environ.get("EXMO_SECRET", "")
+
+    def _mask(s: str) -> str:
+        if not s: return "∅"
+        return f"{len(s)} chars, ****{s[-4:]}"
+
+    print(f"[env] .env={'ok' if loaded_count > 0 else 'skip'} "
+          f"EXMO_KEY={_mask(ek)} EXMO_SECRET={_mask(es)}")
+    # ------------------------------------------
 
     # 1) данные
     df = fetch_exmo_candles(args.exmo_pair, args.exmo_candles)
