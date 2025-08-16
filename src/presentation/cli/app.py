@@ -107,14 +107,20 @@ def main():
     p.add_argument("--risk-out", default="data/risk_grid.csv")
 
     # live
-    p.add_argument("--live", choices=["observe"], default="")
-    p.add_argument("--poll-sec", type=int, default=0)
-    p.add_argument("--live-log", default="")
-    p.add_argument("--heartbeat-sec", type=int, default=0)
     p.add_argument("--live", choices=["observe", "paper"], default="")
     p.add_argument("--poll-sec", type=int, default=0)
     p.add_argument("--live-log", default="")
     p.add_argument("--heartbeat-sec", type=int, default=0)
+
+    # дневной риск и «перерыв» (общие, подходят и для live paper)
+    p.add_argument("--max-daily-loss-bps", type=float, default=0.0,
+                   help="Max daily loss (in basis points) to flatten and pause, e.g. 50 = -0.50%.")
+    p.add_argument("--cooldown-bars", type=int, default=0,
+                   help="Bars to pause after daily loss guard triggers (on the resampled TF).")
+    p.add_argument("--align-on-state", action="store_true",
+                   help="Align position to SMA regime on every bar (enter if fast>slow, exit if fast<slow).")
+    p.add_argument("--enter-on-start", action="store_true",
+                   help="On first processed bar, align position to regime once.")
 
     args = p.parse_args()
 
@@ -168,9 +174,12 @@ def main():
             trades_csv="data/live_paper_trades.csv",
             equity_csv="data/live_paper_equity.csv",
             heartbeat_sec=args.heartbeat_sec,
-            max_daily_loss_bps=getattr(args, "max_daily_loss_bps", 0.0) if hasattr(args, "max_daily_loss_bps") else 0.0,
-            cooldown_bars=getattr(args, "cooldown_bars", 0),
+            max_daily_loss_bps=args.max_daily_loss_bps,
+            cooldown_bars=args.cooldown_bars,
+            align_on_state=args.align_on_state,  # ← добавлено
+            enter_on_start=args.enter_on_start,  # ← добавлено
         )
+
         return
 
     # 2) режимы оптимизаций/оценок
