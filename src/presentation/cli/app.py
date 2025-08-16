@@ -3,18 +3,20 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 import time
-from typing import Optional, Tuple
 from datetime import datetime, timezone
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 
-# ===== попытка взять функции из интеграции EXMO; если нет — дадим простые фолбэки =====
+# ===== интеграции EXMO: аккуратные обёртки и фолбэки =====
 def _try_import_exmo_utils():
-    # абсолютный путь (чаще всего у вас так и есть)
+    """
+    Пытаемся импортировать из src.integrations.exmo. Если модуль отсутствует,
+    часть логики заменяем простыми фолбэками (ресемплинг).
+    """
     try:
         from src.integrations.exmo import (
             fetch_exmo_candles as _f,
@@ -24,7 +26,6 @@ def _try_import_exmo_utils():
         return _f, _r, _n
     except Exception:
         pass
-    # относительный путь: из src/presentation/cli -> к src/integrations
     try:
         from ...integrations.exmo import (
             fetch_exmo_candles as _f,
@@ -40,42 +41,45 @@ _FEXMO, _RESAMPLE, _NORM = _try_import_exmo_utils()
 
 
 def fetch_exmo_candles(pair: str, span: str, verbose: bool = False) -> pd.DataFrame:
-    """
-    Тонкая обёртка над src.integrations.exmo.fetch_exmo_candles.
-    Здесь держим только маршрутизацию импорта, без сетевой логики.
-    """
     if _FEXMO is None:
-        raise RuntimeError("integrations.exmo.fetch_exmo_candles отсутствует. "
-                           "Установите файл src/integrations/exmo.py или поправьте импорты.")
+        raise RuntimeError(
+            "integrations.exmo.fetch_exmo_candles отсутствует. "
+            "Добавьте src/integrations/exmo.py или поправьте импорты."
+        )
     return _FEXMO(pair, span, verbose=verbose)
 
 
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    if _RESAMPLE is None:
-        # Простой фолбэк на случай отсутствия интеграции
-        if not rule:
-            return df.copy()
-        x = df.copy()
+    if not rule:
+        return df.copy()
+    if _RESAMPLE is not None:
+        return _RESAMPLE(df, rule)
+    # Фолбэк-ресемплер
+    x = df.copy()
+    if "time" in x.columns:
+        x["time"] = pd.to_datetime(x["time"], utc=True, errors="coerce")
         x = x.set_index("time")
-        o = x["open"].resample(rule).first()
-        h = x["high"].resample(rule).max()
-        l = x["low"].resample(rule).min()
-        c = x["close"].resample(rule).last()
-        v = x["volume"].resample(rule).sum()
-        y = pd.DataFrame({"open": o, "high": h, "low": l, "close": c, "volume": v})
-        y = y.dropna().reset_index()
-        return y
-    return _RESAMPLE(df, rule)
+    if not isinstance(x.index, pd.DatetimeIndex):
+        raise ValueError("DataFrame должен содержать DatetimeIndex или колонку 'time'.")
+    o = x["open"].resample(rule).first()
+    h = x["high"].resample(rule).max()
+    l = x["low"].resample(rule).min()
+    c = x["close"].resample(rule).last()
+    v = x["volume"].resample(rule).sum() if "volume" in x.columns else None
+    y = {"open": o, "high": h, "low": l, "close": c}
+    if v is not None:
+        y["volume"] = v
+    out = pd.DataFrame(y).dropna()
+    out = out.reset_index()
+    return out
 
 
 def normalize_resample_rule(rule: str) -> str:
     if _NORM is not None:
         return _NORM(rule)
-    # Фолбэк: приводим частые варианты к современным псевдонимам pandas
     if not rule:
         return ""
     r = str(rule).strip().lower()
-    # поддержим 5m / 15m / 1h / 4h / 1d и т.п.
     if r.endswith("m"):
         return f"{int(r[:-1])}min"
     if r.endswith("min"):
@@ -87,7 +91,7 @@ def normalize_resample_rule(rule: str) -> str:
     return r
 
 
-# ===== маленькие утилиты, которые также использует live_trade =====
+# ===== утилиты времени/TF =====
 def _parse_span(span: str) -> Tuple[str, int]:
     tf, n = span.split(":")
     return tf.strip().lower(), int(n)
@@ -95,222 +99,35 @@ def _parse_span(span: str) -> Tuple[str, int]:
 
 def _tf_seconds(tf: str) -> int:
     tf = tf.strip().lower()
-    if tf.endswith("m"): return int(tf[:-1]) * 60
-    if tf.endswith("h"): return int(tf[:-1]) * 3600
-    if tf.endswith("d"): return int(tf[:-1]) * 86400
+    if tf.endswith("m"):
+        return int(tf[:-1]) * 60
+    if tf.endswith("h"):
+        return int(tf[:-1]) * 3600
+    if tf.endswith("d"):
+        return int(tf[:-1]) * 86400
     raise ValueError(f"Unsupported TF {tf!r}")
 
 
-import os
-import time
-from datetime import datetime, timezone
-from typing import Optional
-
-import numpy as np
-import pandas as pd
-
-
-def _append_live_signal_row(
-        csv_path: str,
-        ts: datetime,
-        close: float,
-        volume: float,
-        sma_fast: float,
-        sma_slow: float,
-        signal: Optional[str],
-) -> None:
-    """Пишет одну строку в CSV: time,close,volume,sma_fast,sma_slow,signal."""
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    iso = ts.astimezone(timezone.utc).isoformat(timespec="seconds")
-    sig = "" if not signal else str(signal)
-
-    row = "{time},{close:.8f},{vol:.8f},{f:.8f},{s:.8f},{sig}\n".format(
-        time=iso,
-        close=float(close),
-        vol=float(volume if volume is not None else 0.0),
-        f=float(sma_fast if sma_fast is not None else 0.0),
-        s=float(sma_slow if sma_slow is not None else 0.0),
-        sig=sig,
-    )
-
-    directory = os.path.dirname(csv_path) or "."
-    os.makedirs(directory, exist_ok=True)
-    need_header = (not os.path.exists(csv_path)) or (os.path.getsize(csv_path) == 0)
-
-    with open(csv_path, "a", newline="") as f:
-        if need_header:
-            f.write("time,close,volume,sma_fast,sma_slow,signal\n")
-        f.write(row)
-
-
-# ===== лёгкие режимы: observe и paper =====
-def _read_last_written_ts(csv_path: Optional[str]) -> Optional[pd.Timestamp]:
-    """Возвращает последний time из CSV, если файл существует и непустой."""
-    if not csv_path or not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
-        return None
-    try:
-        # читаем последнюю непустую строку
-        with open(csv_path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            pos = f.tell()
-            line = b""
-            while pos > 0:
-                pos -= 1
-                f.seek(pos)
-                ch = f.read(1)
-                if ch == b"\n" and line:
-                    break
-                line = ch + line
-        last = line.decode("utf-8").strip()
-        if not last or last.startswith("time,"):
-            return None
-        # time в первой колонке
-        ts_s = last.split(",", 1)[0].strip()
-        ts = pd.to_datetime(ts_s, utc=True, errors="coerce")
-        if pd.isna(ts):
-            return None
-        return pd.Timestamp(ts)
-    except Exception:
-        return None
-
-
-def run_live_observe(
-        pair: str,
-        span: str,
-        resample_rule: str,
-        fast: int,
-        slow: int,
-        poll_sec: int = 15,
-        heartbeat_sec: int = 60,
-        live_log: Optional[str] = None,
-) -> None:
-    """
-    Лайв-наблюдение:
-      - тянем EXMO свечи, опционально ресемплим
-      - считаем SMA(fast/slow) и сигнал ('buy'/'sell'/'none')
-      - пишем в CSV РОВНО одну строку на бар (без дублей)
-      - печатаем в консоль тоже максимум один раз на бар (антиспам)
-    """
-    rs_print = resample_rule if (resample_rule and str(resample_rule).strip()) else "—"
-    print(f"[live] observe {pair} {span} resample={rs_print} fast={fast} slow={slow} poll={poll_sec}s")
-
-    # последний записанный в CSV бар (для устойчивости к перезапуску)
-    last_written_ts: Optional[pd.Timestamp] = _read_last_written_ts(live_log)
-    # последний выведенный в консоль бар (чтобы не спамить одинаковым тиком)
-    last_printed_ts: Optional[pd.Timestamp] = None
-
-    last_hb: float = time.time()
-
-    def _compute_signal(f_now: float, s_now: float, f_prev: float, s_prev: float) -> str:
-        if any(map(np.isnan, [f_now, s_now, f_prev, s_prev])):
-            return ""
-        cross_up = (f_prev <= s_prev) and (f_now > s_now)
-        cross_dn = (f_prev >= s_prev) and (f_now < s_now)
-        if cross_up:
-            return "buy"
-        if cross_dn:
-            return "sell"
-        return "none"
-
-    try:
-        while True:
-            # 1) загрузка и индекс времени
-            df = fetch_exmo_candles(pair, span)
-            if df is None or len(df) == 0:
-                time.sleep(max(1, int(poll_sec)))
-                continue
-
-            if not isinstance(df.index, pd.DatetimeIndex):
-                if "time" in df.columns:
-                    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-                    df = df.set_index("time")
-                else:
-                    time.sleep(max(1, int(poll_sec)))
-                    continue
-
-            if df.index.tz is None:
-                df.index = df.index.tz_localize("UTC")
-            else:
-                df.index = df.index.tz_convert("UTC")
-            df = df.sort_index()
-
-            # 2) ресемпл при необходимости
-            dfr = df
-            if resample_rule and str(resample_rule).strip():
-                dfr = resample_ohlcv(df, rule=resample_rule)
-                if dfr is None or len(dfr) == 0:
-                    time.sleep(max(1, int(poll_sec)))
-                    continue
-
-            # 3) SMA
-            dfr = dfr.copy()
-            dfr["sma_fast"] = dfr["close"].rolling(int(fast), min_periods=1).mean()
-            dfr["sma_slow"] = dfr["close"].rolling(int(slow), min_periods=1).mean()
-            if len(dfr) < 2:
-                time.sleep(max(1, int(poll_sec)))
-                continue
-
-            last_ts = pd.Timestamp(dfr.index[-1])  # «текущий» бар
-            prev_ts = pd.Timestamp(dfr.index[-2])  # предыдущий бар
-
-            close_now = float(dfr.iloc[-1]["close"])
-            vol_now = float(dfr.iloc[-1]["volume"]) if "volume" in dfr.columns else 0.0
-            f_now = float(dfr.iloc[-1]["sma_fast"])
-            s_now = float(dfr.iloc[-1]["sma_slow"])
-            f_prev = float(dfr.iloc[-2]["sma_fast"])
-            s_prev = float(dfr.iloc[-2]["sma_slow"])
-
-            sig = _compute_signal(f_now, s_now, f_prev, s_prev)
-
-            # 4) Печатаем в консоль только если бар сменился
-            if (last_printed_ts is None) or (last_ts > last_printed_ts):
-                ts_iso = last_ts.tz_convert("UTC").isoformat()
-                print(f"[live] {ts_iso} tick  close={close_now:.6f}  f={f_now:.6f}  s={s_now:.6f}")
-                last_printed_ts = last_ts
-
-            # 5) Пишем в CSV только если бар НОВЫЙ относительно последней записи
-            if live_log and ((last_written_ts is None) or (last_ts > last_written_ts)):
-                _append_live_signal_row(
-                    live_log,
-                    ts=last_ts.to_pydatetime(),
-                    close=close_now,
-                    volume=vol_now,
-                    sma_fast=f_now,
-                    sma_slow=s_now,
-                    signal=sig,
-                )
-                last_written_ts = last_ts
-
-            # 6) heartbeat (по времени, не по барам)
-            now = time.time()
-            if now - last_hb >= max(5, int(heartbeat_sec)):
-                hb_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                print(f"[live] hb @ {hb_iso}")
-                last_hb = now
-
-            time.sleep(max(1, int(poll_sec)))
-    except KeyboardInterrupt:
-        print("[live] stopped.")
-
-
+# ===== paper-режим (уникальный, оставляем здесь) =====
 def run_live_paper(
-        pair: str, span: str, resample_rule: str,
-        fast: int, slow: int,
-        *,
-        start_eur: float,
-        qty_eur: float,
-        position_pct: float,
-        fee_bps: float,
-        slip_bps: float,
-        poll_sec: Optional[int],
-        heartbeat_sec: int,
+    pair: str,
+    span: str,
+    resample_rule: str,
+    fast: int,
+    slow: int,
+    *,
+    start_eur: float,
+    qty_eur: float,
+    position_pct: float,
+    fee_bps: float,
+    slip_bps: float,
+    poll_sec: Optional[int],
+    heartbeat_sec: int,
 ) -> None:
     """
-    Упрощённый paper-режим: только учет позиции и equity, без комиссий биржи.
-    Пишет CSV: data/live_paper_equity.csv
+    Упрощённый paper-режим: держим позицию и equity, лог в CSV (data/live_paper_equity.csv).
     """
-    import csv, os
+    import csv
 
     tf, _ = _parse_span(span)
     tf_sec = _tf_seconds(tf)
@@ -333,7 +150,8 @@ def run_live_paper(
     avg_price = 0.0
 
     print(
-        f"[paper] {pair} {span} resample={rule or '—'} fast={fast} slow={slow} start={start_eur:.2f} fee={fee_bps}bps slip={slip_bps}bps")
+        f"[paper] {pair} {span} resample={rule or '—'} fast={fast} slow={slow} start={start_eur:.2f} fee={fee_bps}bps slip={slip_bps}bps"
+    )
 
     last_ts = None
     next_hb = time.time() + max(heartbeat_sec, 0)
@@ -342,7 +160,7 @@ def run_live_paper(
         while True:
             df = fetch_exmo_candles(pair, span, verbose=False)
             if df.empty:
-                time.sleep(poll);
+                time.sleep(poll)
                 continue
             if rule:
                 df = resample_ohlcv(df, rule)
@@ -350,12 +168,12 @@ def run_live_paper(
             df["sma_fast"] = df["close"].rolling(fast, min_periods=fast).mean()
             df["sma_slow"] = df["close"].rolling(slow, min_periods=slow).mean()
             if len(df) < max(fast, slow) + 2:
-                time.sleep(poll);
+                time.sleep(poll)
                 continue
 
             ts = df["time"].iloc[-1]
             if last_ts is not None and ts <= last_ts:
-                time.sleep(poll);
+                time.sleep(poll)
                 continue
             last_ts = ts
 
@@ -366,8 +184,10 @@ def run_live_paper(
             sc = float(df["sma_slow"].iloc[-1])
 
             sig = None
-            if fp <= sp and fc > sc: sig = "buy"
-            if fp >= sp and fc < sc: sig = "sell"
+            if fp <= sp and fc > sc:
+                sig = "buy"
+            if fp >= sp and fc < sc:
+                sig = "sell"
 
             if sig == "buy":
                 equity_now = cash_eur + pos_qty * c
@@ -397,7 +217,7 @@ def run_live_paper(
         print("[paper] stopped.")
 
 
-# ===== CLI =====
+# ===== загрузка .env =====
 def _load_env_file(path: str) -> None:
     if not path:
         return
@@ -416,13 +236,16 @@ def _load_env_file(path: str) -> None:
             loaded[k.strip()] = v
     ek = os.environ.get("EXMO_API_KEY") or os.environ.get("EXMO_KEY") or ""
     es = os.environ.get("EXMO_API_SECRET") or os.environ.get("EXMO_SECRET") or ""
-    # зеркалим в EXMO_KEY/EXMO_SECRET
-    if ek and not os.environ.get("EXMO_KEY"): os.environ["EXMO_KEY"] = ek
-    if es and not os.environ.get("EXMO_SECRET"): os.environ["EXMO_SECRET"] = es
+    if ek and not os.environ.get("EXMO_KEY"):
+        os.environ["EXMO_KEY"] = ek
+    if es and not os.environ.get("EXMO_SECRET"):
+        os.environ["EXMO_SECRET"] = es
     print(
-        f"[env] .env=ok EXMO_KEY={'∅' if not ek else str(len(ek)) + ' chars, ****' + ek[-4:]} EXMO_SECRET={'∅' if not es else str(len(es)) + ' chars, ****' + es[-4:]}")
+        f"[env] .env=ok EXMO_KEY={'∅' if not ek else str(len(ek)) + ' chars, ****' + ek[-4:]} EXMO_SECRET={'∅' if not es else str(len(es)) + ' chars, ****' + es[-4:]}"
+    )
 
 
+# ===== CLI =====
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--env-file", default="", help=".env с EXMO_KEY/EXMO_SECRET (или EXMO_API_KEY/EXMO_API_SECRET).")
@@ -447,6 +270,10 @@ def main() -> None:
     p.add_argument("--poll-sec", type=int, default=15)
     p.add_argument("--heartbeat-sec", type=int, default=60)
     p.add_argument("--live-log", default="", help="CSV для observe-логов (опционально)")
+    p.add_argument(
+        "--closed-only-log", action="store_true",
+        help="Log/print only CLOSED bars in live observe (no intra-bar updates).",
+    )
 
     # поведение live-trade
     p.add_argument("--confirm-live-trade", action="store_true")
@@ -455,20 +282,20 @@ def main() -> None:
     p.add_argument("--fok-wait-sec", type=float, default=3.0)
     p.add_argument("--reprice-attempts", type=int, default=0)
     p.add_argument("--reprice-step-bps", type=float, default=5.0)
-    p.add_argument("--aggr-limit", action="store_true",
-                   help="Peg limit to best ask/bid (uses order_book) for immediate fills.")
+    p.add_argument(
+        "--aggr-limit",
+        action="store_true",
+        help="Peg limit to best ask/bid (uses order_book) for immediate fills.",
+    )
     p.add_argument("--aggr-ticks", type=int, default=1)
-    p.add_argument("--force-entry", choices=["", "buy", "sell"], default="",
-                   help="Одноразовый вход/выход поверх сигналов (для теста связи).")
+    p.add_argument(
+        "--force-entry", choices=["", "buy", "sell"], default="",
+        help="Одноразовый вход/выход поверх сигналов (для теста связи).",
+    )
 
     # зарезервированные (пока не используем)
     p.add_argument("--max-daily-loss-bps", type=float, default=0.0)
     p.add_argument("--cooldown-bars", type=int, default=0)
-
-    p.add_argument(
-        "--closed-only-log", action="store_true",
-        help="Log/print only CLOSED bars in live observe (no intra-bar updates).",
-    )
 
     args = p.parse_args()
 
@@ -480,6 +307,8 @@ def main() -> None:
     rule = args.resample
 
     if args.live == "observe":
+        # импортим реализацию из src/presentation/live.py
+        from ..live import run_live_observe
         run_live_observe(
             pair=pair, span=span, resample_rule=rule,
             fast=args.fast, slow=args.slow,
@@ -519,7 +348,7 @@ def main() -> None:
         )
         return
 
-    # Если сюда дошли — пользователь не выбрал live-режим
+    # Если live-режим не выбран — просто показываем помощь
     p.print_help()
 
 
