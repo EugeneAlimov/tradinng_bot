@@ -176,14 +176,14 @@ def _read_last_written_ts(csv_path: Optional[str]) -> Optional[pd.Timestamp]:
 
 
 def run_live_observe(
-    pair: str,
-    span: str,
-    resample_rule: str,
-    fast: int,
-    slow: int,
-    poll_sec: int = 15,
-    heartbeat_sec: int = 60,
-    live_log: Optional[str] = None,
+        pair: str,
+        span: str,
+        resample_rule: str,
+        fast: int,
+        slow: int,
+        poll_sec: int = 15,
+        heartbeat_sec: int = 60,
+        live_log: Optional[str] = None,
 ) -> None:
     """
     Лайв-наблюдение:
@@ -251,8 +251,8 @@ def run_live_observe(
                 time.sleep(max(1, int(poll_sec)))
                 continue
 
-            last_ts = pd.Timestamp(dfr.index[-1])   # «текущий» бар
-            prev_ts = pd.Timestamp(dfr.index[-2])   # предыдущий бар
+            last_ts = pd.Timestamp(dfr.index[-1])  # «текущий» бар
+            prev_ts = pd.Timestamp(dfr.index[-2])  # предыдущий бар
 
             close_now = float(dfr.iloc[-1]["close"])
             vol_now = float(dfr.iloc[-1]["volume"]) if "volume" in dfr.columns else 0.0
@@ -292,7 +292,6 @@ def run_live_observe(
             time.sleep(max(1, int(poll_sec)))
     except KeyboardInterrupt:
         print("[live] stopped.")
-
 
 
 def run_live_paper(
@@ -466,6 +465,11 @@ def main() -> None:
     p.add_argument("--max-daily-loss-bps", type=float, default=0.0)
     p.add_argument("--cooldown-bars", type=int, default=0)
 
+    p.add_argument(
+        "--closed-only-log", action="store_true",
+        help="Log/print only CLOSED bars in live observe (no intra-bar updates).",
+    )
+
     args = p.parse_args()
 
     if args.env_file:
@@ -481,6 +485,7 @@ def main() -> None:
             fast=args.fast, slow=args.slow,
             poll_sec=args.poll_sec, heartbeat_sec=args.heartbeat_sec,
             live_log=args.live_log or None,
+            closed_only_log=args.closed_only_log,
         )
         return
 
