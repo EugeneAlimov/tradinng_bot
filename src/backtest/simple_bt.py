@@ -12,7 +12,7 @@ getcontext().prec = 50  # высокая точность для денег
 class BtConfig:
     fast: int = 10
     slow: int = 30
-    fee_bps: Decimal = Decimal("10")    # 10 bps = 0.1%
+    fee_bps: Decimal = Decimal("10")  # 10 bps = 0.1%
     size_quote: Decimal = Decimal("100")  # размер на сделку в котируемой валюте
 
 
@@ -55,10 +55,10 @@ def _sma(values: List[Decimal], win: int) -> List[Optional[Decimal]]:
 
 
 def backtest_sma(
-    pair: str,
-    tf: str,
-    ohlcv: List[Dict[str, Any]],
-    cfg: BtConfig,
+        pair: str,
+        tf: str,
+        ohlcv: List[Dict[str, Any]],
+        cfg: BtConfig,
 ) -> BtResult:
     """
     ohlcv: [{'ts': int, 'open': '...', 'high': '...', 'low': '...', 'close': '...', 'volume': '...'}, ...]
@@ -71,7 +71,7 @@ def backtest_sma(
 
     in_pos = False
     pos_qty = Decimal("0")
-    pos_cost = Decimal("0")   # суммарные затраты в quote
+    pos_cost = Decimal("0")  # суммарные затраты в quote
     trades: List[BtTrade] = []
     equity: List[Tuple[int, Decimal]] = []
     realized = Decimal("0")

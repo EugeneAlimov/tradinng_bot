@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 EXMO_DEBUG = os.getenv("EXMO_DEBUG", "0") not in ("", "0", "false", "False", "no", "No")
 
+
 class HttpClient:
     def __init__(self, base_url: str = "", session: Optional[requests.Session] = None, timeout: float = 15.0):
         self.base_url = base_url.rstrip("/")
@@ -23,14 +24,14 @@ class HttpClient:
         return f"{self.base_url}/{path.lstrip('/')}"
 
     def request(
-        self,
-        method: str,
-        path: str,
-        *,
-        params: Optional[Dict[str, Any]] = None,
-        json_data: Optional[Dict[str, Any]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        auth=None,
+            self,
+            method: str,
+            path: str,
+            *,
+            params: Optional[Dict[str, Any]] = None,
+            json_data: Optional[Dict[str, Any]] = None,
+            headers: Optional[Dict[str, str]] = None,
+            auth=None,
     ) -> requests.Response:
         url = self._full_url(path)
         t0 = time.perf_counter()
@@ -55,7 +56,8 @@ class HttpClient:
             except Exception:
                 body_preview = resp.text[:500]
             logger.warning("[EXMO] ← %s %s (%d) in %.1fms body=%s",
-                           method.upper(), url, resp.status_code, dt, json.dumps(body_preview, ensure_ascii=False)[:800])
+                           method.upper(), url, resp.status_code, dt,
+                           json.dumps(body_preview, ensure_ascii=False)[:800])
 
         resp.raise_for_status()
         return resp

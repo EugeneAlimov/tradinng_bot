@@ -7,10 +7,12 @@ from src.config.env import load_env, env_str
 
 SETTINGS_SINGLETON = None
 
+
 @dataclass
 class RiskCfg:
     position_size_usd: Decimal = Decimal(os.getenv("RISK_POSITION_SIZE_USD", "50"))
     max_daily_loss: float = float(os.getenv("RISK_MAX_DAILY_LOSS", "0.03"))
+
 
 @dataclass
 class Settings:
@@ -19,6 +21,7 @@ class Settings:
     storage_path: str = field(default_factory=lambda: os.getenv("STORAGE_PATH", "data/"))
     default_pair: str = field(default_factory=lambda: os.getenv("DEFAULT_PAIR", "DOGE_EUR"))
     risk: RiskCfg = field(default_factory=RiskCfg)
+
 
 def get_settings() -> Settings:
     global SETTINGS_SINGLETON

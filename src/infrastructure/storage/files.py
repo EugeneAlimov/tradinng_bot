@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import json
 from pathlib import Path
@@ -6,6 +5,7 @@ from typing import Dict, Any
 from decimal import Decimal
 from src.core.ports.storage import StoragePort
 from src.core.domain.models import Position, TradingPair
+
 
 class FileStorage(StoragePort):
     def __init__(self, path: str = "data/"):

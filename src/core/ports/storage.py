@@ -1,9 +1,11 @@
-
 from __future__ import annotations
 from typing import Protocol, Dict, Any
 from src.core.domain.models import Position, TradeFill, TradingPair
 
+
 class StoragePort(Protocol):
     def append_trade(self, rec: Dict[str, Any]) -> None: ...
+
     def get_position(self, pair: TradingPair) -> Position | None: ...
+
     def save_position(self, p: Position) -> None: ...

@@ -64,8 +64,8 @@ class SmaCrossover:
         slow_now = _sma(closes[-self.cfg.slow:])
 
         # предыдущие SMA (на один шаг назад)
-        fast_prev = _sma(closes[-self.cfg.fast-1:-1])
-        slow_prev = _sma(closes[-self.cfg.slow-1:-1])
+        fast_prev = _sma(closes[-self.cfg.fast - 1:-1])
+        slow_prev = _sma(closes[-self.cfg.slow - 1:-1])
 
         if None in (fast_now, slow_now, fast_prev, slow_prev):
             return {"action": "HOLD", "reason": "sma_none"}

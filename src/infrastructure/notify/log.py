@@ -1,7 +1,7 @@
-
 from __future__ import annotations
 import logging
 from src.core.ports.notify import NotifierPort
+
 
 class LogNotifier(NotifierPort):
     def __init__(self) -> None:

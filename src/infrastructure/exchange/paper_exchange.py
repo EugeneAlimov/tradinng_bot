@@ -34,8 +34,8 @@ class PaperExchange(ExchangePort):
     """
 
     market: MarketDataPort
-    spread_bps: int = 10     # 10 б.п. = 0.10% «плохая» цена относительно mid
-    slippage_bps: int = 5    # 5 б.п.  = 0.05% слиппаж
+    spread_bps: int = 10  # 10 б.п. = 0.10% «плохая» цена относительно mid
+    slippage_bps: int = 5  # 5 б.п.  = 0.05% слиппаж
     rnd_seed: Optional[int] = None
     # начальные балансы (quote побольше на старте)
     initial_balances: Dict[str, Decimal] = field(
@@ -160,11 +160,11 @@ class PaperExchange(ExchangePort):
 
     @classmethod
     def with_quote_funds(
-        cls,
-        market: MarketDataPort,
-        quote_asset: str,
-        amount: Decimal | str | float,
-        **kwargs,
+            cls,
+            market: MarketDataPort,
+            quote_asset: str,
+            amount: Decimal | str | float,
+            **kwargs,
     ) -> "PaperExchange":
         """
         Удобный конструктор для тестов: задать стартовый кэш в котируемой валюте.

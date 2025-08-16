@@ -1,9 +1,9 @@
-
 from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 from src.core.domain.models import Position, TradeFill, TradingPair
 from src.core.ports.storage import StoragePort
+
 
 @dataclass
 class PositionService:

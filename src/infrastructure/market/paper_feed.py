@@ -1,8 +1,8 @@
-
 from __future__ import annotations
 from decimal import Decimal
 from src.core.domain.models import TradingPair
 from src.core.ports.market_data import MarketDataPort
+
 
 class PaperFeed(MarketDataPort):
     def __init__(self, start_price: Decimal = Decimal("0.1")):

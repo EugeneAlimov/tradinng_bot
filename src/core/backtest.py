@@ -21,25 +21,25 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def run_backtest_sma(
-    df: pd.DataFrame,
-    fast: int, slow: int,
-    *,
-    start_eur: float, qty_eur: float,
-    fee_bps: float, slip_bps: float,
-    position_pct: float = 0.0,
-    price_tick: float = 0.0,
-    qty_step: float = 0.0,
-    min_quote: float = 0.0,
-    atr_period: int = 14,
-    atr_mult: float = 0.0,
-    tp_bps: int = 0,
-    risk_pct: float = 0.0,
-    atr_pctl_min: float | None = None,
-    atr_pctl_max: float | None = None,
-    collect_trades: bool = True,
-    collect_equity: bool = True,
-    warmup_bars: int = 0,
-    inventory_method: str = "FIFO",
+        df: pd.DataFrame,
+        fast: int, slow: int,
+        *,
+        start_eur: float, qty_eur: float,
+        fee_bps: float, slip_bps: float,
+        position_pct: float = 0.0,
+        price_tick: float = 0.0,
+        qty_step: float = 0.0,
+        min_quote: float = 0.0,
+        atr_period: int = 14,
+        atr_mult: float = 0.0,
+        tp_bps: int = 0,
+        risk_pct: float = 0.0,
+        atr_pctl_min: float | None = None,
+        atr_pctl_max: float | None = None,
+        collect_trades: bool = True,
+        collect_equity: bool = True,
+        warmup_bars: int = 0,
+        inventory_method: str = "FIFO",
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     d = df.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True).copy()
     if "time" not in d.columns:
@@ -51,7 +51,7 @@ def run_backtest_sma(
     tr = pd.concat([
         (d["high"] - d["low"]).abs(),
         (d["high"] - d["close"].shift(1)).abs(),
-        (d["low"]  - d["close"].shift(1)).abs()
+        (d["low"] - d["close"].shift(1)).abs()
     ], axis=1).max(axis=1)
     d["atr"] = tr.rolling(atr_period, min_periods=atr_period).mean()
 
@@ -115,7 +115,8 @@ def run_backtest_sma(
             pos_qty = 0.0
             pos_entry = 0.0
         if collect_trades:
-            trades.append({"time": t, "side": "sell", "qty": qty, "price": px, "fee": fee, "slip": slip, "pnl": realised})
+            trades.append(
+                {"time": t, "side": "sell", "qty": qty, "price": px, "fee": fee, "slip": slip, "pnl": realised})
 
     tp_mult = (tp_bps / 1e4) if tp_bps and tp_bps > 0 else 0.0
     start_i = max(fast, slow, atr_period, warmup_bars)
@@ -134,7 +135,7 @@ def run_backtest_sma(
         # стоп/тейк по позиции
         if pos_qty > 0:
             stop_px = pos_entry - (atr_mult * atr) if (atr_mult and np.isfinite(atr)) else -np.inf
-            tp_px   = pos_entry * (1.0 + tp_mult) if tp_mult > 0 else np.inf
+            tp_px = pos_entry * (1.0 + tp_mult) if tp_mult > 0 else np.inf
             done = False
             if l <= stop_px:
                 _exit(pos_qty, stop_px, t)
@@ -170,8 +171,8 @@ def run_backtest_sma(
         last_c = float(d["close"].iloc[-1])
         _exit(pos_qty, last_c, d["time"].iloc[-1])
 
-    equity_df = pd.DataFrame(eq) if collect_equity else pd.DataFrame(columns=["time","equity"])
-    trades_df = pd.DataFrame(trades) if collect_trades else pd.DataFrame(columns=["time","side","qty","price"])
+    equity_df = pd.DataFrame(eq) if collect_equity else pd.DataFrame(columns=["time", "equity"])
+    trades_df = pd.DataFrame(trades) if collect_trades else pd.DataFrame(columns=["time", "side", "qty", "price"])
     report = {"metrics": compute_metrics(equity_df if collect_equity else None, trades, start_eur),
               "fast": fast, "slow": slow}
     return trades_df, equity_df, report

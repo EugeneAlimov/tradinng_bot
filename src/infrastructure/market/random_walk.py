@@ -64,11 +64,11 @@ class RandomWalkMarket(MarketDataPort):
     """
 
     start_price: Decimal = Decimal("0.1")
-    drift_bps: float = 0.0     # средний дрейф в б.п. за тик
-    vol_bps: float = 20.0      # стандартное отклонение в б.п. за тик
+    drift_bps: float = 0.0  # средний дрейф в б.п. за тик
+    vol_bps: float = 20.0  # стандартное отклонение в б.п. за тик
     seed: Optional[int] = None
     max_candles: int = 2000
-    tick_seconds: int = 1      # «логическая» длительность одного tick() в секундах
+    tick_seconds: int = 1  # «логическая» длительность одного tick() в секундах
 
     _price: Decimal = field(default=Decimal("0"), init=False)
     _rng: random.Random = field(default_factory=random.Random, init=False)
@@ -91,10 +91,10 @@ class RandomWalkMarket(MarketDataPort):
         return self._price
 
     def get_candles(
-        self,
-        pair: TradingPair,
-        timeframe: str,
-        limit: int,
+            self,
+            pair: TradingPair,
+            timeframe: str,
+            limit: int,
     ) -> Sequence[Tuple[int, Decimal, Decimal, Decimal, Decimal]]:
         tf = self._normalize_tf(timeframe)
         buf = self._candles.get(tf, [])

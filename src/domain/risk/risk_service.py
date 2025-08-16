@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
@@ -6,6 +5,7 @@ from typing import Dict, Any
 from src.config.settings import RiskCfg
 from datetime import datetime, timedelta
 from typing import Optional
+
 
 @dataclass
 class RiskService:
@@ -18,10 +18,12 @@ class RiskService:
         qty = (Decimal(self.cfg.position_size_usd) / price).quantize(Decimal("0.000001"))
         return {"allow": True, "qty": qty, "limit_price": None, "client_id": ctx.get("client_id", "paper")}
 
+
 @dataclass
 class RiskLimits:
-    max_daily_loss_bps: float = 0.0     # например 50 => -0.50% дневной лимит
-    cooldown_bars: int = 0              # не открывать новую сделку N баров после последней
+    max_daily_loss_bps: float = 0.0  # например 50 => -0.50% дневной лимит
+    cooldown_bars: int = 0  # не открывать новую сделку N баров после последней
+
 
 class RiskGuard:
     def __init__(self, limits: RiskLimits):

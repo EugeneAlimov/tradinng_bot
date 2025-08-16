@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Tuple
 
 getcontext().prec = 50
 
+
 @dataclass
 class PnLSummary:
     pair: str
@@ -22,8 +23,10 @@ class PnLSummary:
     fees_quote_converted: Decimal
     base_fees_total: Decimal
 
+
 def _d(x: Any) -> Decimal:
     return Decimal(str(x))
+
 
 def _trade_key(ts: Any, tid: Any) -> Tuple[int, int]:
     try:
@@ -31,10 +34,13 @@ def _trade_key(ts: Any, tid: Any) -> Tuple[int, int]:
     except Exception:
         return int(ts or 0), int(tid or 0)
 
+
 def _quote_ccy(pair: str) -> str:
     return pair.split("_", 1)[1].upper()
 
-def compute_pnl_with_ledger(pair: str, trades: List[Dict[str, Any]], last_price: Decimal) -> Tuple[PnLSummary, List[Dict[str, Any]], List[Dict[str, Any]]]:
+
+def compute_pnl_with_ledger(pair: str, trades: List[Dict[str, Any]], last_price: Decimal) -> Tuple[
+    PnLSummary, List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Возвращает:
       summary — агрегаты
@@ -75,7 +81,7 @@ def compute_pnl_with_ledger(pair: str, trades: List[Dict[str, Any]], last_price:
     for t in tsorted:
         ttype = (t.get("type") or "").lower()
         qty = _d(t.get("quantity", "0"))
-        px  = _d(t.get("price", "0"))
+        px = _d(t.get("price", "0"))
         amt = _d(t.get("amount", "0"))  # в котируемой валюте
         fee_amt = _d(t.get("commission_amount", "0"))
         fee_ccy = (t.get("commission_currency") or "").upper()
@@ -178,6 +184,7 @@ def compute_pnl_with_ledger(pair: str, trades: List[Dict[str, Any]], last_price:
         base_fees_total=fees_base_sum,
     )
     return summary, ledger, equity
+
 
 def compute_pnl(pair: str, trades: List[Dict[str, Any]], last_price: Decimal) -> PnLSummary:
     summary, _, _ = compute_pnl_with_ledger(pair, trades, last_price)

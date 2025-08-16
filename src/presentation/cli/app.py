@@ -48,7 +48,7 @@ def print_bt_summary(report: Dict[str, Any]) -> None:
         f"trades={int(m.get('trades', 0))}  "
         f"win_rate={m.get('win_rate', 0):.2f}%  "
         f"pf={pf_str}  "
-        f"dd={m.get('max_drawdown', 0)*100:.2f}%  "
+        f"dd={m.get('max_drawdown', 0) * 100:.2f}%  "
         f"sharpe={m.get('sharpe', 0):.2f}"
     )
 
@@ -91,7 +91,7 @@ def main():
     p.add_argument("--slow-range", default="20:120:5")
     p.add_argument("--optimize-out", default="data/sma_grid.csv")
     p.add_argument("--heatmap-out", default="data/sma_heatmap.png")
-    p.add_argument("--heatmap-metric", choices=["sharpe","end","total_pnl"], default="sharpe")
+    p.add_argument("--heatmap-metric", choices=["sharpe", "end", "total_pnl"], default="sharpe")
 
     p.add_argument("--oos-split", type=float, default=0.0)
     p.add_argument("--oos-out", default="")
@@ -106,12 +106,72 @@ def main():
     p.add_argument("--tp-range", default="0:120:10")
     p.add_argument("--risk-out", default="data/risk_grid.csv")
 
+    # live
+    p.add_argument("--live", choices=["observe"], default="")
+    p.add_argument("--poll-sec", type=int, default=0)
+    p.add_argument("--live-log", default="")
+    p.add_argument("--heartbeat-sec", type=int, default=0)
+    p.add_argument("--live", choices=["observe", "paper"], default="")
+    p.add_argument("--poll-sec", type=int, default=0)
+    p.add_argument("--live-log", default="")
+    p.add_argument("--heartbeat-sec", type=int, default=0)
+
     args = p.parse_args()
 
     # 1) данные
     df = fetch_exmo_candles(args.exmo_pair, args.exmo_candles)
     if args.resample:
         df = resample_ohlcv(df, args.resample)
+
+    # LIVE OBSERVE
+    if args.live == "observe":
+        try:
+            from ..live import run_live_observe  # пакетный
+        except Exception:
+            from src.presentation.live import run_live_observe  # запуск из корня
+
+        run_live_observe(
+            pair=args.exmo_pair,
+            span=args.exmo_candles,
+            resample_rule=args.resample,
+            fast=args.fast,
+            slow=args.slow,
+            poll_sec=args.poll_sec or None,
+        )
+        return
+
+    if args.live == "paper":
+        try:
+            from ..live import run_live_observe  # не нужен здесь, но пусть останется совместимость
+        except Exception:
+            pass
+        try:
+            from ..paper import run_live_paper
+        except Exception:
+            from src.presentation.paper import run_live_paper
+
+        run_live_paper(
+            pair=args.exmo_pair,
+            span=args.exmo_candles,
+            resample_rule=args.resample,
+            fast=args.fast,
+            slow=args.slow,
+            start_eur=args.start_eur,
+            qty_eur=args.qty_eur,
+            position_pct=args.position_pct,
+            fee_bps=args.fee_bps,
+            slip_bps=args.slip_bps,
+            price_tick=args.price_tick,
+            qty_step=args.qty_step,
+            min_quote=args.min_quote,
+            poll_sec=args.poll_sec or None,
+            trades_csv="data/live_paper_trades.csv",
+            equity_csv="data/live_paper_equity.csv",
+            heartbeat_sec=args.heartbeat_sec,
+            max_daily_loss_bps=getattr(args, "max_daily_loss_bps", 0.0) if hasattr(args, "max_daily_loss_bps") else 0.0,
+            cooldown_bars=getattr(args, "cooldown_bars", 0),
+        )
+        return
 
     # 2) режимы оптимизаций/оценок
     if args.optimize_sma:
@@ -142,8 +202,8 @@ def main():
         pf_str = _format_pf_for_console(tm.get("profit_factor", 0))
         print(f"[oos] train_ratio={args.oos_split:.2f}  best=({best['fast']},{best['slow']}) "
               f"train_{args.heatmap_metric}={best['metric_train']:.4f}  "
-              f"test_end={tm.get('end',0):.6f}  pnl={tm.get('total_pnl',0):.6f}  "
-              f"pf={pf_str}  dd={tm.get('max_drawdown',0)*100:.2f}%  sharpe={tm.get('sharpe',0):.2f}")
+              f"test_end={tm.get('end', 0):.6f}  pnl={tm.get('total_pnl', 0):.6f}  "
+              f"pf={pf_str}  dd={tm.get('max_drawdown', 0) * 100:.2f}%  sharpe={tm.get('sharpe', 0):.2f}")
         if args.oos_out:
             os.makedirs(os.path.dirname(args.oos_out), exist_ok=True)
             with open(args.oos_out, "w") as f:
@@ -183,11 +243,13 @@ def main():
         for _, r in top.iterrows():
             pf_str = _format_pf_for_console(r.get("pf", 0))
             print(f"  atr_mult={r['atr_mult']}, tp_bps={int(r['tp_bps'])}, "
-                  f"{key}={r[key]:.4f}, pf={pf_str}, dd={float(r['dd'])*100:.2f}%, trades={int(r['trades'])}")
+                  f"{key}={r[key]:.4f}, pf={pf_str}, dd={float(r['dd']) * 100:.2f}%, trades={int(r['trades'])}")
         return
 
     # 3) обычный бэктест
-    trades_df = pd.DataFrame(); equity_df = pd.DataFrame(); report: Dict[str, Any] = {}
+    trades_df = pd.DataFrame();
+    equity_df = pd.DataFrame();
+    report: Dict[str, Any] = {}
     if args.backtest:
         trades_df, equity_df, report = run_backtest_sma(
             df, fast=args.fast, slow=args.slow,
@@ -203,7 +265,8 @@ def main():
 
     # графики
     if args.exmo_plot and not df.empty:
-        first = df["time"].iloc[0].isoformat(); last = df["time"].iloc[-1].isoformat()
+        first = df["time"].iloc[0].isoformat();
+        last = df["time"].iloc[-1].isoformat()
         print(f"[plot] OHLC: points={len(df)}  first={first}  last={last}")
         plot_ohlc_with_volume(
             df, args.exmo_plot,
@@ -242,7 +305,9 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         if os.environ.get("EXMO_DEBUG", "0").lower() in ("1", "true", "yes"):
-            import traceback; traceback.print_exc()
+            import traceback;
+
+            traceback.print_exc()
         else:
             print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

@@ -2,14 +2,21 @@
 from collections import deque
 from typing import Optional, NamedTuple
 
+
 class Bar(NamedTuple):
-    ts: int      # unix seconds (UTC)
-    o: float; h: float; l: float; c: float; v: float
+    ts: int  # unix seconds (UTC)
+    o: float;
+    h: float;
+    l: float;
+    c: float;
+    v: float
+
 
 class Signal(NamedTuple):
-    side: str        # "buy" | "sell"
+    side: str  # "buy" | "sell"
     price: float
     reason: str
+
 
 class SMA:
     def __init__(self, n: int):
@@ -18,15 +25,18 @@ class SMA:
         self.s = 0.0
 
     def push(self, x: float) -> Optional[float]:
-        self.q.append(x); self.s += x
+        self.q.append(x);
+        self.s += x
         if len(self.q) > self.n:
             self.s -= self.q.popleft()
         if len(self.q) == self.n:
             return self.s / self.n
         return None
 
+
 class SmaCross:
     """Простая стратегия: лонг при пересечении fast вверх slow, выход при обратном пересечении."""
+
     def __init__(self, fast: int, slow: int):
         assert fast < slow, "fast < slow"
         self.fast = SMA(fast)

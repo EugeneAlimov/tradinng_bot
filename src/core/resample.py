@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 from typing import List, Dict
 
+
 def tf_to_seconds(s: str) -> int:
     s = s.strip().lower()
     if s.endswith("m"): return int(s[:-1]) * 60
     if s.endswith("h"): return int(s[:-1]) * 3600
     if s.endswith("d"): return int(s[:-1]) * 86400
     raise ValueError(f"bad tf: {s}")
+
 
 def normalize_row(r: Dict) -> Dict:
     # Вход: EXMO {"t": ms, "o","h","l","c","v"} либо {"ts": sec, ...}
@@ -19,6 +21,7 @@ def normalize_row(r: Dict) -> Dict:
         "c": float(r["c"]),
         "v": float(r.get("v", 0.0)),
     }
+
 
 def resample_ohlcv(rows: List[Dict], tf_sec: int) -> List[Dict]:
     if not rows: return []

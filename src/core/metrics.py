@@ -68,9 +68,9 @@ def _roundtrip_pnls(trades: List[Dict[str, Any]]) -> List[float]:
 
 
 def compute_metrics_from_equity(
-    equity_df: Optional[pd.DataFrame],
-    trades: List[Dict[str, Any]],
-    start_eur: float
+        equity_df: Optional[pd.DataFrame],
+        trades: List[Dict[str, Any]],
+        start_eur: float
 ) -> Dict[str, Any]:
     """
     Унифицированный расчёт метрик.
@@ -99,7 +99,8 @@ def compute_metrics_from_equity(
 
     # Sharpe/DD
     sharpe = _sharpe(equity_df) if (equity_df is not None and not equity_df.empty) else 0.0
-    max_dd = _max_drawdown(equity_df["equity"].astype(float).to_numpy()) if (equity_df is not None and not equity_df.empty) else 0.0
+    max_dd = _max_drawdown(equity_df["equity"].astype(float).to_numpy()) if (
+                equity_df is not None and not equity_df.empty) else 0.0
 
     # PF / win-rate / trades
     pnls = _roundtrip_pnls(trades or [])
@@ -155,13 +156,13 @@ def needs_equity(metric: str) -> bool:
 
 
 def risk_based_qty(
-    equity_eur: float,
-    entry_price: float,
-    stop_price: float,
-    risk_pct: float,
-    price_tick: float,
-    qty_step: float,
-    min_quote: float,
+        equity_eur: float,
+        entry_price: float,
+        stop_price: float,
+        risk_pct: float,
+        price_tick: float,
+        qty_step: float,
+        min_quote: float,
 ) -> float:
     """К-во базовой монеты из % риска на сделку."""
     import math

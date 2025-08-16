@@ -1,38 +1,44 @@
-
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from decimal import Decimal
 from typing import Optional
 
+
 class Side(str, Enum):
     BUY = "BUY"
     SELL = "SELL"
+
 
 @dataclass(frozen=True)
 class TradingPair:
     base: str
     quote: str
+
     def symbol(self) -> str:
         return f"{self.base}_{self.quote}"
+
 
 @dataclass(frozen=True)
 class Money:
     amount: Decimal
     currency: str
 
+
 @dataclass(frozen=True)
 class Price:
     value: Decimal
     ts_ms: int
 
+
 @dataclass(frozen=True)
 class OrderRequest:
     pair: TradingPair
     side: Side
-    qty: Decimal          # base asset quantity
+    qty: Decimal  # base asset quantity
     limit_price: Optional[Decimal] = None
     client_id: Optional[str] = None
+
 
 @dataclass(frozen=True)
 class TradeFill:
@@ -41,6 +47,7 @@ class TradeFill:
     qty: Decimal
     price: Decimal
     ts_ms: int
+
 
 @dataclass
 class Position:

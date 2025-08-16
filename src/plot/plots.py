@@ -10,11 +10,11 @@ from datetime import timezone
 
 
 def plot_ohlc_with_volume(
-    df: pd.DataFrame,
-    out_path: str,
-    title: str,
-    sma_overlay: Optional[Tuple[int, int]] = None,
-    trades_df: Optional[pd.DataFrame] = None,
+        df: pd.DataFrame,
+        out_path: str,
+        title: str,
+        sma_overlay: Optional[Tuple[int, int]] = None,
+        trades_df: Optional[pd.DataFrame] = None,
 ) -> None:
     if df.empty or not out_path:
         return
@@ -27,7 +27,7 @@ def plot_ohlc_with_volume(
     times = mdates.date2num(pd.to_datetime(df["time"], utc=True))
     for i in range(len(df)):
         t = times[i]
-        o,h,l,c,v = df.iloc[i][["open","high","low","close","volume"]]
+        o, h, l, c, v = df.iloc[i][["open", "high", "low", "close", "volume"]]
         color = "green" if c >= o else "red"
         ax.vlines(t, l, h, color=color, linewidth=1)
         ax.add_patch(Rectangle((t - 0.0015, min(o, c)), 0.003, max(abs(c - o), 0.0002),
@@ -90,7 +90,8 @@ def plot_sma_heatmap(grid_df: pd.DataFrame, metric: str, out_png: str, title: st
     ax.set_xticklabels(pivot.columns)
     ax.set_yticks(range(len(pivot.index)))
     ax.set_yticklabels(pivot.index)
-    ax.set_xlabel("fast"); ax.set_ylabel("slow")
+    ax.set_xlabel("fast");
+    ax.set_ylabel("slow")
     ax.set_title(title or f"SMA grid heatmap ({metric})")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     os.makedirs(os.path.dirname(out_png), exist_ok=True)

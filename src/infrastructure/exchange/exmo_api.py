@@ -98,14 +98,14 @@ class ExmoApi:
     base_url: str = "https://api.exmo.com/v1.1"
 
     def __init__(
-        self,
-        creds_or_key: ExmoCredentials | None = None,
-        *,
-        api_key: str = "",
-        api_secret: str = "",
-        allow_trading: bool = False,
-        timeout: float = 10.0,
-        retry_attempts: int = 3,
+            self,
+            creds_or_key: ExmoCredentials | None = None,
+            *,
+            api_key: str = "",
+            api_secret: str = "",
+            allow_trading: bool = False,
+            timeout: float = 10.0,
+            retry_attempts: int = 3,
     ):
         # Совместимость: можно передавать либо объект ExmoCredentials, либо пары строк.
         if isinstance(creds_or_key, ExmoCredentials):
@@ -147,13 +147,13 @@ class ExmoApi:
             if _is_debug():
                 try:
                     body_preview = json.dumps(data, ensure_ascii=False)[:800]
-                    _dbg(f"[EXMO]   body: {body_preview}{'...(trunc)' if len(body_preview)==800 else ''}")
+                    _dbg(f"[EXMO]   body: {body_preview}{'...(trunc)' if len(body_preview) == 800 else ''}")
                 except Exception:
                     pass
             return data
 
         def _on_retry(i, err):
-            print(f"[EXMO]   retry {i+1}: {type(err).__name__}: {err}")
+            print(f"[EXMO]   retry {i + 1}: {type(err).__name__}: {err}")
 
         return with_retries(_do, attempts=self.retry_attempts, on_retry=_on_retry)
 
@@ -189,7 +189,7 @@ class ExmoApi:
             return data
 
         def _on_retry(i, err):
-            print(f"[EXMO]   retry {i+1}: {type(err).__name__}: {err}")
+            print(f"[EXMO]   retry {i + 1}: {type(err).__name__}: {err}")
 
         return with_retries(_do, attempts=self.retry_attempts, on_retry=_on_retry)
 

@@ -5,6 +5,7 @@ from typing import Optional
 
 _ENV_LOADED: bool = False
 
+
 def load_env(path: Optional[str] = None) -> None:
     """
     Разово пытается загрузить .env (если установлен python-dotenv).
@@ -20,6 +21,7 @@ def load_env(path: Optional[str] = None) -> None:
         # Библиотеки может не быть — это ок: читаем os.environ
         pass
     _ENV_LOADED = True
+
 
 def env_str(key: str, default: str = "") -> str:
     """Строка из окружения, снимает лишние кавычки, если есть."""

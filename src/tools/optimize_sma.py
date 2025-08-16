@@ -4,12 +4,13 @@ import json
 from datetime import datetime
 from typing import Dict, Any, Tuple
 
+
 # Импорты под ваш проект:
 # from src.application.engine.trade_engine import Backtester
 # from src.domain.strategy.sma_crossover import run_backtest_sma
 # Замените на реальные вызовы вашего бэктеста
 
-def run_sma_backtest(fast:int, slow:int, fee_bps:int, slip_bps:int, candles:Any) -> Dict[str,Any]:
+def run_sma_backtest(fast: int, slow: int, fee_bps: int, slip_bps: int, candles: Any) -> Dict[str, Any]:
     """
     Должен вернуть метрики: end, total_pnl, trades, win_rate, profit_factor, max_drawdown, sharpe
     Адаптируйте тело под ваши функции.
@@ -19,8 +20,9 @@ def run_sma_backtest(fast:int, slow:int, fee_bps:int, slip_bps:int, candles:Any)
     # return report["metrics"]
     raise NotImplementedError
 
-def grid_search(candles, fee_bps:int, slip_bps:int):
-    grid = [(f,s) for f in range(5,21,1) for s in range(20,81,5) if f < s]
+
+def grid_search(candles, fee_bps: int, slip_bps: int):
+    grid = [(f, s) for f in range(5, 21, 1) for s in range(20, 81, 5) if f < s]
     best = []
     for fast, slow in grid:
         m = run_sma_backtest(fast, slow, fee_bps, slip_bps, candles)
@@ -36,6 +38,7 @@ def grid_search(candles, fee_bps:int, slip_bps:int):
     best.sort(key=lambda r: (r["sharpe"], r["pf"], -r["dd"]), reverse=True)
     return best[:20]
 
+
 def main():
     # 1) Загрузите свечи так же, как вы это делаете в main.py
     # candles = load_exmo_candles(...); resample(...)
@@ -49,6 +52,7 @@ def main():
     with open(out, "w") as f:
         json.dump(top, f, indent=2)
     print(f"→ saved: {out}")
+
 
 if __name__ == "__main__":
     main()

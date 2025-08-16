@@ -9,12 +9,12 @@ from src.core.backtest import run_backtest_sma
 
 
 def optimize_sma_grid(
-    df: pd.DataFrame,
-    fast_range: str, slow_range: str,
-    fee_bps: float, slip_bps: float,
-    start_eur: float, qty_eur: float,
-    out_csv: str, metric: str = "sharpe",
-    warmup_bars: int = 0, inventory_method: str = "FIFO",
+        df: pd.DataFrame,
+        fast_range: str, slow_range: str,
+        fee_bps: float, slip_bps: float,
+        start_eur: float, qty_eur: float,
+        out_csv: str, metric: str = "sharpe",
+        warmup_bars: int = 0, inventory_method: str = "FIFO",
 ) -> pd.DataFrame:
     f_vals = parse_range(fast_range)
     s_vals = parse_range(slow_range)
@@ -50,12 +50,12 @@ def optimize_sma_grid(
 
 
 def optimize_sma_grid_oos(
-    df: pd.DataFrame,
-    fast_range: str, slow_range: str,
-    fee_bps: float, slip_bps: float,
-    start_eur: float, qty_eur: float,
-    metric: str = "sharpe", train_ratio: float = 0.7,
-    warmup_bars: int = 0, inventory_method: str = "FIFO",
+        df: pd.DataFrame,
+        fast_range: str, slow_range: str,
+        fee_bps: float, slip_bps: float,
+        start_eur: float, qty_eur: float,
+        metric: str = "sharpe", train_ratio: float = 0.7,
+        warmup_bars: int = 0, inventory_method: str = "FIFO",
 ) -> Dict[str, Any]:
     assert 0.0 < train_ratio < 1.0
     dfx = df.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
@@ -92,16 +92,17 @@ def optimize_sma_grid_oos(
 
 
 def walk_forward_sma(
-    df: pd.DataFrame,
-    fast_range: str, slow_range: str,
-    fee_bps: float, slip_bps: float,
-    start_eur: float, qty_eur: float,
-    window_bars: int = 2000, step_bars: int = 500,
-    metric: str = "sharpe", warmup_bars: int = 0,
-    inventory_method: str = "FIFO",
+        df: pd.DataFrame,
+        fast_range: str, slow_range: str,
+        fee_bps: float, slip_bps: float,
+        start_eur: float, qty_eur: float,
+        window_bars: int = 2000, step_bars: int = 500,
+        metric: str = "sharpe", warmup_bars: int = 0,
+        inventory_method: str = "FIFO",
 ) -> pd.DataFrame:
     dfx = df.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
-    n = len(dfx); rows = []
+    n = len(dfx);
+    rows = []
     need = max(parse_range(slow_range) or [1] + parse_range(fast_range) or [1])
 
     i = 0
@@ -112,7 +113,7 @@ def walk_forward_sma(
             break
 
         train_df = dfx.iloc[tr_a:tr_b].reset_index(drop=True)
-        test_df  = dfx.iloc[te_a:te_b].reset_index(drop=True)
+        test_df = dfx.iloc[te_a:te_b].reset_index(drop=True)
         grid = optimize_sma_grid(
             train_df, fast_range, slow_range,
             fee_bps, slip_bps, start_eur, qty_eur,
@@ -137,7 +138,7 @@ def walk_forward_sma(
         m = rep["metrics"]
         rows.append({
             "train_start": train_df["time"].iloc[0], "train_end": train_df["time"].iloc[-1],
-            "test_start": test_df["time"].iloc[0],   "test_end":  test_df["time"].iloc[-1],
+            "test_start": test_df["time"].iloc[0], "test_end": test_df["time"].iloc[-1],
             "fast": f, "slow": s, "end": m["end"], "pnl": m["total_pnl"], "sharpe": m["sharpe"],
             "dd": m["max_drawdown"], "pf": m["profit_factor"], "trades": m["trades"],
         })
@@ -148,19 +149,20 @@ def walk_forward_sma(
 
 
 def optimize_risk_grid(
-    df: pd.DataFrame,
-    fast: int, slow: int,
-    fee_bps: float, slip_bps: float,
-    start_eur: float, qty_eur: float,
-    atr_range: str = "0.0:3.0:0.5",
-    tp_range: str = "0:120:10",
-    metric: str = "sharpe",
-    warmup_bars: int = 0,
-    inventory_method: str = "FIFO",
+        df: pd.DataFrame,
+        fast: int, slow: int,
+        fee_bps: float, slip_bps: float,
+        start_eur: float, qty_eur: float,
+        atr_range: str = "0.0:3.0:0.5",
+        tp_range: str = "0:120:10",
+        metric: str = "sharpe",
+        warmup_bars: int = 0,
+        inventory_method: str = "FIFO",
 ) -> pd.DataFrame:
     def _frange(spec: str) -> list[float]:
-        a,b,s = [float(x) for x in str(spec).split(":")]
-        cur = a; out = []
+        a, b, s = [float(x) for x in str(spec).split(":")]
+        cur = a;
+        out = []
         while cur <= b + 1e-12:
             out.append(round(cur, 10))
             cur += s
@@ -168,7 +170,7 @@ def optimize_risk_grid(
 
     need_eq = needs_equity(metric)
     atr_vals = _frange(atr_range)
-    tp_vals  = [int(x) for x in _frange(tp_range)]
+    tp_vals = [int(x) for x in _frange(tp_range)]
     rows = []
     for am in atr_vals:
         for tp in tp_vals:

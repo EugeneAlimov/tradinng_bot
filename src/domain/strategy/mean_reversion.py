@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -7,11 +6,13 @@ from src.core.domain.models import TradingPair
 
 Action = Literal["BUY", "SELL", "HOLD"]
 
+
 @dataclass
 class StrategyCfg:
     lookback: int = 100
     entry_z: float = 1.0
     exit_z: float = 0.2
+
 
 @dataclass
 class MeanReversion:

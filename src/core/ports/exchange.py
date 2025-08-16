@@ -1,12 +1,16 @@
-
 from __future__ import annotations
 from typing import Protocol, Iterable
 from decimal import Decimal
 from src.core.domain.models import TradingPair, OrderRequest, TradeFill
 
+
 class ExchangePort(Protocol):
     def get_price(self, pair: TradingPair) -> Decimal: ...
+
     def place_order(self, req: OrderRequest) -> str: ...
+
     def cancel(self, order_id: str) -> None: ...
+
     def get_fills(self, client_id: str) -> Iterable[TradeFill]: ...
+
     def get_balance(self, asset: str) -> Decimal: ...

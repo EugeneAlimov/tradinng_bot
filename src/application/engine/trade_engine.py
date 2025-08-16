@@ -11,6 +11,7 @@ from src.core.ports.notify import NotifierPort
 
 # Стратегии
 from src.domain.strategy.mean_reversion import MeanReversion
+
 # Новая SMA-стратегия (если не используешь — импорт можно убрать)
 try:
     from src.domain.strategy.sma_crossover import SmaCrossover, SmaCfg
@@ -26,17 +27,17 @@ class TradeEngine:
     notifier: NotifierPort
     strategy: Any  # MeanReversion | SmaCrossover | др., лишь бы .decide(pair, ctx) был
     positions: Any  # PositionService
-    risk: Any       # RiskService
+    risk: Any  # RiskService
 
     # Новые параметры для свечей
     candles_timeframe: Optional[str] = "1m"
     candles_lookback: int = 60  # сколько свечей прокидывать в стратегию
 
     def run_tick(
-        self,
-        pair: TradingPair,
-        *,
-        extra_ctx: Optional[Dict[str, Any]] = None,
+            self,
+            pair: TradingPair,
+            *,
+            extra_ctx: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Выполняет один «тик»:

@@ -1,12 +1,13 @@
-
 from __future__ import annotations
 from decimal import Decimal
 from typing import Iterable
 from src.core.ports.exchange import ExchangePort
 from src.core.domain.models import TradingPair, OrderRequest, TradeFill
 
+
 class ExmoStubExchange(ExchangePort):
     """Paper/live placeholder. In paper mode it mirrors MarketData price and instantly 'fills' orders."""
+
     def __init__(self, market):
         self.market = market
 

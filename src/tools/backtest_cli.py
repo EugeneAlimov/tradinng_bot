@@ -24,6 +24,7 @@ def parse_tf_minutes(tf: str) -> int:
         return int(tf[:-1]) * 60 * 24
     raise ValueError(f"Unsupported timeframe: {tf!r}")
 
+
 def _downscale_limits(start: int) -> List[int]:
     chain = [start, 1000, 800, 600, 500, 400, 300, 250, 200, 180, 150, 120, 100, 80, 60, 50, 40, 30, 20, 10]
     out: List[int] = []
@@ -108,7 +109,8 @@ def fetch_bars_exmo(pair: str, tf: str, limit: int, debug: bool = False) -> List
         if isinstance(data, list) and data:
             # может прийти list[list], нормализуем
             if data and isinstance(data[0], list):
-                data = [{"ts": int(r[0]), "open": str(r[1]), "high": str(r[2]), "low": str(r[3]), "close": str(r[4]), "volume": str(r[5])} for r in data]
+                data = [{"ts": int(r[0]), "open": str(r[1]), "high": str(r[2]), "low": str(r[3]), "close": str(r[4]),
+                         "volume": str(r[5])} for r in data]
             return data
 
         # 2) Kline
@@ -150,6 +152,7 @@ class SmaCfg:
     fee_bps: Decimal
     size_quote: Decimal
 
+
 def sma(values: List[Decimal], n: int) -> List[Optional[Decimal]]:
     out: List[Optional[Decimal]] = []
     s = Decimal("0")
@@ -162,7 +165,9 @@ def sma(values: List[Decimal], n: int) -> List[Optional[Decimal]]:
         out.append((s / n) if len(q) == n else None)
     return out
 
-def run_backtest(bars: List[Dict[str, Any]], cfg: SmaCfg, base: str, quote: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Tuple[int, Decimal]]]:
+
+def run_backtest(bars: List[Dict[str, Any]], cfg: SmaCfg, base: str, quote: str) -> Tuple[
+    Dict[str, Any], List[Dict[str, Any]], List[Tuple[int, Decimal]]]:
     if not bars:
         return {
             "trades": 0,
@@ -275,7 +280,8 @@ def main() -> None:
         rows = raw.get("ohlcv") or raw.get("candles") or raw.get("kline") or []
         # нормализуем: если list[list]
         if rows and isinstance(rows[0], list):
-            rows = [{"ts": int(r[0]), "open": str(r[1]), "high": str(r[2]), "low": str(r[3]), "close": str(r[4]), "volume": str(r[5])} for r in rows]
+            rows = [{"ts": int(r[0]), "open": str(r[1]), "high": str(r[2]), "low": str(r[3]), "close": str(r[4]),
+                     "volume": str(r[5])} for r in rows]
         bars = rows
 
     if args.debug_fetch:
