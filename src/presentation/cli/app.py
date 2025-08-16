@@ -6,8 +6,11 @@ import os
 import sys
 import time
 from typing import Optional, Tuple
+from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
+
 
 # ===== попытка взять функции из интеграции EXMO; если нет — дадим простые фолбэки =====
 def _try_import_exmo_utils():
@@ -97,81 +100,181 @@ def _tf_seconds(tf: str) -> int:
     if tf.endswith("d"): return int(tf[:-1]) * 86400
     raise ValueError(f"Unsupported TF {tf!r}")
 
+def _append_live_signal_row(
+    csv_path: str,
+    ts: datetime,
+    close: float,
+    volume: float,
+    sma_fast: float,
+    sma_slow: float,
+    signal: Optional[str],
+) -> None:
+    """
+    Пишет одну строку в CSV со стабильной схемой:
+    time,close,volume,sma_fast,sma_slow,signal
 
+    - Создаёт каталог, если нужно.
+    - Гарантирует заголовок, если файл пустой/новый.
+    - Корректно форматирует числа (до 8 знаков после запятой).
+    - signal может быть '', 'none', 'buy', 'sell'.
+    """
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    iso = ts.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+    sig = "" if not signal else str(signal)
+
+    row = "{time},{close:.8f},{vol:.8f},{f:.8f},{s:.8f},{sig}\n".format(
+        time=iso,
+        close=float(close),
+        vol=float(volume if volume is not None else 0.0),
+        f=float(sma_fast if sma_fast is not None else 0.0),
+        s=float(sma_slow if sma_slow is not None else 0.0),
+        sig=sig,
+    )
+
+    directory = os.path.dirname(csv_path) or "."
+    os.makedirs(directory, exist_ok=True)
+    need_header = (not os.path.exists(csv_path)) or (os.path.getsize(csv_path) == 0)
+
+    with open(csv_path, "a", newline="") as f:
+        if need_header:
+            f.write("time,close,volume,sma_fast,sma_slow,signal\n")
+        f.write(row)
 # ===== лёгкие режимы: observe и paper =====
 def run_live_observe(
-    pair: str, span: str, resample_rule: str,
-    fast: int, slow: int,
-    poll_sec: Optional[int] = None,
+    pair: str,
+    span: str,
+    resample_rule: str,
+    fast: int,
+    slow: int,
+    poll_sec: int = 15,
     heartbeat_sec: int = 60,
     live_log: Optional[str] = None,
 ) -> None:
-    tf, _ = _parse_span(span)
-    tf_sec = _tf_seconds(tf)
-    poll = int(poll_sec or max(5, tf_sec // 2))
-    rule = normalize_resample_rule(resample_rule) if resample_rule else ""
+    """
+    Лайв-наблюдение (без ордеров):
+    - Периодически тянет свечи EXMO.
+    - Опционально ресемплит (resample_rule: '5min', '15min', ''/None — без ресемпла).
+    - Считает SMA(fast/slow), генерит сигнал ('buy' при пересечении вверх, 'sell' при пересечении вниз, иначе 'none').
+    - Печатает состояние и, если задан live_log, пишет в CSV: time,close,volume,sma_fast,sma_slow,signal.
+    - Защита от дубликатов: в CSV пишется не более одной строки на один timestamp бара.
+    """
+    # печать шапки
+    rs_print = resample_rule if (resample_rule and str(resample_rule).strip()) else "—"
+    print(f"[live] observe {pair} {span} resample={rs_print} fast={fast} slow={slow} poll={poll_sec}s")
 
-    print(f"[live] observe {pair} {span} resample={rule or '—'} fast={fast} slow={slow} poll={poll}s")
+    last_written_ts: Optional[pd.Timestamp] = None
+    last_hb: float = time.time()
 
-    import csv, os
-    def _append_csv(path: str, row: dict) -> None:
-        if not path:
-            return
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        write_header = not os.path.exists(path)
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=list(row.keys()))
-            if write_header:
-                w.writeheader()
-            w.writerow(row)
+    def _compute_signal(f_now: float, s_now: float, f_prev: float, s_prev: float) -> str:
+        if np.isnan([f_now, s_now, f_prev, s_prev]).any():
+            return ""
+        cross_up = (f_prev <= s_prev) and (f_now > s_now)
+        cross_dn = (f_prev >= s_prev) and (f_now < s_now)
+        if cross_up:
+            return "buy"
+        if cross_dn:
+            return "sell"
+        return "none"
 
-    last_ts = None
-    next_hb = time.time() + max(heartbeat_sec, 0)
     try:
         while True:
-            df = fetch_exmo_candles(pair, span, verbose=False)
-            if df.empty:
-                time.sleep(poll); continue
-            if rule:
-                df = resample_ohlcv(df, rule)
-            df["sma_fast"] = df["close"].rolling(fast, min_periods=fast).mean()
-            df["sma_slow"] = df["close"].rolling(slow, min_periods=slow).mean()
-            if len(df) < max(fast, slow) + 1:
-                time.sleep(poll); continue
+            # 1) тянем свечи
+            df = fetch_exmo_candles(pair, span)  # <- у тебя уже есть эта функция
+            if df is None or len(df) == 0:
+                time.sleep(poll_sec)
+                continue
 
-            bar = df.iloc[-1]
-            ts = bar["time"]
-            if last_ts is not None and ts <= last_ts:
-                time.sleep(poll); continue
-            last_ts = ts
+            # 2) приведение времени/индекса
+            if not isinstance(df.index, pd.DatetimeIndex):
+                if "time" in df.columns:
+                    df["time"] = pd.to_datetime(df["time"], utc=True)
+                    df = df.set_index("time").sort_index()
+                else:
+                    # без индекса времени корректно не работаем
+                    time.sleep(poll_sec)
+                    continue
 
-            c = float(bar["close"])
-            f = float(df["sma_fast"].iloc[-1])
-            s = float(df["sma_slow"].iloc[-1])
+            # 3) ресемплинг (если задан)
+            dfr = df
+            if resample_rule and str(resample_rule).strip():
+                dfr = resample_ohlcv(df, rule=resample_rule)  # <- твой ресемплер
+                if dfr is None or len(dfr) == 0:
+                    time.sleep(poll_sec)
+                    continue
 
-            print(f"[live] {ts.isoformat()} tick  close={c:.6f}  f={f:.6f}  s={s:.6f}")
-            _append_csv(live_log or "", {"time": ts.isoformat(), "close": c, "sma_fast": f, "sma_slow": s})
+            # 4) SMA
+            dfr = dfr.copy()
+            dfr["sma_fast"] = dfr["close"].rolling(int(fast), min_periods=1).mean()
+            dfr["sma_slow"] = dfr["close"].rolling(int(slow), min_periods=1).mean()
 
-            if heartbeat_sec > 0 and time.time() >= next_hb:
-                print(f"[live] hb @ {ts.isoformat()}")
-                next_hb = time.time() + heartbeat_sec
+            if len(dfr) < 2:
+                time.sleep(poll_sec)
+                continue
 
-            time.sleep(poll)
+            # 5) текущий/предыдущий бар
+            last_ts = dfr.index[-1]
+            prev_ts = dfr.index[-2]
+
+            # защита от дубликатов в CSV
+            if last_written_ts is not None and pd.Timestamp(last_ts) <= pd.Timestamp(last_written_ts):
+                # но всё равно выведем в консоль и heartbeat по расписанию
+                pass
+            else:
+                last_written_ts = pd.Timestamp(last_ts)
+
+            close_now = float(dfr.iloc[-1]["close"])
+            vol_now = float(dfr.iloc[-1]["volume"]) if "volume" in dfr.columns else float("nan")
+            f_now = float(dfr.iloc[-1]["sma_fast"])
+            s_now = float(dfr.iloc[-1]["sma_slow"])
+            f_prev = float(dfr.iloc[-2]["sma_fast"])
+            s_prev = float(dfr.iloc[-2]["sma_slow"])
+
+            # 6) сигнал пересечения
+            sig = _compute_signal(f_now, s_now, f_prev, s_prev)
+
+            # печать статуса
+            ts_iso = pd.Timestamp(last_ts).tz_convert("UTC").isoformat()
+            print(f"[live] {ts_iso} tick  close={close_now:.6f}  f={f_now:.6f}  s={s_now:.6f}")
+
+            # 7) запись в CSV (строго 6 колонок, один раз на бар)
+            if live_log:
+                _append_live_signal_row(
+                    live_log,
+                    ts=pd.Timestamp(last_ts).to_pydatetime(),
+                    close=close_now,
+                    volume=(vol_now if np.isfinite(vol_now) else 0.0),
+                    sma_fast=f_now,
+                    sma_slow=s_now,
+                    signal=sig,
+                )
+
+            # 8) heartbeat
+            now = time.time()
+            if now - last_hb >= max(5, int(heartbeat_sec)):
+                hb_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                print(f"[live] hb @ {hb_iso}")
+                last_hb = now
+
+            # 9) пауза
+            time.sleep(max(1, int(poll_sec)))
     except KeyboardInterrupt:
         print("[live] stopped.")
 
 
+
 def run_live_paper(
-    pair: str, span: str, resample_rule: str,
-    fast: int, slow: int,
-    *,
-    start_eur: float,
-    qty_eur: float,
-    position_pct: float,
-    fee_bps: float,
-    slip_bps: float,
-    poll_sec: Optional[int],
-    heartbeat_sec: int,
+        pair: str, span: str, resample_rule: str,
+        fast: int, slow: int,
+        *,
+        start_eur: float,
+        qty_eur: float,
+        position_pct: float,
+        fee_bps: float,
+        slip_bps: float,
+        poll_sec: Optional[int],
+        heartbeat_sec: int,
 ) -> None:
     """
     Упрощённый paper-режим: только учет позиции и equity, без комиссий биржи.
@@ -199,7 +302,8 @@ def run_live_paper(
     cash_eur = float(start_eur)
     avg_price = 0.0
 
-    print(f"[paper] {pair} {span} resample={rule or '—'} fast={fast} slow={slow} start={start_eur:.2f} fee={fee_bps}bps slip={slip_bps}bps")
+    print(
+        f"[paper] {pair} {span} resample={rule or '—'} fast={fast} slow={slow} start={start_eur:.2f} fee={fee_bps}bps slip={slip_bps}bps")
 
     last_ts = None
     next_hb = time.time() + max(heartbeat_sec, 0)
@@ -208,21 +312,24 @@ def run_live_paper(
         while True:
             df = fetch_exmo_candles(pair, span, verbose=False)
             if df.empty:
-                time.sleep(poll); continue
+                time.sleep(poll);
+                continue
             if rule:
                 df = resample_ohlcv(df, rule)
 
             df["sma_fast"] = df["close"].rolling(fast, min_periods=fast).mean()
             df["sma_slow"] = df["close"].rolling(slow, min_periods=slow).mean()
             if len(df) < max(fast, slow) + 2:
-                time.sleep(poll); continue
+                time.sleep(poll);
+                continue
 
             ts = df["time"].iloc[-1]
             if last_ts is not None and ts <= last_ts:
-                time.sleep(poll); continue
+                time.sleep(poll);
+                continue
             last_ts = ts
 
-            c  = float(df["close"].iloc[-1])
+            c = float(df["close"].iloc[-1])
             fp = float(df["sma_fast"].iloc[-2])
             sp = float(df["sma_slow"].iloc[-2])
             fc = float(df["sma_fast"].iloc[-1])
@@ -282,7 +389,8 @@ def _load_env_file(path: str) -> None:
     # зеркалим в EXMO_KEY/EXMO_SECRET
     if ek and not os.environ.get("EXMO_KEY"): os.environ["EXMO_KEY"] = ek
     if es and not os.environ.get("EXMO_SECRET"): os.environ["EXMO_SECRET"] = es
-    print(f"[env] .env=ok EXMO_KEY={'∅' if not ek else str(len(ek))+' chars, ****'+ek[-4:]} EXMO_SECRET={'∅' if not es else str(len(es))+' chars, ****'+es[-4:]}")
+    print(
+        f"[env] .env=ok EXMO_KEY={'∅' if not ek else str(len(ek)) + ' chars, ****' + ek[-4:]} EXMO_SECRET={'∅' if not es else str(len(es)) + ' chars, ****' + es[-4:]}")
 
 
 def main() -> None:

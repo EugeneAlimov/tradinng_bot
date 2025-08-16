@@ -9,33 +9,35 @@ import pandas as pd
 import requests
 
 
-def normalize_resample_rule(rule: str) -> str:
+def normalize_resample_rule(rule: Optional[str]) -> Optional[str]:
     """
-    Превращает '5m','15m','1h','1d' в pandas-совместимое:
-      5m -> 5min, 1h -> 1H, 1d -> 1D.
-    Также конвертирует устаревшее 'T' -> 'min', чтобы не ловить FutureWarning.
+    Приводит пользовательский ввод вроде '5m'/'5T'/'5min' к безопасному правилу pandas.
+    Возвращает None, если ресемпл отключён.
     """
     if not rule:
-        return rule
-    s = rule.strip()
-    # уже валидные варианты: 5min, 1H, 1D, 30S, 250MS
-    if re.fullmatch(r"\d+\s*(min|H|D|S|MS)", s, flags=re.IGNORECASE):
-        return s.upper().replace("MIN", "min")
-    # человеческие: 5m, 1h, 1d, 30s, 250ms
-    m = re.fullmatch(r"\s*(\d+)\s*([mhd]|s|ms)\s*", s, flags=re.IGNORECASE)
-    if m:
-        n, u = m.groups()
-        u = u.lower()
-        if u == "m":  return f"{n}min"
-        if u == "h":  return f"{n}H"
-        if u == "d":  return f"{n}D"
-        if u == "s":  return f"{n}S"
-        if u == "ms": return f"{n}MS"
-    # устаревшее 'T'
-    m = re.fullmatch(r"\s*(\d+)\s*T\s*", s, flags=re.IGNORECASE)
-    if m:
-        return f"{m.group(1)}min"
-    return s
+        return None
+    r = str(rule).strip().lower()
+    if r in ("", "none", "false", "0"):
+        return None
+
+    # '5m' часто путают с месяцами; нам нужны минуты -> '5min'
+    if r.endswith("m") and not r.endswith("min"):
+        try:
+            val = int(r[:-1])
+            return f"{val}min"
+        except Exception:
+            pass
+
+    # Старый алиас минут 'T' -> 'min'
+    if r.endswith("t"):
+        try:
+            val = int(r[:-1])
+            return f"{val}min"
+        except Exception:
+            pass
+
+    # Если уже 'min', 'h', 'd' и т.п. — оставляем как есть
+    return r
 
 
 def _parse_exmo_json(payload: Any) -> pd.DataFrame:
@@ -170,23 +172,56 @@ def fetch_exmo_candles(symbol: str, span: str, *, verbose: bool = True) -> pd.Da
     return out[["time", "open", "high", "low", "close", "volume"]]
 
 
-def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+def resample_ohlcv(df: pd.DataFrame, rule: Optional[str]) -> pd.DataFrame:
     """
-    Ресемпл OHLCV по правилу pandas (после normalize_resample_rule):
-      - open: first, high: max, low: min, close: last, volume: sum.
+    Ресемпл OHLCV с поддержкой:
+      - входа с DatetimeIndex ИЛИ с колонкой 'time'
+      - таймзоны (приводим к UTC)
+      - корректной агрегации: O=first, H=max, L=min, C=last, V=sum
+
+    Возвращает новый DataFrame с теми же колонками (volume опциональна).
     """
-    rule = normalize_resample_rule(rule)
-    if not rule:
-        return df.copy()
-    if df.empty:
+    rule_n = normalize_resample_rule(rule)
+    if not rule_n:
         return df.copy()
 
-    d = df.set_index("time")
-    o = d["open"].resample(rule).first()
-    h = d["high"].resample(rule).max()
-    l = d["low"].resample(rule).min()
-    c = d["close"].resample(rule).last()
-    v = d["volume"].resample(rule).sum()
-    out = pd.concat([o, h, l, c, v], axis=1).dropna()
-    out.reset_index(inplace=True)
+    dfi = df.copy()
+
+    # Гарантируем DatetimeIndex
+    if not isinstance(dfi.index, pd.DatetimeIndex):
+        if "time" in dfi.columns:
+            dfi["time"] = pd.to_datetime(dfi["time"], utc=True, errors="coerce")
+            dfi = dfi.set_index("time")
+        else:
+            raise KeyError("resample_ohlcv: need DatetimeIndex or 'time' column")
+
+    # Таймзона -> UTC
+    if dfi.index.tz is None:
+        dfi.index = dfi.index.tz_localize("UTC")
+    else:
+        dfi.index = dfi.index.tz_convert("UTC")
+
+    dfi = dfi.sort_index()
+
+    # Проверяем необходимые колонки
+    need_cols = ["open", "high", "low", "close"]
+    for c in need_cols:
+        if c not in dfi.columns:
+            raise KeyError(f"resample_ohlcv: missing column '{c}'")
+
+    has_vol = "volume" in dfi.columns
+
+    o = dfi["open"].resample(rule_n).first()
+    h = dfi["high"].resample(rule_n).max()
+    l = dfi["low"].resample(rule_n).min()
+    c = dfi["close"].resample(rule_n).last()
+
+    if has_vol:
+        v = dfi["volume"].resample(rule_n).sum()
+        out = pd.DataFrame({"open": o, "high": h, "low": l, "close": c, "volume": v})
+    else:
+        out = pd.DataFrame({"open": o, "high": h, "low": l, "close": c})
+
+    # Убираем полностью пустые бары (в случае дыр в данных)
+    out = out.dropna(how="all")
     return out
