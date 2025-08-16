@@ -114,9 +114,23 @@ def main():
     p.add_argument("--heartbeat-sec", type=int, default=0)
     p.add_argument("--align-on-state", action="store_true")
     p.add_argument("--enter-on-start", action="store_true")
+    p.add_argument("--fok-wait-sec", type=float, default=3.0,
+                   help="Seconds to wait before cancelling unfilled limit (soft FOK).")
+    p.add_argument("--reprice-attempts", type=int, default=0,
+                   help="If >0, re-place order with increased slip if not filled.")
+    p.add_argument("--reprice-step-bps", type=float, default=5.0,
+                   help="Slip increment per attempt in bps when re-pricing.")
+    p.add_argument("--aggr-limit", action="store_true",
+                   help="Peg limit to best ask/bid (uses order_book) for immediate fills.")
+    p.add_argument("--aggr-ticks", type=int, default=1,
+                   help="Extra ticks over best ask (buy) / under best bid (sell) when aggr-limit is on.")
+    p.add_argument("--force-entry", choices=["", "buy", "sell"], default="",
+                   help="Force a single entry on the next bar regardless of regime (for testing).")
+
     # дневной риск/перерыв (общие с paper)
     p.add_argument("--max-daily-loss-bps", type=float, default=0.0)
     p.add_argument("--cooldown-bars", type=int, default=0)
+
     # trade safety + ключи
     p.add_argument("--confirm-live-trade", action="store_true",
                    help="Required to actually place real orders.")
@@ -131,13 +145,25 @@ def main():
 
     # ---- .env autoload (до любого режима) ----
     try:
-        from  ...utils.env import load_env_file  # пакетный запуск
+        from ...utils.env import load_env_file
     except Exception:
-        from src.utils.env import load_env_file  # запуск из репо
+        from src.utils.env import load_env_file
 
     loaded_count, loaded_map = load_env_file(args.env_file or ".env", override=False)
 
-    # короткая диагностика без утечки секрета
+    # коалесим ключи, если кто-то назвал их иначе
+    def _coalesce_env(target: str, aliases: list[str]) -> None:
+        if os.environ.get(target):  # уже есть — не трогаем
+            return
+        for a in aliases:
+            if os.environ.get(a):
+                os.environ[target] = os.environ[a]
+                break
+
+    _coalesce_env("EXMO_KEY", ["EXMO_API_KEY", "EXMO_PUBLIC_KEY", "EXMO_KEY_ID"])
+    _coalesce_env("EXMO_SECRET", ["EXMO_API_SECRET", "EXMO_PRIVATE_KEY", "EXMO_SECRET_KEY"])
+
+    # короткая диагностика (маскируем значения)
     ek = os.environ.get("EXMO_KEY", "")
     es = os.environ.get("EXMO_SECRET", "")
 
@@ -200,9 +226,11 @@ def main():
             max_daily_loss_bps=args.max_daily_loss_bps, cooldown_bars=args.cooldown_bars,
             confirm_live_trade=args.confirm_live_trade,
             align_on_state=args.align_on_state, enter_on_start=args.enter_on_start,
-            api_key=args.exmo_key, api_secret=args.exmo_secret,
+            api_key=args.exmo_key, api_secret=args.exmo_secret, fok_wait_sec=args.fok_wait_sec,
+            reprice_attempts=args.reprice_attempts, reprice_step_bps=args.reprice_step_bps,
+            aggr_limit=args.aggr_limit, aggr_ticks=args.aggr_ticks, force_entry=args.force_entry,
         )
-        return
+
     # -------------------------
 
     # 2) режимы оптимизаций/оценок

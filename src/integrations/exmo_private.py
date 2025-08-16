@@ -122,13 +122,11 @@ class ExmoPrivate:
             quantity: str,
             price: str,
             side: str,  # "buy" | "sell"
-            client_id: Optional[str] = None,
+            client_id: Optional[object] = None,  # может прийти int/str
     ) -> Dict[str, Any]:
         """
-        В EXMO метод order_create принимает:
-          pair, quantity, price, type (buy/sell), опц. client_id.
-        Примечание: для BUY quantity трактуется как сумма в котируемой валюте (EUR/USDT),
-        для SELL — как количество базовой валюты. (Проверь на своём аккаунте на малой сумме!)
+        EXMO v1.1: order_create(pair, quantity, price, type, [client_id]).
+        ВНИМАНИЕ: client_id должен быть ЧИСЛОМ. Если не приводится к int — не отправляем.
         """
         params: Dict[str, Any] = {
             "pair": pair,
@@ -136,8 +134,14 @@ class ExmoPrivate:
             "price": price,
             "type": side,
         }
-        if client_id:
-            params["client_id"] = client_id
+        if client_id is not None:
+            try:
+                # приводим к int → обратно в строку (как обычно у REST)
+                params["client_id"] = str(int(str(client_id).strip()))
+            except Exception:
+                # некорректный client_id — безопасно игнорируем
+                pass
+
         return self._post("order_create", params)
 
     def order_cancel(self, order_id: str) -> Dict[str, Any]:
@@ -171,3 +175,24 @@ class ExmoPrivate:
                 return data.get(pair, {})
             return {}
         return data
+
+    def ticker(self, pair: str) -> Dict[str, Any]:
+        """Публичный тикер. Возвращает словарь по запрошенной паре или {}."""
+        try:
+            data = self._get_public("ticker")  # должен уже быть в классе
+        except Exception:
+            return {}
+        t = data.get(pair)
+        return t if isinstance(t, dict) else {}
+
+    def order_book(self, pair: str, limit: int = 20) -> Dict[str, Any]:
+        """
+        Публичный стакан. Возвращает {'ask': [[price, qty], ...], 'bid': [[price, qty], ...]} для пары,
+        либо {}. Параметр limit - желаемая глубина.
+        """
+        try:
+            data = self._get_public("order_book", params={"pair": pair, "limit": limit})
+        except Exception:
+            return {}
+        ob = data.get(pair)
+        return ob if isinstance(ob, dict) else {}
