@@ -111,3 +111,29 @@ class ExmoPrivate:
 
     def order_trades(self, order_id: str) -> Dict[str, Any]:
         return self._post("order_trades", {"order_id": order_id})
+
+    def _get_public(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Публичные методы EXMO (без подписи). Например: pair_settings.
+        """
+        url = f"{self.base_url}/{method}"
+        r = requests.get(url, params=params or {}, timeout=self.timeout)
+        r.raise_for_status()
+        return r.json()
+
+    def pair_settings(self, pair: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Возвращает настройки торговых пар.
+        Если pair задан, возвращает словарь настроек только для этой пары.
+        Поля у EXMO могут называться по-разному в зависимости от версии:
+        - 'price_precision' или 'price_scale', 'price_decimals'
+        - 'min_quantity', 'quantity_step'
+        - 'min_amount' (минимальная сумма для сделки)
+        Мы не делаем сильных предположений — просто возвращаем как есть.
+        """
+        data = self._get_public("pair_settings")
+        if pair:
+            if isinstance(data, dict):
+                return data.get(pair, {})
+            return {}
+        return data

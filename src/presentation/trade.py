@@ -79,8 +79,11 @@ def run_live_trade(
         api_secret: Optional[str] = None,
 ) -> None:
     """
-    Реальная торговля (на свой страх и риск). Параметры риска/объёмов — как в paper.
-    Исполнение: лимитный ордер по цене close*(1±slip_bps). Если за ~3 сек не исполнен, отменяем.
+    Реальная торговля с безопасным «префлайтом» и диагностикой:
+      1) Печатаем user_info и pair_settings (price_tick/qty_step/min_quote),
+      2) Для ЛИМИТ-ордеров используем КОЛИЧЕСТВО БАЗОВОЙ валюты (DOGE), не сумму в EUR,
+      3) На каждом закрытом баре печатаем краткую диагностику режима/сигнала,
+      4) Для каждого ордера печатаем результат: filled/cancelled.
     """
     if not confirm_live_trade:
         raise SystemExit("Refused to run: add --confirm-live-trade to enable real trading.")
@@ -92,17 +95,76 @@ def run_live_trade(
 
     exmo = ExmoPrivate(key, sec)
 
+    # --- Префлайт: балансы и настройки пары ---
+    base_ccy, quote_ccy = (pair.split("_", 1) + [""])[:2]
+    try:
+        ui = exmo.user_info()
+    except Exception as e:
+        raise SystemExit(f"user_info failed: {e}")
+
+    # user_info: пытаемся достать свободные балансы
+    def _get_balances(uinfo: dict) -> tuple[float, float]:
+        bal = uinfo.get("balances") or uinfo.get("balance") or {}
+
+        # возможны строки — приведём к float
+        def _f(x):
+            try:
+                return float(x)
+            except Exception:
+                return 0.0
+
+        return _f(bal.get(quote_ccy, 0)), _f(bal.get(base_ccy, 0))  # EUR_free, DOGE_free
+
+    eur_free, base_free = _get_balances(ui)
+
+    # pair_settings
+    try:
+        ps_all = exmo.pair_settings()
+        ps = ps_all.get(pair, {}) if isinstance(ps_all, dict) else {}
+    except Exception as e:
+        ps_all, ps = {}, {}
+        print(f"[trade] warning: pair_settings failed: {e}")
+
+    # попытаемся извлечь тики/шаги/минималки из настроек биржи
+    price_prec = ps.get("price_precision") or ps.get("price_scale") or ps.get("price_decimals")
+    try:
+        price_prec = int(price_prec) if price_prec is not None else None
+    except Exception:
+        price_prec = None
+
+    step_from_settings = ps.get("quantity_step") or ps.get("min_quantity") or ps.get("min_quantity_step")
+    try:
+        step_from_settings = float(step_from_settings) if step_from_settings is not None else 0.0
+    except Exception:
+        step_from_settings = 0.0
+
+    min_amount = ps.get("min_amount") or ps.get("min_total")  # минимальная СУММА в котируемой (EUR)
+    try:
+        min_amount = float(min_amount) if min_amount is not None else 0.0
+    except Exception:
+        min_amount = 0.0
+
+    # применим фоллбэки только если пользователь не задал параметры вручную (>0)
+    eff_price_tick = price_tick if price_tick > 0 else (10.0 ** (-price_prec) if price_prec is not None else 0.0)
+    eff_qty_step = qty_step if qty_step > 0 else step_from_settings
+    eff_min_quote = min_quote if min_quote > 0 else min_amount
+
+    print("[trade] preflight:")
+    print(f"  account: {quote_ccy}_free={eur_free:.6f}, {base_ccy}_free={base_free:.6f}")
+    print(
+        f"  pair_settings[{pair}]: price_tick={eff_price_tick or 'n/a'}, qty_step={eff_qty_step or 'n/a'}, min_quote={eff_min_quote or 'n/a'}")
+
+    # --- Основной цикл ---
     tf, _ = _parse_span(span)
     tf_sec = _tf_seconds(tf)
     poll = int(poll_sec or max(5, tf_sec // 2))
     rule = normalize_resample_rule(resample_rule) if resample_rule else ""
 
-    # известные ограничения/допуски приходят снаружи (price_tick/qty_step/min_quote)
-    pos_qty = 0.0
-    cash_eur = start_eur  # для внутренней метрики; реальные балансы можно читать из user_info()
+    pos_qty = 0.0  # локальная оценка позиции
+    cash_eur = start_eur  # локальная оценка кэша (для диагностики)
     last_bar_ts: Optional[pd.Timestamp] = None
     first_bar_seen = False
-    next_heartbeat = time.time() + max(heartbeat_sec, 0)
+    next_hb = time.time() + max(heartbeat_sec, 0)
 
     print(f"[trade] {pair} {span} resample={rule or '—'} fast={fast} slow={slow} fee={fee_bps}bps slip={slip_bps}bps")
 
@@ -133,88 +195,94 @@ def run_live_trade(
             f_prev, s_prev = df["sma_fast"].iloc[-2], df["sma_slow"].iloc[-2]
             f_cur, s_cur = df["sma_fast"].iloc[-1], df["sma_slow"].iloc[-1]
 
-            # дневной риск: ориентируемся на paper-эквити (грубая оценка)
+            # режим/сигнал
+            regime = "LONG" if (pd.notna(f_cur) and pd.notna(s_cur) and f_cur > s_cur) else "FLAT"
+            sig = None
+            base_note = ""
+            if pd.notna(f_prev) and pd.notna(s_prev) and pd.notna(f_cur) and pd.notna(s_cur):
+                if f_prev <= s_prev and f_cur > s_cur:
+                    sig = "buy"
+                elif f_prev >= s_prev and f_cur < s_cur:
+                    sig = "sell"
+            if sig is None and ((enter_on_start and not first_bar_seen) or align_on_state):
+                if pos_qty == 0 and regime == "LONG":
+                    sig, base_note = "buy", "align"
+                elif pos_qty > 0 and regime == "FLAT":
+                    sig, base_note = "sell", "align"
+            first_bar_seen = True
+
+            # быстрая диагностика бара
+            print(
+                f"[trade] {ts.isoformat()} regime={regime} signal={sig or (base_note or 'none')} price={price:.6f} f={f_cur:.6f} s={s_cur:.6f}")
+
+            # дневной риск — в этой упрощённой версии просто пропустим, если нарушен
             equity = cash_eur + pos_qty * price
-            # смена дня
-            # (упрощённо: на практике лучше хранить day_start_equity с датой в файле)
-            if df["time"].iloc[-2].date() != ts.date():
-                day_start_equity = equity
-            else:
-                day_start_equity = cash_eur + pos_qty * float(df["close"].iloc[-2])
             if max_daily_loss_bps > 0:
-                pl_bps = (equity / max(day_start_equity, 1e-9) - 1.0) * 1e4
+                # примем старт дня по предыдущему бару
+                day_start_eq = cash_eur + pos_qty * float(df['close'].iloc[-2])
+                pl_bps = (equity / max(day_start_eq, 1e-9) - 1.0) * 1e4
                 if pl_bps <= -abs(max_daily_loss_bps) and pos_qty > 0:
-                    # аварийный выход по рынку (лимитом со слиппеджем вниз)
-                    lim = _round_price(price * (1.0 - slip_bps / 1e4), price_tick)
-                    q = _round_qty(pos_qty, qty_step)
-                    if q > 0:
-                        oid = _place_limit(exmo, pair, side="sell", price=lim, qty_or_quote=q,
-                                           buy_uses_quote=False, client_id_prefix=client_id_prefix)
-                        _await_and_cleanup(exmo, oid)
-                        pos_qty = 0.0
-                        print(f"[trade] {ts.isoformat()} FLAT by daily loss, oid={oid}")
-                    cooldown = max(1, int(cooldown_bars))
-                    for _ in range(cooldown):
-                        # пропускаем сделки на N баров
-                        _hb(ts, equity, pos_qty, heartbeat_sec, next_heartbeat)
+                    lim = _round_price(price * (1.0 - slip_bps / 1e4), eff_price_tick)
+                    qty = _round_qty(pos_qty, eff_qty_step)
+                    if qty > 0:
+                        oid = _place_limit(exmo, pair, side="sell", price=lim, qty_base=qty,
+                                           client_id_prefix=client_id_prefix)
+                        filled = _await_and_cleanup(exmo, oid, wait_sec=3.0)
+                        print(f"[trade] daily-loss exit oid={oid} -> {'filled' if filled else 'cancelled'}")
+                        if filled:
+                            pos_qty = 0.0
+                            cash_eur += qty * lim
+                    # пауза
+                    cool = max(1, int(cooldown_bars))
+                    for _ in range(cool):
+                        if heartbeat_sec > 0 and time.time() >= next_hb:
+                            print(f"[trade] {ts.isoformat()} hb equity={equity:.2f} pos={pos_qty:.6f}")
+                            next_hb = time.time() + heartbeat_sec
                         time.sleep(poll)
                     continue
 
-            sig = _signal(f_prev, s_prev, f_cur, s_cur)
-            note = ""
-
-            # выравнивание по состоянию (по желанию)
-            if sig is None and ((enter_on_start and not first_bar_seen) or align_on_state):
-                if pos_qty == 0 and pd.notna(f_cur) and pd.notna(s_cur) and f_cur > s_cur:
-                    sig, note = "buy", "align"
-                elif pos_qty > 0 and pd.notna(f_cur) and pd.notna(s_cur) and f_cur < s_cur:
-                    sig, note = "sell", "align"
-            first_bar_seen = True
-
+            # исполнение
             if sig == "buy":
-                # при BUY в EXMO quantity трактуется как КОТИРУЕМАЯ сумма (EUR) — см. примеры.
+                # считаем базовое количество (DOGE), а не сумму в EUR
                 eur_to_use = qty_eur if qty_eur > 0 else (equity * max(0.0, position_pct) / 100.0)
-                if eur_to_use < max(min_quote, 0.0):
-                    _hb(ts, equity, pos_qty, heartbeat_sec, next_heartbeat);
-                    time.sleep(poll);
-                    continue
-                lim = _round_price(price * (1.0 + slip_bps / 1e4), price_tick)
-                # проверим по шагу: реальное количество монет ~ eur_to_use/lim
-                qty_base = _round_qty(eur_to_use / max(lim, 1e-9), qty_step)
-                if qty_base <= 0:
-                    _hb(ts, equity, pos_qty, heartbeat_sec, next_heartbeat);
-                    time.sleep(poll);
-                    continue
-                # отправляем BUY: quantity = сумма в EUR (округлим вниз до цента)
-                eur_to_send = max(min_quote, eur_to_use)
-                eur_to_send = float(f"{eur_to_send:.2f}")
-                oid = _place_limit(exmo, pair, side="buy", price=lim, qty_or_quote=eur_to_send,
-                                   buy_uses_quote=True, client_id_prefix=client_id_prefix)
-                filled = _await_and_cleanup(exmo, oid)
-                if filled:
-                    pos_qty += qty_base  # грубая оценка позиции (точно узнаем из user_trades/order_trades при желании)
-                    cash_eur -= eur_to_send
-                    print(
-                        f"[trade] {ts.isoformat()} BUY {qty_base:.6f} @ {lim:.6f} oid={oid} {note and '[' + note + ']' or ''}")
+                if eur_to_use < max(eff_min_quote, 0.0):
+                    print(f"[trade] skip buy: eur_to_use={eur_to_use:.2f} < min_quote={eff_min_quote}")
+                else:
+                    lim = _round_price(price * (1.0 + slip_bps / 1e4), eff_price_tick)
+                    qty_base = _round_qty(eur_to_use / max(lim, 1e-9), eff_qty_step)
+                    if qty_base <= 0:
+                        print(f"[trade] skip buy: qty_base=0 after rounding (qty_step={eff_qty_step})")
+                    else:
+                        oid = _place_limit(exmo, pair, side="buy", price=lim, qty_base=qty_base,
+                                           client_id_prefix=client_id_prefix)
+                        filled = _await_and_cleanup(exmo, oid, wait_sec=3.0)
+                        print(
+                            f"[trade] buy oid={oid} -> {'filled' if filled else 'cancelled'} lim={lim:.6f} qty={qty_base:.6f} {('[' + base_note + ']') if base_note else ''}")
+                        if filled:
+                            pos_qty += qty_base
+                            cash_eur -= qty_base * lim  # грубая оценка кэша
 
             elif sig == "sell" and pos_qty > 0:
-                lim = _round_price(price * (1.0 - slip_bps / 1e4), price_tick)
-                qty = _round_qty(pos_qty, qty_step)
+                lim = _round_price(price * (1.0 - slip_bps / 1e4), eff_price_tick)
+                qty = _round_qty(pos_qty, eff_qty_step)
                 if qty <= 0:
-                    _hb(ts, equity, pos_qty, heartbeat_sec, next_heartbeat);
-                    time.sleep(poll);
-                    continue
-                oid = _place_limit(exmo, pair, side="sell", price=lim, qty_or_quote=qty,
-                                   buy_uses_quote=False, client_id_prefix=client_id_prefix)
-                filled = _await_and_cleanup(exmo, oid)
-                if filled:
-                    pos_qty = 0.0
-                    cash_eur += qty * lim
+                    print(f"[trade] skip sell: qty=0 after rounding (qty_step={eff_qty_step})")
+                else:
+                    oid = _place_limit(exmo, pair, side="sell", price=lim, qty_base=qty,
+                                       client_id_prefix=client_id_prefix)
+                    filled = _await_and_cleanup(exmo, oid, wait_sec=3.0)
                     print(
-                        f"[trade] {ts.isoformat()} SELL {qty:.6f} @ {lim:.6f} oid={oid} {note and '[' + note + ']' or ''}")
+                        f"[trade] sell oid={oid} -> {'filled' if filled else 'cancelled'} lim={lim:.6f} qty={qty:.6f} {('[' + base_note + ']') if base_note else ''}")
+                    if filled:
+                        pos_qty -= qty
+                        cash_eur += qty * lim
 
-            equity = cash_eur + pos_qty * price
-            _hb(ts, equity, pos_qty, heartbeat_sec, next_heartbeat)
+            # heartbeat
+            if heartbeat_sec > 0 and time.time() >= next_hb:
+                equity = cash_eur + pos_qty * price
+                print(f"[trade] {ts.isoformat()} hb equity={equity:.2f} pos={pos_qty:.6f}")
+                next_hb = time.time() + heartbeat_sec
+
             time.sleep(poll)
 
     except KeyboardInterrupt:
@@ -226,17 +294,18 @@ def _place_limit(
         pair: str,
         side: str,
         price: float,
-        qty_or_quote: float,
+        qty_base: float,
         *,
-        buy_uses_quote: bool,
         client_id_prefix: str,
 ) -> str:
-    # client_id для трассировки
-    cid = f"{client_id_prefix}-{int(time.time())}"
+    """
+    Создаёт ЛИМИТ-ордер с количеством в БАЗОВОЙ валюте (DOGE для DOGE_EUR).
+    """
+    import time as _t
+    cid = f"{client_id_prefix}-{int(_t.time())}"
     price_s = f"{price:.10f}".rstrip("0").rstrip(".")
-    qty_s = f"{qty_or_quote:.10f}".rstrip("0").rstrip(".")
+    qty_s = f"{qty_base:.10f}".rstrip("0").rstrip(".")
     resp = exmo.order_create(pair=pair, quantity=qty_s, price=price_s, side=side, client_id=cid)
-    # Ожидается order_id (строка)
     oid = str(resp.get("order_id") or resp.get("order_id_str") or "")
     if not oid:
         raise RuntimeError(f"order_create failed: {resp}")
@@ -245,18 +314,28 @@ def _place_limit(
 
 def _await_and_cleanup(exmo: ExmoPrivate, order_id: str, wait_sec: float = 3.0) -> bool:
     """
-    Дешёвый FOK: ждём немного, если ордер висит — отменяем.
-    Возвращает True, если предполагаем, что ордер исполнился (не висит в open_orders).
+    «Мягкий FOK»: ждём до wait_sec, если ордер всё ещё «в открытых» — отменяем.
+    True -> предполагаем исполнение (не найден в open_orders), False -> отменён.
     """
     t0 = time.time()
     while time.time() - t0 < wait_sec:
         time.sleep(0.5)
-        oo = exmo.user_open_orders()
-        for pair, orders in (oo.items() if isinstance(oo, dict) else []):
-            if any(str(o.get("order_id")) == order_id for o in (orders or [])):
-                break
-        else:
-            return True  # не нашли в открытых — считаем исполненным
+        try:
+            oo = exmo.user_open_orders()
+        except Exception:
+            # если не смогли получить — попробуем ещё
+            continue
+        found = False
+        if isinstance(oo, dict):
+            for _pair, orders in oo.items():
+                for o in (orders or []):
+                    if str(o.get("order_id")) == order_id:
+                        found = True
+                        break
+                if found:
+                    break
+        if not found:
+            return True  # больше не висит
     try:
         exmo.order_cancel(order_id)
     except Exception:

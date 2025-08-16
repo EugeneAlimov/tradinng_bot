@@ -106,15 +106,7 @@ def main():
     p.add_argument("--tp-range", default="0:120:10")
     p.add_argument("--risk-out", default="data/risk_grid.csv")
 
-    # дневной риск и «перерыв» (общие, подходят и для live paper)
-    p.add_argument("--max-daily-loss-bps", type=float, default=0.0,
-                   help="Max daily loss (in basis points) to flatten and pause, e.g. 50 = -0.50%.")
-    p.add_argument("--cooldown-bars", type=int, default=0,
-                   help="Bars to pause after daily loss guard triggers (on the resampled TF).")
-    p.add_argument("--align-on-state", action="store_true",
-                   help="Align position to SMA regime on every bar (enter if fast>slow, exit if fast<slow).")
-    p.add_argument("--enter-on-start", action="store_true",
-                   help="On first processed bar, align position to regime once.")
+
     # ---- LIVE mods ----
     p.add_argument("--live", choices=["observe", "paper", "trade"], default="")
     p.add_argument("--poll-sec", type=int, default=0)
