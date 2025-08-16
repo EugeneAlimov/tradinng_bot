@@ -106,12 +106,6 @@ def main():
     p.add_argument("--tp-range", default="0:120:10")
     p.add_argument("--risk-out", default="data/risk_grid.csv")
 
-    # live
-    p.add_argument("--live", choices=["observe", "paper"], default="")
-    p.add_argument("--poll-sec", type=int, default=0)
-    p.add_argument("--live-log", default="")
-    p.add_argument("--heartbeat-sec", type=int, default=0)
-
     # дневной риск и «перерыв» (общие, подходят и для live paper)
     p.add_argument("--max-daily-loss-bps", type=float, default=0.0,
                    help="Max daily loss (in basis points) to flatten and pause, e.g. 50 = -0.50%.")
@@ -121,6 +115,22 @@ def main():
                    help="Align position to SMA regime on every bar (enter if fast>slow, exit if fast<slow).")
     p.add_argument("--enter-on-start", action="store_true",
                    help="On first processed bar, align position to regime once.")
+    # ---- LIVE mods ----
+    p.add_argument("--live", choices=["observe", "paper", "trade"], default="")
+    p.add_argument("--poll-sec", type=int, default=0)
+    p.add_argument("--live-log", default="")
+    p.add_argument("--heartbeat-sec", type=int, default=0)
+    p.add_argument("--align-on-state", action="store_true")
+    p.add_argument("--enter-on-start", action="store_true")
+    # дневной риск/перерыв (общие с paper)
+    p.add_argument("--max-daily-loss-bps", type=float, default=0.0)
+    p.add_argument("--cooldown-bars", type=int, default=0)
+    # trade safety + ключи
+    p.add_argument("--confirm-live-trade", action="store_true",
+                   help="Required to actually place real orders.")
+    p.add_argument("--exmo-key", default="", help="EXMO API key (optional, prefer env EXMO_KEY)")
+    p.add_argument("--exmo-secret", default="", help="EXMO API secret (optional, prefer env EXMO_SECRET)")
+    # --------------------------------------------
 
     args = p.parse_args()
 
@@ -130,57 +140,55 @@ def main():
         df = resample_ohlcv(df, args.resample)
 
     # LIVE OBSERVE
+    # ---- LIVE dispatcher ----
     if args.live == "observe":
         try:
-            from ..live import run_live_observe  # пакетный
+            from ..live import run_live_observe
         except Exception:
-            from src.presentation.live import run_live_observe  # запуск из корня
-
+            from src.presentation.live import run_live_observe
         run_live_observe(
-            pair=args.exmo_pair,
-            span=args.exmo_candles,
-            resample_rule=args.resample,
-            fast=args.fast,
-            slow=args.slow,
-            poll_sec=args.poll_sec or None,
+            pair=args.exmo_pair, span=args.exmo_candles, resample_rule=args.resample,
+            fast=args.fast, slow=args.slow, poll_sec=args.poll_sec or None,
+            log_csv=args.live_log, heartbeat_sec=args.heartbeat_sec
         )
         return
 
     if args.live == "paper":
         try:
-            from ..live import run_live_observe  # не нужен здесь, но пусть останется совместимость
-        except Exception:
-            pass
-        try:
             from ..paper import run_live_paper
         except Exception:
             from src.presentation.paper import run_live_paper
-
         run_live_paper(
-            pair=args.exmo_pair,
-            span=args.exmo_candles,
-            resample_rule=args.resample,
-            fast=args.fast,
-            slow=args.slow,
-            start_eur=args.start_eur,
-            qty_eur=args.qty_eur,
-            position_pct=args.position_pct,
-            fee_bps=args.fee_bps,
-            slip_bps=args.slip_bps,
-            price_tick=args.price_tick,
-            qty_step=args.qty_step,
-            min_quote=args.min_quote,
-            poll_sec=args.poll_sec or None,
-            trades_csv="data/live_paper_trades.csv",
-            equity_csv="data/live_paper_equity.csv",
-            heartbeat_sec=args.heartbeat_sec,
-            max_daily_loss_bps=args.max_daily_loss_bps,
-            cooldown_bars=args.cooldown_bars,
-            align_on_state=args.align_on_state,  # ← добавлено
-            enter_on_start=args.enter_on_start,  # ← добавлено
+            pair=args.exmo_pair, span=args.exmo_candles, resample_rule=args.resample,
+            fast=args.fast, slow=args.slow,
+            start_eur=args.start_eur, qty_eur=args.qty_eur, position_pct=args.position_pct,
+            fee_bps=args.fee_bps, slip_bps=args.slip_bps,
+            price_tick=args.price_tick, qty_step=args.qty_step, min_quote=args.min_quote,
+            poll_sec=args.poll_sec or None, heartbeat_sec=args.heartbeat_sec,
+            max_daily_loss_bps=args.max_daily_loss_bps, cooldown_bars=args.cooldown_bars,
+            align_on_state=args.align_on_state, enter_on_start=args.enter_on_start,
         )
-
         return
+
+    if args.live == "trade":
+        try:
+            from ..trade import run_live_trade
+        except Exception:
+            from src.presentation.trade import run_live_trade
+        run_live_trade(
+            pair=args.exmo_pair, span=args.exmo_candles, resample_rule=args.resample,
+            fast=args.fast, slow=args.slow,
+            start_eur=args.start_eur, qty_eur=args.qty_eur, position_pct=args.position_pct,
+            fee_bps=args.fee_bps, slip_bps=args.slip_bps,
+            price_tick=args.price_tick, qty_step=args.qty_step, min_quote=args.min_quote,
+            poll_sec=args.poll_sec or None, heartbeat_sec=args.heartbeat_sec,
+            max_daily_loss_bps=args.max_daily_loss_bps, cooldown_bars=args.cooldown_bars,
+            confirm_live_trade=args.confirm_live_trade,
+            align_on_state=args.align_on_state, enter_on_start=args.enter_on_start,
+            api_key=args.exmo_key, api_secret=args.exmo_secret,
+        )
+        return
+    # -------------------------
 
     # 2) режимы оптимизаций/оценок
     if args.optimize_sma:
