@@ -4,10 +4,8 @@ from __future__ import annotations
 import argparse
 import os
 import time
-from datetime import datetime, timezone
-from typing import Optional, Tuple
+from typing import Tuple, Optional
 
-import numpy as np
 import pandas as pd
 
 
@@ -108,25 +106,22 @@ def _tf_seconds(tf: str) -> int:
     raise ValueError(f"Unsupported TF {tf!r}")
 
 
-# ===== paper-режим (уникальный, оставляем здесь) =====
+# ===== paper-режим (оставляем тут; не зависит от приватного API) =====
 def run_live_paper(
-    pair: str,
-    span: str,
-    resample_rule: str,
-    fast: int,
-    slow: int,
-    *,
-    start_eur: float,
-    qty_eur: float,
-    position_pct: float,
-    fee_bps: float,
-    slip_bps: float,
-    poll_sec: Optional[int],
-    heartbeat_sec: int,
+        pair: str,
+        span: str,
+        resample_rule: str,
+        fast: int,
+        slow: int,
+        *,
+        start_eur: float,
+        qty_eur: float,
+        position_pct: float,
+        fee_bps: float,
+        slip_bps: float,
+        poll_sec: Optional[int],
+        heartbeat_sec: int,
 ) -> None:
-    """
-    Упрощённый paper-режим: держим позицию и equity, лог в CSV (data/live_paper_equity.csv).
-    """
     import csv
 
     tf, _ = _parse_span(span)
@@ -272,8 +267,9 @@ def main() -> None:
     p.add_argument("--live-log", default="", help="CSV для observe-логов (опционально)")
     p.add_argument(
         "--closed-only-log", action="store_true",
-        help="Log/print only CLOSED bars in live observe (no intra-bar updates).",
-    )
+        help="Log/print only CLOSED bars in live observe (no intra-bar updates).")
+    p.add_argument("--hysteresis-bps", type=float, default=0.0,
+                   help="Минимальная разница между SMA-fast и SMA-slow в б.п. цены для генерации сигнала (0 = без фильтра).")
 
     # поведение live-trade
     p.add_argument("--confirm-live-trade", action="store_true")
@@ -282,18 +278,13 @@ def main() -> None:
     p.add_argument("--fok-wait-sec", type=float, default=3.0)
     p.add_argument("--reprice-attempts", type=int, default=0)
     p.add_argument("--reprice-step-bps", type=float, default=5.0)
-    p.add_argument(
-        "--aggr-limit",
-        action="store_true",
-        help="Peg limit to best ask/bid (uses order_book) for immediate fills.",
-    )
+    p.add_argument("--aggr-limit", action="store_true",
+                   help="Peg limit to best ask/bid (uses order_book) for immediate fills.")
     p.add_argument("--aggr-ticks", type=int, default=1)
-    p.add_argument(
-        "--force-entry", choices=["", "buy", "sell"], default="",
-        help="Одноразовый вход/выход поверх сигналов (для теста связи).",
-    )
+    p.add_argument("--force-entry", choices=["", "buy", "sell"], default="",
+                   help="Одноразовый вход/выход поверх сигналов (для теста связи).")
 
-    # зарезервированные (пока не используем)
+    # зарезервированные (пока не используем в логике, но оставляем в сигнатуре trade)
     p.add_argument("--max-daily-loss-bps", type=float, default=0.0)
     p.add_argument("--cooldown-bars", type=int, default=0)
 
@@ -307,14 +298,13 @@ def main() -> None:
     rule = args.resample
 
     if args.live == "observe":
-        # импортим реализацию из src/presentation/live.py
         from ..live import run_live_observe
         run_live_observe(
             pair=pair, span=span, resample_rule=rule,
             fast=args.fast, slow=args.slow,
             poll_sec=args.poll_sec, heartbeat_sec=args.heartbeat_sec,
             live_log=args.live_log or None,
-            closed_only_log=args.closed_only_log,
+            hysteresis_bps=args.hysteresis_bps,
         )
         return
 
@@ -329,7 +319,6 @@ def main() -> None:
         return
 
     if args.live == "trade":
-        # импортим здесь, чтобы не тянуть зависимости раньше времени
         from ..live_trade import run_live_trade
         run_live_trade(
             pair=pair, span=span, resample_rule=rule,
@@ -348,7 +337,6 @@ def main() -> None:
         )
         return
 
-    # Если live-режим не выбран — просто показываем помощь
     p.print_help()
 
 
