@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Dict, Any, Optional, Sequence, Tuple, Literal
+from typing import Dict, Any, Optional, Sequence, Tuple, Literal, Protocol
 
 from src.core.domain.models import TradingPair, OrderRequest, Side, TradeFill
 from src.core.ports.market_data import MarketDataPort

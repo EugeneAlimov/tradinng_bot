@@ -121,8 +121,12 @@ def run_live_trade(
                  "wins", "pnl_pos_sum", "pnl_neg_sum"])
 
     # --- env and private API ---
-    api_key = os.environ.get("EXMO_KEY") or os.environ.get("EXMO_API_KEY") or ""
-    api_secret = os.environ.get("EXMO_SECRET") or os.environ.get("EXMO_API_SECRET") or ""
+    from src.config.env import load_env, env_str
+    load_env()  # подхватываем .env если он есть
+
+    api_key = env_str("EXMO_KEY") or env_str("EXMO_API_KEY")
+    api_secret = env_str("EXMO_SECRET") or env_str("EXMO_API_SECRET")
+
     if not api_key or not api_secret:
         raise RuntimeError("EXMO_KEY/EXMO_SECRET are required (env or CLI).")
 

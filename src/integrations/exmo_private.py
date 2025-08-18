@@ -5,9 +5,12 @@ import hmac
 import os
 import time
 import urllib.parse
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union, List
 
 import requests
+
+
+Number = Union[int, float, str]
 
 
 class ExmoPrivate:
@@ -15,7 +18,11 @@ class ExmoPrivate:
     Мини-клиент приватного REST API EXMO v1.1.
     Авторизация: заголовки Key/Sign, подпись HMAC-SHA512 по urlencoded(body), параметр nonce.
     База: https://api.exmo.com/v1.1/{method}
-    Документация/список методов см. в официальной Postman-коллекции и блог-статьях EXMO.
+
+    Нота bene:
+    - Некоторые параметры могут отличаться между версиями API/аккаунтами. Мы передаём только то, что поддерживаем явно.
+    - Параметр `immediate_or_cancel` пробрасываем ТОЛЬКО если он True — биржа может игнорировать его,
+      а в live_trade мы и так реализуем «FOK-подобное» поведение (подождали и отменили остаток).
     """
 
     def __init__(self, api_key: str, api_secret: str, base_url: str = "https://api.exmo.com/v1.1", timeout: int = 20):
@@ -29,9 +36,10 @@ class ExmoPrivate:
         # простая персистентность nonce, чтобы избежать коллизий между перезапусками
         self._nonce_file = os.environ.get("EXMO_NONCE_FILE", "data/.exmo_nonce")
 
+    # ---------- низкоуровневые утилиты ----------
+
     def _nonce(self) -> int:
         now = int(time.time() * 1000)  # мс
-        # обеспечим строго возрастающий nonce
         last = self._last_nonce
         if os.path.exists(self._nonce_file):
             try:
@@ -55,9 +63,8 @@ class ExmoPrivate:
 
     def _post(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        POST c Key/Sign + nonce и надёжными ретраями.
-        - Повторяем на 429/5xx, таймаутах и типичных бизнес-ошибках (nonce/flood).
-        - Экспоненциальный бэкофф.
+        POST с Key/Sign + nonce и надёжными ретраями.
+        Повторяем на 429/5xx, таймаутах и типичных бизнес-ошибках (nonce/flood).
         """
         import random
         params = dict(params or {})
@@ -74,7 +81,7 @@ class ExmoPrivate:
             r = requests.post(url, data=payload, headers=headers, timeout=self.timeout)
             r.raise_for_status()
             data = r.json()
-            # форматы разные; часто встречаются поля result/error
+            # часто встречаются поля result/error
             if isinstance(data, dict) and data.get("error"):
                 raise RuntimeError(str(data.get("error")))
             return data
@@ -87,26 +94,59 @@ class ExmoPrivate:
             except requests.HTTPError as e:
                 code = e.response.status_code if e.response is not None else None
                 if code in (429, 500, 502, 503, 504) and attempt < max_tries:
-                    time.sleep(delay);
-                    delay *= 1.7;
+                    time.sleep(delay)
+                    delay *= 1.7
                     continue
                 raise
             except (requests.Timeout, requests.ConnectionError):
                 if attempt < max_tries:
-                    time.sleep(delay);
-                    delay *= 1.7;
+                    time.sleep(delay)
+                    delay *= 1.7
                     continue
                 raise
             except RuntimeError as e:
                 msg = str(e).lower()
-                # типичные сообщения биржи: "nonce", "flood", "too many requests"
+                # типовые бизнес-ошибки
                 if any(k in msg for k in ("nonce", "flood", "too many", "try again")) and attempt < max_tries:
-                    time.sleep(delay + random.random() * 0.5);
-                    delay *= 1.7;
+                    time.sleep(delay + random.random() * 0.5)  # type: ignore[name-defined]
+                    delay *= 1.7
                     continue
                 raise
 
-    # ===== Удобные обёртки по популярным методам =====
+    def _get_public(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        url = f"{self.base_url}/{method}"
+        r = requests.get(url, params=params or {}, timeout=self.timeout)
+        r.raise_for_status()
+        return r.json()
+
+    # ---------- публичные методы ----------
+
+    def pair_settings(self, pair: Optional[str] = None) -> Dict[str, Any]:
+        data = self._get_public("pair_settings")
+        if pair:
+            if isinstance(data, dict):
+                return data.get(pair, {})
+            return {}
+        return data
+
+    def ticker(self, pair: str) -> Dict[str, Any]:
+        try:
+            data = self._get_public("ticker")
+        except Exception:
+            return {}
+        t = data.get(pair)
+        return t if isinstance(t, dict) else {}
+
+    def order_book(self, pair: str, limit: int = 20) -> Dict[str, Any]:
+        try:
+            data = self._get_public("order_book", params={"pair": pair, "limit": limit})
+        except Exception:
+            return {}
+        ob = data.get(pair)
+        return ob if isinstance(ob, dict) else {}
+
+    # ---------- приватные методы ----------
+
     def user_info(self) -> Dict[str, Any]:
         return self._post("user_info")
 
@@ -117,30 +157,39 @@ class ExmoPrivate:
         return self._post("user_open_orders", params)
 
     def order_create(
-            self,
-            pair: str,
-            quantity: str,
-            price: str,
-            side: str,  # "buy" | "sell"
-            client_id: Optional[object] = None,  # может прийти int/str
+        self,
+        pair: str,
+        quantity: Number,
+        price: Number,
+        side: str,                     # "buy" | "sell"
+        client_id: Optional[object] = None,
+        immediate_or_cancel: bool = False,  # ← поддержка IOC (если биржа примет)
     ) -> Dict[str, Any]:
         """
-        EXMO v1.1: order_create(pair, quantity, price, type, [client_id]).
-        ВНИМАНИЕ: client_id должен быть ЧИСЛОМ. Если не приводится к int — не отправляем.
+        EXMO v1.1: order_create(pair, quantity, price, type, [client_id], [immediate_or_cancel?]).
+        Мы приводим числа к строкам; client_id должен быть числом (строка-число).
         """
+        def _num(x: Number) -> str:
+            if isinstance(x, str):
+                return x
+            return f"{x:.16f}".rstrip("0").rstrip(".") if isinstance(x, float) else str(x)
+
         params: Dict[str, Any] = {
             "pair": pair,
-            "quantity": quantity,
-            "price": price,
+            "quantity": _num(quantity),
+            "price": _num(price),
             "type": side,
         }
         if client_id is not None:
             try:
-                # приводим к int → обратно в строку (как обычно у REST)
                 params["client_id"] = str(int(str(client_id).strip()))
             except Exception:
                 # некорректный client_id — безопасно игнорируем
                 pass
+
+        # Пробросим IOC-флаг, только если True (на некоторых аккаунтах/версиях его нет — биржа проигнорирует)
+        if immediate_or_cancel:
+            params["immediate_or_cancel"] = "true"
 
         return self._post("order_create", params)
 
@@ -150,49 +199,58 @@ class ExmoPrivate:
     def order_trades(self, order_id: str) -> Dict[str, Any]:
         return self._post("order_trades", {"order_id": order_id})
 
-    def _get_public(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def order_status(self, pair: str, order_id: str) -> Dict[str, Any]:
         """
-        Публичные методы EXMO (без подписи). Например: pair_settings.
+        Best-effort статус ордера.
+        1) Пробуем получить сделки (fills) через order_trades → считаем исполненный объём.
+        2) Если нет трейдов, смотрим user_open_orders(pair) → если ордер там есть — статус 'open'.
+        3) Иначе считаем, что 'canceled' или 'unknown' (биржа может не вернуть явный статус).
+        Возвращаем унифицированные поля: status, quantity_processed, price (по последнему fill или лимиту).
         """
-        url = f"{self.base_url}/{method}"
-        r = requests.get(url, params=params or {}, timeout=self.timeout)
-        r.raise_for_status()
-        return r.json()
+        filled_qty = 0.0
+        last_price = None
 
-    def pair_settings(self, pair: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Возвращает настройки торговых пар.
-        Если pair задан, возвращает словарь настроек только для этой пары.
-        Поля у EXMO могут называться по-разному в зависимости от версии:
-        - 'price_precision' или 'price_scale', 'price_decimals'
-        - 'min_quantity', 'quantity_step'
-        - 'min_amount' (минимальная сумма для сделки)
-        Мы не делаем сильных предположений — просто возвращаем как есть.
-        """
-        data = self._get_public("pair_settings")
-        if pair:
-            if isinstance(data, dict):
-                return data.get(pair, {})
-            return {}
-        return data
-
-    def ticker(self, pair: str) -> Dict[str, Any]:
-        """Публичный тикер. Возвращает словарь по запрошенной паре или {}."""
         try:
-            data = self._get_public("ticker")  # должен уже быть в классе
+            tr = self.order_trades(order_id)
+            # форматы разные: {'result': True, 'trades': [{'price': '...', 'quantity': '...'}, ...]}
+            trades: List[Dict[str, Any]] = tr.get("trades") or tr.get("response") or []
+            if isinstance(trades, dict):  # иногда словарь с id=>trade
+                trades = list(trades.values())
+            for t in trades:
+                q = float(t.get("quantity") or t.get("qty") or 0.0)
+                p = float(t.get("price") or 0.0)
+                filled_qty += q
+                last_price = p or last_price
         except Exception:
-            return {}
-        t = data.get(pair)
-        return t if isinstance(t, dict) else {}
+            pass
 
-    def order_book(self, pair: str, limit: int = 20) -> Dict[str, Any]:
-        """
-        Публичный стакан. Возвращает {'ask': [[price, qty], ...], 'bid': [[price, qty], ...]} для пары,
-        либо {}. Параметр limit - желаемая глубина.
-        """
+        if filled_qty > 0:
+            return {
+                "status": "filled",  # может быть partial, но для live_trade это достаточно
+                "quantity_processed": filled_qty,
+                "price": last_price,
+            }
+
         try:
-            data = self._get_public("order_book", params={"pair": pair, "limit": limit})
+            open_orders = self.user_open_orders(pair=pair)
+            orders = open_orders.get(pair) if isinstance(open_orders, dict) else None
+            if isinstance(orders, list):
+                for o in orders:
+                    if str(o.get("order_id")) == str(order_id):
+                        # EXMO иногда отдаёт 'quantity' и 'quantity_left'/'quantity_processed'
+                        qp = float(o.get("quantity_processed") or o.get("filled_qty") or 0.0)
+                        pr = float(o.get("price") or 0.0)
+                        return {
+                            "status": "open",
+                            "quantity_processed": qp,
+                            "price": pr,
+                        }
         except Exception:
-            return {}
-        ob = data.get(pair)
-        return ob if isinstance(ob, dict) else {}
+            pass
+
+        # не нашли — считаем отменён/неизвестен
+        return {
+            "status": "canceled",
+            "quantity_processed": 0.0,
+            "price": last_price or 0.0,
+        }
