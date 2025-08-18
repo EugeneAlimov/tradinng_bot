@@ -19,10 +19,9 @@ class ExmoPrivate:
     Авторизация: заголовки Key/Sign, подпись HMAC-SHA512 по urlencoded(body), параметр nonce.
     База: https://api.exmo.com/v1.1/{method}
 
-    Нота bene:
-    - Некоторые параметры могут отличаться между версиями API/аккаунтами. Мы передаём только то, что поддерживаем явно.
-    - Параметр `immediate_or_cancel` пробрасываем ТОЛЬКО если он True — биржа может игнорировать его,
-      а в live_trade мы и так реализуем «FOK-подобное» поведение (подождали и отменили остаток).
+    Поддержано:
+      - order_create(..., immediate_or_cancel=True/False)
+      - order_status(pair, order_id) (best-effort: trades -> open orders -> canceled)
     """
 
     def __init__(self, api_key: str, api_secret: str, base_url: str = "https://api.exmo.com/v1.1", timeout: int = 20):
@@ -33,7 +32,6 @@ class ExmoPrivate:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self._last_nonce: int = 0
-        # простая персистентность nonce, чтобы избежать коллизий между перезапусками
         self._nonce_file = os.environ.get("EXMO_NONCE_FILE", "data/.exmo_nonce")
 
     # ---------- низкоуровневые утилиты ----------
@@ -62,10 +60,6 @@ class ExmoPrivate:
         return hmac.new(self.secret, payload, hashlib.sha512).hexdigest()
 
     def _post(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        POST с Key/Sign + nonce и надёжными ретраями.
-        Повторяем на 429/5xx, таймаутах и типичных бизнес-ошибках (nonce/flood).
-        """
         import random
         params = dict(params or {})
 
@@ -81,7 +75,6 @@ class ExmoPrivate:
             r = requests.post(url, data=payload, headers=headers, timeout=self.timeout)
             r.raise_for_status()
             data = r.json()
-            # часто встречаются поля result/error
             if isinstance(data, dict) and data.get("error"):
                 raise RuntimeError(str(data.get("error")))
             return data
@@ -106,7 +99,6 @@ class ExmoPrivate:
                 raise
             except RuntimeError as e:
                 msg = str(e).lower()
-                # типовые бизнес-ошибки
                 if any(k in msg for k in ("nonce", "flood", "too many", "try again")) and attempt < max_tries:
                     time.sleep(delay + random.random() * 0.5)  # type: ignore[name-defined]
                     delay *= 1.7
@@ -119,7 +111,7 @@ class ExmoPrivate:
         r.raise_for_status()
         return r.json()
 
-    # ---------- публичные методы ----------
+    # ---------- публичные ----------
 
     def pair_settings(self, pair: Optional[str] = None) -> Dict[str, Any]:
         data = self._get_public("pair_settings")
@@ -145,7 +137,7 @@ class ExmoPrivate:
         ob = data.get(pair)
         return ob if isinstance(ob, dict) else {}
 
-    # ---------- приватные методы ----------
+    # ---------- приватные ----------
 
     def user_info(self) -> Dict[str, Any]:
         return self._post("user_info")
@@ -163,12 +155,9 @@ class ExmoPrivate:
         price: Number,
         side: str,                     # "buy" | "sell"
         client_id: Optional[object] = None,
-        immediate_or_cancel: bool = False,  # ← поддержка IOC (если биржа примет)
+        immediate_or_cancel: bool = False,
     ) -> Dict[str, Any]:
-        """
-        EXMO v1.1: order_create(pair, quantity, price, type, [client_id], [immediate_or_cancel?]).
-        Мы приводим числа к строкам; client_id должен быть числом (строка-число).
-        """
+        """EXMO v1.1: order_create(pair, quantity, price, type, [client_id], [immediate_or_cancel])."""
         def _num(x: Number) -> str:
             if isinstance(x, str):
                 return x
@@ -184,10 +173,8 @@ class ExmoPrivate:
             try:
                 params["client_id"] = str(int(str(client_id).strip()))
             except Exception:
-                # некорректный client_id — безопасно игнорируем
                 pass
 
-        # Пробросим IOC-флаг, только если True (на некоторых аккаунтах/версиях его нет — биржа проигнорирует)
         if immediate_or_cancel:
             params["immediate_or_cancel"] = "true"
 
@@ -200,21 +187,14 @@ class ExmoPrivate:
         return self._post("order_trades", {"order_id": order_id})
 
     def order_status(self, pair: str, order_id: str) -> Dict[str, Any]:
-        """
-        Best-effort статус ордера.
-        1) Пробуем получить сделки (fills) через order_trades → считаем исполненный объём.
-        2) Если нет трейдов, смотрим user_open_orders(pair) → если ордер там есть — статус 'open'.
-        3) Иначе считаем, что 'canceled' или 'unknown' (биржа может не вернуть явный статус).
-        Возвращаем унифицированные поля: status, quantity_processed, price (по последнему fill или лимиту).
-        """
+        """Best-effort статус ордера (trades → open_orders → canceled)."""
         filled_qty = 0.0
         last_price = None
 
         try:
             tr = self.order_trades(order_id)
-            # форматы разные: {'result': True, 'trades': [{'price': '...', 'quantity': '...'}, ...]}
             trades: List[Dict[str, Any]] = tr.get("trades") or tr.get("response") or []
-            if isinstance(trades, dict):  # иногда словарь с id=>trade
+            if isinstance(trades, dict):
                 trades = list(trades.values())
             for t in trades:
                 q = float(t.get("quantity") or t.get("qty") or 0.0)
@@ -225,11 +205,7 @@ class ExmoPrivate:
             pass
 
         if filled_qty > 0:
-            return {
-                "status": "filled",  # может быть partial, но для live_trade это достаточно
-                "quantity_processed": filled_qty,
-                "price": last_price,
-            }
+            return {"status": "filled", "quantity_processed": filled_qty, "price": last_price}
 
         try:
             open_orders = self.user_open_orders(pair=pair)
@@ -237,20 +213,10 @@ class ExmoPrivate:
             if isinstance(orders, list):
                 for o in orders:
                     if str(o.get("order_id")) == str(order_id):
-                        # EXMO иногда отдаёт 'quantity' и 'quantity_left'/'quantity_processed'
                         qp = float(o.get("quantity_processed") or o.get("filled_qty") or 0.0)
                         pr = float(o.get("price") or 0.0)
-                        return {
-                            "status": "open",
-                            "quantity_processed": qp,
-                            "price": pr,
-                        }
+                        return {"status": "open", "quantity_processed": qp, "price": pr}
         except Exception:
             pass
 
-        # не нашли — считаем отменён/неизвестен
-        return {
-            "status": "canceled",
-            "quantity_processed": 0.0,
-            "price": last_price or 0.0,
-        }
+        return {"status": "canceled", "quantity_processed": 0.0, "price": last_price or 0.0}
