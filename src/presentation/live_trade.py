@@ -3,11 +3,10 @@ from __future__ import annotations
 import csv
 import json
 import math
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Iterable, Any
 
 import pandas as pd
 
@@ -37,12 +36,14 @@ def _load_state(path: Path) -> dict:
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             pass
-    # расширенный стейт (cooldown + дневной лимит в bps)
+    # расширенный стейт: cooldown + дневной лимит + трекинг внешних ордеров
     return {
         "pos_qty": 0.0, "cash_eur": 1000.0, "avg_price": 0.0,
         "pnl_sum_pos": 0.0, "pnl_sum_neg": 0.0, "round_trips": 0, "wins": 0,
         "cooldown_left": 0,
-        "daily_date": "", "daily_realized_bps": 0.0, "eq_day_start": 0.0
+        "daily_date": "", "daily_realized_bps": 0.0, "eq_day_start": 0.0,
+        # внешний трекинг: ext_orders[oid] = {"side":"sell","price":float,"qty":float,"filled":float}
+        "ext_orders": {}
     }
 
 
@@ -50,6 +51,61 @@ def _save_state(path: Path, st: dict) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
+
+
+def _to_df(candles: Any) -> pd.DataFrame:
+    """
+    Приводит candles к DataFrame c колонками: time, open, high, low, close, volume.
+    Поддерживает вход: DataFrame | list/tuple[ (ts, o,h,l,c, [v]) ].
+    """
+    if candles is None:
+        return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+    if isinstance(candles, pd.DataFrame):
+        df = candles.copy()
+        cols_lower = {c: str(c).lower() for c in df.columns}
+        inv = {v: k for k, v in cols_lower.items()}
+        need = ["time", "open", "high", "low", "close", "volume"]
+        if all(col in cols_lower.values() for col in need):
+            rename = {inv[c]: c for c in need if c in inv}
+            df = df.rename(columns=rename)
+            if "volume" not in df.columns:
+                df["volume"] = 0.0
+            return df[["time", "open", "high", "low", "close", "volume"]]
+        mapping = {}
+        for c in df.columns:
+            cl = str(c).lower()
+            if "time" in cl or "ts" in cl or cl == "t":
+                mapping[c] = "time"
+            elif cl.startswith("o"):
+                mapping[c] = "open"
+            elif cl.startswith("h"):
+                mapping[c] = "high"
+            elif cl.startswith("l"):
+                mapping[c] = "low"
+            elif cl.startswith("c"):
+                mapping[c] = "close"
+            elif "vol" in cl or cl.startswith("v"):
+                mapping[c] = "volume"
+        df = df.rename(columns=mapping)
+        for col in ["time", "open", "high", "low", "close"]:
+            if col not in df.columns:
+                df[col] = pd.NA
+        if "volume" not in df.columns:
+            df["volume"] = 0.0
+        return df[["time", "open", "high", "low", "close", "volume"]].copy()
+
+    rows: Iterable = candles if isinstance(candles, (list, tuple)) else list(candles)
+    norm = []
+    for r in rows:
+        if not isinstance(r, (list, tuple)) or len(r) < 5:
+            continue
+        if len(r) == 5:
+            t, o, h, l, c = r
+            v = 0.0
+        else:
+            t, o, h, l, c, v = r[:6]
+        norm.append([t, float(o), float(h), float(l), float(c), float(v)])
+    return pd.DataFrame(norm, columns=["time", "open", "high", "low", "close", "volume"])
 
 
 @dataclass
@@ -146,15 +202,17 @@ def run_live_trade(
     daily_date = str(st.get("daily_date", ""))
     daily_realized_bps = float(st.get("daily_realized_bps", 0.0))
     eq_day_start = float(st.get("eq_day_start", 0.0))
+    ext_orders = dict(st.get("ext_orders", {}))
 
     def _equity(px: float) -> float:
         return cash_eur + pos_qty * px
 
-    # preflight wallet
+    # preflight wallet (user_info → balances)
     try:
-        w = exmo.user_info().get("balances") or {}
-        eur_free = float((w.get("EUR") or {}).get("available", 0.0))
-        base_free = float((w.get(pair.split("_")[0]) or {}).get("available", 0.0))
+        info = exmo.user_info()
+        balances = info.get("balances") or {}
+        eur_free = float((balances.get("EUR") or {}).get("available", 0.0))
+        base_free = float((balances.get(pair.split("_")[0]) or {}).get("available", 0.0))
     except Exception:
         eur_free = base_free = 0.0
 
@@ -162,6 +220,7 @@ def run_live_trade(
     print(f"  account: EUR_free={eur_free:.6f}, {pair.split('_')[0]}_free={base_free:.6f}")
     print(f"  pair_settings[{pair}]: price_tick={rules.price_tick}, qty_step={rules.qty_step}, min_quote={rules.min_quote}")
     print(f"[trade] resume: pos_qty={pos_qty:.6f} cash_eur={cash_eur:.2f} avg_price={avg_price:.6f}")
+    print(f"[trade] {pair} {span} resample={resample_rule} fast={fast} slow={slow} fee={fee_bps}bps slip={slip_bps}bps")
 
     # --- helpers ---
     def _round_step(x: float, step: float, mode: str) -> float:
@@ -177,16 +236,156 @@ def run_live_trade(
         return q * step
 
     def _limit_from_price(side: str, px: float) -> float:
-        if aggr_limit and rules.price_tick > 0:
-            ticks = int(max(0, aggr_ticks))
-            if side == "buy":
-                px = _round_step(px, rules.price_tick, "ceil") + ticks * rules.price_tick
-            else:
-                px = _round_step(px, rules.price_tick, "floor") - ticks * rules.price_tick
-        else:
+        if rules.price_tick > 0:
             mode = "ceil" if side == "buy" else "floor"
             px = _round_step(px, rules.price_tick, mode)
         return max(px, rules.price_tick) if rules.price_tick > 0 else px
+
+    def _place_limit(side: str, px: float, qty: float, client_id_prefix: str = "rt") -> Tuple[str, dict]:
+        """Создаёт лимит без server-side IOC (на акке запрещён этот параметр)."""
+        oid = ""
+        resp = {}
+        try:
+            cid = f"{client_id_prefix}-{int(time.time()*1000)}"
+            resp = exmo.order_create(
+                pair=pair, quantity=qty, price=px, side=side, client_id=cid
+            )
+            oid = str(resp.get("order_id") or resp.get("id") or "")
+        except Exception as e:
+            print(f"[exmo] order_create error: {e!r}")
+        return oid, resp
+
+    # ---------- external (long-term) sell orders tracking ----------
+
+    def _list_open_orders(pair: str):
+        """Вернёт список открытых ордеров по паре с унифицированными полями."""
+        try:
+            data = exmo.user_open_orders(pair=pair)
+            orders = data.get(pair) if isinstance(data, dict) else None
+            if not isinstance(orders, list):
+                return []
+            norm = []
+            for o in orders:
+                oid = str(o.get("order_id") or o.get("id") or "")
+                side = str(o.get("type") or o.get("order_type") or "").lower()
+                price = float(o.get("price") or 0.0)
+                qty = float(o.get("quantity") or o.get("qty") or 0.0)
+                qp = float(o.get("quantity_processed") or o.get("filled_qty") or 0.0)
+                client_id = str(o.get("client_id") or "")
+                norm.append({"order_id": oid, "side": side, "price": price, "qty": qty, "filled": qp, "client_id": client_id})
+            return norm
+        except Exception:
+            return []
+
+    def _filled_of_order(order_id: str) -> float:
+        """Суммарный исполненный qty по ордеру через order_trades."""
+        try:
+            tr = exmo.order_trades(order_id)
+            trades = tr.get("trades") or tr.get("response") or []
+            if isinstance(trades, dict):
+                trades = list(trades.values())
+            total = 0.0
+            for t in trades:
+                total += float(t.get("quantity") or t.get("qty") or 0.0)
+            return total
+        except Exception:
+            return 0.0
+
+    def _reserved_sell_qty() -> float:
+        """Сколько qty сейчас «зарезервировано» под внешние незавершённые SELL-ордера."""
+        total = 0.0
+        for rec in ext_orders.values():
+            if str(rec.get("side")) == "sell":
+                total += max(0.0, float(rec.get("qty", 0.0)) - float(rec.get("filled", 0.0)))
+        return total
+
+    def _sync_external_orders(current_price: float, fee_bps_val: float):
+        """
+        Синхронизировать внешние (долгосрочные) ордера:
+          - обнаружить/обновить SELL-ордера, выставленные вручную (client_id не начинается с 'rt').
+          - доучесть новые исполнения (delta_filled) как обычную продажу с комиссией.
+          - не отменять ордера, только резервировать qty и логировать сделки.
+        """
+        nonlocal pos_qty, cash_eur, avg_price, pnl_sum_pos, pnl_sum_neg, round_trips, wins, daily_realized_bps, ext_orders
+
+        open_now = _list_open_orders(pair)
+        open_ext = {o["order_id"]: o for o in open_now
+                    if o["side"] == "sell" and not str(o.get("client_id", "")).lower().startswith("rt")}
+
+        # добавить/обновить в ext_orders текущие внешние ордера
+        for oid, o in open_ext.items():
+            rec = ext_orders.get(oid, {"side": "sell", "price": o["price"], "qty": o["qty"], "filled": 0.0})
+            rec["price"] = o["price"]
+            rec["qty"] = o["qty"]
+            rec["filled"] = max(float(rec.get("filled", 0.0)), float(o["filled"]))
+            ext_orders[oid] = rec
+
+        # обработать известные ордера (могли исполниться/отмениться)
+        known_oids = list(ext_orders.keys())
+        for oid in known_oids:
+            in_open = oid in open_ext
+            prev_filled = float(ext_orders[oid].get("filled", 0.0))
+            total_qty = float(ext_orders[oid].get("qty", 0.0))
+            price_exec = float(ext_orders[oid].get("price", current_price))
+
+            if not in_open:
+                filled_total = _filled_of_order(oid)
+                new_fill = max(0.0, filled_total - prev_filled)
+            else:
+                filled_total = float(open_ext[oid]["filled"])
+                new_fill = max(0.0, filled_total - prev_filled)
+
+            if new_fill > 0.0:
+                fee_eur = (price_exec * new_fill) * (fee_bps_val / 1e4)
+                pnl_gross = (price_exec - avg_price) * new_fill
+                cash_eur += new_fill * price_exec - fee_eur
+                pos_qty = max(0.0, pos_qty - new_fill)
+                pnl_net = pnl_gross - fee_eur
+                if pnl_net >= 0:
+                    pnl_sum_pos += pnl_net
+                    wins += 1
+                else:
+                    pnl_sum_neg += pnl_net
+                if eq_day_start > 0:
+                    pnl_bps = (pnl_net / eq_day_start) * 1e4
+                    daily_realized_bps += float(pnl_bps)
+
+                _append_csv(trades_csv, [
+                    pd.Timestamp.utcnow().isoformat(), "sell", f"{price_exec:.10f}", f"{new_fill:.10f}",
+                    f"{fee_eur:.10f}", "ext"
+                ])
+
+                if pos_qty <= (rules.qty_step or 0.0) / 2:
+                    pos_qty = 0.0
+                    avg_price = 0.0
+                    round_trips += 1
+                    eq = cash_eur + pos_qty * current_price
+                    _append_csv(balance_csv, [
+                        pd.Timestamp.utcnow().isoformat(), "CLOSE", round_trips, "SELL",
+                        f"{price_exec:.10f}", f"{avg_price:.10f}",
+                        f"{new_fill:.10f}", f"{pnl_net:.10f}",
+                        f"{cash_eur:.8f}", f"{0.0 + 0.0:.8f}",
+                        f"{pos_qty:.10f}", f"{cash_eur:.10f}", f"{eq:.10f}",
+                        wins, f"{pnl_sum_pos:.10f}", f"{pnl_sum_neg:.10f}"
+                    ])
+
+                ext_orders[oid]["filled"] = prev_filled + new_fill
+
+            # если ордера нет в стакане и исполнений нет — удалить (отменён на бирже)
+            if (not in_open) and (filled_total <= 0.0 + 1e-12):
+                ext_orders.pop(oid, None)
+
+        # сохранить стейт после синка
+        st2 = {
+            "pos_qty": pos_qty, "cash_eur": cash_eur, "avg_price": avg_price,
+            "pnl_sum_pos": pnl_sum_pos, "pnl_sum_neg": pnl_sum_neg,
+            "round_trips": round_trips, "wins": wins,
+            "cooldown_left": cooldown_left,
+            "daily_date": daily_date, "daily_realized_bps": daily_realized_bps,
+            "eq_day_start": eq_day_start,
+            "ext_orders": ext_orders,
+        }
+        _save_state(state_json, st2)
 
     # candles poll loop
     last_ts: Optional[pd.Timestamp] = None
@@ -220,32 +419,27 @@ def run_live_trade(
             return False
         return True
 
-    def _place_limit(side: str, px: float, qty: float, client_id_prefix: str = "rt") -> Tuple[str, dict]:
-        oid = ""
-        resp = {}
-        try:
-            cid = f"{client_id_prefix}-{int(time.time()*1000)}"
-            resp = exmo.order_create(
-                pair=pair, quantity=qty, price=px, side=side, client_id=cid,
-                immediate_or_cancel=True  # быстрый результат; остатки будем «репрайсить»
-            )
-            oid = str(resp.get("order_id") or resp.get("id") or "")
-        except Exception as e:
-            print(f"[exmo] order_create error: {e!r}")
-        return oid, resp
-
     try:
         while True:
-            # fetch candles
+            # --- fetch candles ---
             candles = fetch_exmo_candles(pair, span)
             if resample_rule:
                 candles = resample_ohlcv(candles, resample_rule)
 
-            if not candles or len(candles) < max(fast, slow) + 2:
+            df = _to_df(candles)
+            if df is None or df.empty or len(df) < max(fast, slow) + 2:
                 time.sleep(poll_sec)
                 continue
 
-            df = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume"])
+            df = df.copy()
+            df["time"] = pd.to_datetime(df["time"], utc=True, unit="ms", errors="coerce") \
+                         if pd.api.types.is_numeric_dtype(df["time"]) else pd.to_datetime(df["time"], utc=True, errors="coerce")
+            df = df.dropna(subset=["time", "close"])
+            if df.empty or len(df) < max(fast, slow) + 2:
+                time.sleep(poll_sec)
+                continue
+
+            df = df.sort_values("time")
             df["sma_fast"] = df["close"].rolling(fast, min_periods=fast).mean()
             df["sma_slow"] = df["close"].rolling(slow, min_periods=slow).mean()
             if len(df) < max(fast, slow) + 2:
@@ -254,7 +448,7 @@ def run_live_trade(
 
             prev = df.iloc[-2]
             last = df.iloc[-1]
-            ts: pd.Timestamp = pd.to_datetime(last["time"], utc=True)
+            ts: pd.Timestamp = last["time"]
             if last_ts is not None and ts <= last_ts:
                 time.sleep(poll_sec)
                 continue
@@ -263,6 +457,9 @@ def run_live_trade(
             price = float(last["close"])
             _ensure_daily(price)
             _tick_cooldown()
+
+            # синхронизация частичных исполнений внешних ордеров
+            _sync_external_orders(current_price=price, fee_bps_val=fee_bps)
 
             pf, ps = float(prev["sma_fast"]), float(prev["sma_slow"])
             f, s = float(last["sma_fast"]), float(last["sma_slow"])
@@ -285,6 +482,7 @@ def run_live_trade(
             regime = "LONG" if f >= s else "FLAT"
             base_note = "align" if force_entry == "" else "force"
 
+            # --- inner attempts loop (place → wait → status → cancel-if-not-full → (reprice)) ---
             def _attempts_loop(side: str, eur_to_use: float, note: str) -> None:
                 nonlocal pos_qty, cash_eur, avg_price, pnl_sum_pos, pnl_sum_neg, round_trips, wins, daily_realized_bps
 
@@ -301,7 +499,9 @@ def run_live_trade(
                     if qty <= 0:
                         return
                 else:
-                    qty = _round_step(pos_qty, rules.qty_step, "floor") if rules.qty_step > 0 else pos_qty
+                    # свободная для продажи позиция = pos_qty - резерв под внешние SELL
+                    free_qty = max(0.0, pos_qty - _reserved_sell_qty())
+                    qty = _round_step(free_qty, rules.qty_step, "floor") if rules.qty_step > 0 else free_qty
                     if qty <= 0:
                         return
 
@@ -317,10 +517,17 @@ def run_live_trade(
                     oid, _ = _place_limit(side, lim, qty, client_id_prefix="rt")
 
                     time.sleep(max(0.5, float(fok_wait_sec)))
-                    st_ord = exmo.order_status(pair=pair, order_id=oid)
+                    st_ord = ExmoPrivate.order_status(exmo, pair=pair, order_id=oid)
                     status = str(st_ord.get("status") or "").lower()
                     filled_qty = float(st_ord.get("quantity_processed") or st_ord.get("filled_qty") or 0.0)
                     price_exec = float(st_ord.get("price") or lim)
+
+                    # если ордер не исполнен полностью — отменить перед репрайсом/выходом
+                    try:
+                        if filled_qty <= 0 or filled_qty < qty - 1e-12:
+                            exmo.order_cancel(oid)
+                    except Exception as e:
+                        print(f"[exmo] order_cancel warn: {e!r}")
 
                     if filled_qty > 0:
                         # комиссия сделки (в €)
@@ -377,15 +584,16 @@ def run_live_trade(
                         ])
 
                         # сохранить стейт
-                        st = {
+                        st3 = {
                             "pos_qty": pos_qty, "cash_eur": cash_eur, "avg_price": avg_price,
                             "pnl_sum_pos": pnl_sum_pos, "pnl_sum_neg": pnl_sum_neg,
                             "round_trips": round_trips, "wins": wins,
                             "cooldown_left": cooldown_left,
                             "daily_date": daily_date, "daily_realized_bps": daily_realized_bps,
                             "eq_day_start": eq_day_start,
+                            "ext_orders": ext_orders,
                         }
-                        _save_state(state_json, st)
+                        _save_state(state_json, st3)
                         break  # stop attempts after fill
 
                 # equity log
@@ -410,7 +618,7 @@ def run_live_trade(
                 print(f"[trade] {ts.isoformat()} hb equity={eq:.2f} pos={pos_qty:.6f} "
                       f"pnl_real={pnl_sum_pos + pnl_sum_neg:.4f} pnl_unreal={(price - avg_price) * pos_qty:.4f} "
                       f"rt={round_trips} win_rate={(wins / max(1, round_trips)) * 100:.2f}% "
-                      f"daily_bps={daily_realized_bps:.1f} cd={cooldown_left}")
+                      f"daily_bps={daily_realized_bps:.1f} cd={cooldown_left} resv={_reserved_sell_qty():.6f}")
                 next_hb = now + max(1, int(heartbeat_sec))
 
             time.sleep(poll_sec)
