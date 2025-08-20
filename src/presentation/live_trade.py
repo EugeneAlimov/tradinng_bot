@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,8 @@ from src.integrations.exmo_private import ExmoPrivate
 # secure creds + atomic state
 from src.security.credentials import get_api_credentials
 from src.utils.atomic_state import AtomicState
+# alerts
+from src.monitoring.alerts import make_alerter
 
 
 # ---------- small io helpers ----------
@@ -144,9 +147,11 @@ def run_live_trade(
         aggr_ticks: int,
         force_entry: str,
         hysteresis_bps: float = 0.0,
-        # risk ext (необязательно, по умолчанию отключено)
+        # risk ext (по умолчанию отключено/без ограничений)
         max_position_pct: float = 100.0,
         stop_loss_bps: float = 0.0,
+        # reconcile
+        reconcile_threshold_qty: float = 0.0,
 ) -> None:
     """
     Живой торговый режим.
@@ -173,16 +178,16 @@ def run_live_trade(
                  "pos_qty_after", "cash_eur_after", "equity_after",
                  "wins", "pnl_pos_sum", "pnl_neg_sum"])
 
+    # --- alerts ---
+    alert = make_alerter()
+
     # --- creds: keyring → env(.env) ---
-    # 1) keyring / env
     api_key, api_secret = get_api_credentials()
-    # 2) .env (если не нашли в keyring/окружении)
     if not api_key or not api_secret:
         from src.config.env import load_env, env_str
         load_env()
         api_key = api_key or env_str("EXMO_KEY") or env_str("EXMO_API_KEY")
         api_secret = api_secret or env_str("EXMO_SECRET") or env_str("EXMO_API_SECRET")
-
     if not api_key or not api_secret:
         raise RuntimeError("EXMO_KEY/EXMO_SECRET are required (keyring or env/.env).")
 
@@ -195,6 +200,21 @@ def run_live_trade(
         qty_step=float(info.get("min_quantity_increment") or info.get("qty_step") or qty_step or 0.0),
         min_quote=float(info.get("min_total") or info.get("min_quote") or min_quote or 0.0),
     )
+
+    # --- env overrides for risk/reconcile (если CLI не проброшен) ---
+    def _env_float(name: str, default: float) -> float:
+        try:
+            v = os.getenv(name)
+            return float(v) if v is not None and v != "" else default
+        except Exception:
+            return default
+
+    if max_position_pct == 100.0:
+        max_position_pct = _env_float("MAX_POSITION_PCT", 100.0)
+    if stop_loss_bps == 0.0:
+        stop_loss_bps = _env_float("STOP_LOSS_BPS", 0.0)
+    if reconcile_threshold_qty == 0.0:
+        reconcile_threshold_qty = _env_float("RECONCILE_THRESHOLD_QTY", max(rules.qty_step or 0.0, 1e-9))
 
     # --- state ---
     st = _load_state(state_json)
@@ -228,6 +248,7 @@ def run_live_trade(
     print(f"  pair_settings[{pair}]: price_tick={rules.price_tick}, qty_step={rules.qty_step}, min_quote={rules.min_quote}")
     print(f"[trade] resume: pos_qty={pos_qty:.6f} cash_eur={cash_eur:.2f} avg_price={avg_price:.6f}")
     print(f"[trade] {pair} {span} resample={resample_rule} fast={fast} slow={slow} fee={fee_bps}bps slip={slip_bps}bps")
+    print(f"[risk] max_position_pct={max_position_pct:.2f}% stop_loss_bps={stop_loss_bps:.1f} reconcile_thr_qty={reconcile_threshold_qty}")
 
     # --- helpers ---
     def _round_step(x: float, step: float, mode: str) -> float:
@@ -260,7 +281,22 @@ def run_live_trade(
             oid = str(resp.get("order_id") or resp.get("id") or "")
         except Exception as e:
             print(f"[exmo] order_create error: {e!r}")
+            _bump_error(f"order_create: {e}")
         return oid, resp
+
+    # ---------- alerts/error counter ----------
+    consecutive_errors = 0
+
+    def _bump_error(msg: str) -> None:
+        nonlocal consecutive_errors
+        consecutive_errors += 1
+        if consecutive_errors >= 3:
+            alert.send(f"⚠️ <b>EXMO errors</b>: {consecutive_errors} подряд\n{msg}")
+            consecutive_errors = 0  # чтобы не спамить
+
+    def _reset_errors() -> None:
+        nonlocal consecutive_errors
+        consecutive_errors = 0
 
     # ---------- external (long-term) sell orders tracking ----------
 
@@ -281,7 +317,8 @@ def run_live_trade(
                 client_id = str(o.get("client_id") or "")
                 norm.append({"order_id": oid, "side": side, "price": price, "qty": qty, "filled": qp, "client_id": client_id})
             return norm
-        except Exception:
+        except Exception as e:
+            _bump_error(f"user_open_orders: {e}")
             return []
 
     def _filled_of_order(order_id: str) -> Tuple[float, float]:
@@ -301,8 +338,10 @@ def run_live_trade(
                 qty_sum += q
                 px_w += q * p
             avg = (px_w / qty_sum) if qty_sum > 0 else 0.0
+            _reset_errors()
             return qty_sum, avg
-        except Exception:
+        except Exception as e:
+            _bump_error(f"order_trades: {e}")
             return 0.0, 0.0
 
     def _reserved_sell_qty() -> float:
@@ -338,7 +377,6 @@ def run_live_trade(
         for oid in known_oids:
             in_open = oid in open_ext
             prev_filled = float(ext_orders[oid].get("filled", 0.0))
-            total_qty = float(ext_orders[oid].get("qty", 0.0))
             price_exec = float(ext_orders[oid].get("price", current_price))
 
             if not in_open:
@@ -347,7 +385,6 @@ def run_live_trade(
                 if new_fill > 0 and avg_px > 0:
                     price_exec = avg_px
             else:
-                # уточняем по trades: средняя фактическая цена лучше чем от ордера
                 filled_total, avg_px = _filled_of_order(oid)
                 if filled_total > 0 and avg_px > 0:
                     price_exec = avg_px
@@ -405,7 +442,7 @@ def run_live_trade(
             "eq_day_start": eq_day_start,
             "ext_orders": ext_orders,
         }
-        state_writer.save(st2)
+        AtomicState(state_json).save(st2)  # отдельный инстанс ок
 
     # --- reconcile: периодически сверяем фактическую позицию с биржей ---
     last_reconcile = 0.0
@@ -423,8 +460,10 @@ def run_live_trade(
             base_locked = float((b.get(base) or {}).get("reserved", 0.0))
             on_exchange_qty = base_free + base_locked
             target_pos = max(0.0, on_exchange_qty)
-            if abs(target_pos - pos_qty) > max(rules.qty_step or 0.0, 1e-9):
-                print(f"[sync] reconcile pos: local {pos_qty:.6f} -> exchange {target_pos:.6f}")
+            if abs(target_pos - pos_qty) > max(reconcile_threshold_qty, rules.qty_step or 0.0, 1e-9):
+                delta = target_pos - pos_qty
+                print(f"[sync] reconcile pos: local {pos_qty:.6f} -> exchange {target_pos:.6f} (Δ={delta:.6f})")
+                alert.send(f"ℹ️ <b>Reconcile</b> Δ={delta:.6f}\npos {pos_qty:.6f} → {target_pos:.6f}")
                 pos_qty = target_pos
                 stx = {
                     "pos_qty": pos_qty, "cash_eur": cash_eur, "avg_price": avg_price,
@@ -434,9 +473,10 @@ def run_live_trade(
                     "daily_date": daily_date, "daily_realized_bps": daily_realized_bps,
                     "eq_day_start": eq_day_start, "ext_orders": ext_orders,
                 }
-                state_writer.save(stx)
+                AtomicState(state_json).save(stx)
+            _reset_errors()
         except Exception as e:
-            print(f"[sync] warn: {e!r}")
+            _bump_error(f"user_info (reconcile): {e}")
 
     # candles poll loop
     last_ts: Optional[pd.Timestamp] = None
@@ -463,7 +503,9 @@ def run_live_trade(
 
     def _allow_new_entries() -> bool:
         if max_daily_loss_bps > 0 and daily_realized_bps <= -abs(max_daily_loss_bps):
-            print(f"[risk] daily loss limit reached: {daily_realized_bps:.1f} bps ≤ -{max_daily_loss_bps:.1f} bps — entries blocked.")
+            msg = f"daily loss limit reached: {daily_realized_bps:.1f} bps ≤ -{max_daily_loss_bps:.1f} bps — entries blocked."
+            print(f"[risk] {msg}")
+            alert.send(f"🛑 <b>Daily loss limit</b>\n{msg}")
             return False
         if cooldown_left > 0:
             print(f"[trade] cooldown {cooldown_left} bars left — entries blocked.")
@@ -577,9 +619,15 @@ def run_live_trade(
 
                     time.sleep(max(0.5, float(fok_wait_sec)))
                     # статус
-                    st_ord = ExmoPrivate.order_status(exmo, pair=pair, order_id=oid)
-                    filled_qty = float(st_ord.get("quantity_processed") or st_ord.get("filled_qty") or 0.0)
-                    price_exec = float(st_ord.get("price") or lim)
+                    try:
+                        st_ord = ExmoPrivate.order_status(exmo, pair=pair, order_id=oid)
+                        filled_qty = float(st_ord.get("quantity_processed") or st_ord.get("filled_qty") or 0.0)
+                        price_exec = float(st_ord.get("price") or lim)
+                        _reset_errors()
+                    except Exception as e:
+                        _bump_error(f"order_status: {e}")
+                        filled_qty = 0.0
+                        price_exec = lim
 
                     # уточняем среднюю цену/объём по фактическим сделкам
                     qsum, avg_px = _filled_of_order(oid)
@@ -591,8 +639,10 @@ def run_live_trade(
                     try:
                         if filled_qty <= 0 or filled_qty < qty - 1e-12:
                             exmo.order_cancel(oid)
+                            _reset_errors()
                     except Exception as e:
                         print(f"[exmo] order_cancel warn: {e!r}")
+                        _bump_error(f"order_cancel: {e}")
 
                     if filled_qty > 0:
                         # комиссия сделки (в €)
@@ -649,7 +699,7 @@ def run_live_trade(
                             "daily_date": daily_date, "daily_realized_bps": daily_realized_bps,
                             "eq_day_start": eq_day_start, "ext_orders": ext_orders,
                         }
-                        state_writer.save(st3)
+                        AtomicState(state_json).save(st3)
                         break  # stop attempts after fill
 
                 # equity log
@@ -670,7 +720,9 @@ def run_live_trade(
             # risk: стоп-лосс (простой, от avg_price)
             if pos_qty > 0 and stop_loss_bps > 0 and avg_price > 0:
                 if price <= avg_price * (1.0 - stop_loss_bps / 1e4):
-                    print(f"[risk] stop-loss hit @ {price:.6f} (avg {avg_price:.6f})")
+                    msg = f"stop-loss hit @ {price:.6f} (avg {avg_price:.6f})"
+                    print(f"[risk] {msg}")
+                    alert.send(f"⛔ <b>Stop-loss</b>\n{pair}: {msg}")
                     _attempts_loop("sell", 0.0, "stoploss")
 
             # heartbeat

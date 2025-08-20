@@ -6,3 +6,5 @@ httpx>=0.27
 
 requests~=2.32.4
 matplotlib~=3.10.5
+requests
+keyring
