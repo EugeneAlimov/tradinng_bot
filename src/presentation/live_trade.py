@@ -15,6 +15,10 @@ from src.integrations.exmo import fetch_exmo_candles, resample_ohlcv
 # private (orders, wallet)
 from src.integrations.exmo_private import ExmoPrivate
 
+# secure creds + atomic state
+from src.security.credentials import get_api_credentials
+from src.utils.atomic_state import AtomicState
+
 
 # ---------- small io helpers ----------
 
@@ -45,12 +49,6 @@ def _load_state(path: Path) -> dict:
         # внешний трекинг: ext_orders[oid] = {"side":"sell","price":float,"qty":float,"filled":float}
         "ext_orders": {}
     }
-
-
-def _save_state(path: Path, st: dict) -> None:
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
 
 
 def _to_df(candles: Any) -> pd.DataFrame:
@@ -146,6 +144,9 @@ def run_live_trade(
         aggr_ticks: int,
         force_entry: str,
         hysteresis_bps: float = 0.0,
+        # risk ext (необязательно, по умолчанию отключено)
+        max_position_pct: float = 100.0,
+        stop_loss_bps: float = 0.0,
 ) -> None:
     """
     Живой торговый режим.
@@ -162,6 +163,7 @@ def run_live_trade(
     equity_csv = data_dir / "live_trade_equity.csv"
     balance_csv = data_dir / "live_trade_balance.csv"
     state_json = data_dir / "live_trade_state.json"
+    state_writer = AtomicState(state_json)
 
     _ensure_csv(trades_csv, ["time", "side", "price", "qty", "fee_eur", "note"])
     _ensure_csv(equity_csv, ["time", "equity"])
@@ -171,13 +173,18 @@ def run_live_trade(
                  "pos_qty_after", "cash_eur_after", "equity_after",
                  "wins", "pnl_pos_sum", "pnl_neg_sum"])
 
-    # --- env and private API ---
-    from src.config.env import load_env, env_str
-    load_env()  # подхватываем .env если он есть
-    api_key = env_str("EXMO_KEY") or env_str("EXMO_API_KEY")
-    api_secret = env_str("EXMO_SECRET") or env_str("EXMO_API_SECRET")
+    # --- creds: keyring → env(.env) ---
+    # 1) keyring / env
+    api_key, api_secret = get_api_credentials()
+    # 2) .env (если не нашли в keyring/окружении)
     if not api_key or not api_secret:
-        raise RuntimeError("EXMO_KEY/EXMO_SECRET are required (env or CLI).")
+        from src.config.env import load_env, env_str
+        load_env()
+        api_key = api_key or env_str("EXMO_KEY") or env_str("EXMO_API_KEY")
+        api_secret = api_secret or env_str("EXMO_SECRET") or env_str("EXMO_API_SECRET")
+
+    if not api_key or not api_secret:
+        raise RuntimeError("EXMO_KEY/EXMO_SECRET are required (keyring or env/.env).")
 
     exmo = ExmoPrivate(api_key, api_secret)
 
@@ -277,19 +284,26 @@ def run_live_trade(
         except Exception:
             return []
 
-    def _filled_of_order(order_id: str) -> float:
-        """Суммарный исполненный qty по ордеру через order_trades."""
+    def _filled_of_order(order_id: str) -> Tuple[float, float]:
+        """
+        Возвращает (filled_qty, avg_price) по трейдам ордера.
+        """
         try:
             tr = exmo.order_trades(order_id)
             trades = tr.get("trades") or tr.get("response") or []
             if isinstance(trades, dict):
                 trades = list(trades.values())
-            total = 0.0
+            qty_sum = 0.0
+            px_w = 0.0
             for t in trades:
-                total += float(t.get("quantity") or t.get("qty") or 0.0)
-            return total
+                q = float(t.get("quantity") or t.get("qty") or 0.0)
+                p = float(t.get("price") or 0.0)
+                qty_sum += q
+                px_w += q * p
+            avg = (px_w / qty_sum) if qty_sum > 0 else 0.0
+            return qty_sum, avg
         except Exception:
-            return 0.0
+            return 0.0, 0.0
 
     def _reserved_sell_qty() -> float:
         """Сколько qty сейчас «зарезервировано» под внешние незавершённые SELL-ордера."""
@@ -304,7 +318,6 @@ def run_live_trade(
         Синхронизировать внешние (долгосрочные) ордера:
           - обнаружить/обновить SELL-ордера, выставленные вручную (client_id не начинается с 'rt').
           - доучесть новые исполнения (delta_filled) как обычную продажу с комиссией.
-          - не отменять ордера, только резервировать qty и логировать сделки.
         """
         nonlocal pos_qty, cash_eur, avg_price, pnl_sum_pos, pnl_sum_neg, round_trips, wins, daily_realized_bps, ext_orders
 
@@ -312,7 +325,7 @@ def run_live_trade(
         open_ext = {o["order_id"]: o for o in open_now
                     if o["side"] == "sell" and not str(o.get("client_id", "")).lower().startswith("rt")}
 
-        # добавить/обновить в ext_orders текущие внешние ордера
+        # добавить/обновить текущие внешние ордера
         for oid, o in open_ext.items():
             rec = ext_orders.get(oid, {"side": "sell", "price": o["price"], "qty": o["qty"], "filled": 0.0})
             rec["price"] = o["price"]
@@ -329,10 +342,15 @@ def run_live_trade(
             price_exec = float(ext_orders[oid].get("price", current_price))
 
             if not in_open:
-                filled_total = _filled_of_order(oid)
+                filled_total, avg_px = _filled_of_order(oid)
                 new_fill = max(0.0, filled_total - prev_filled)
+                if new_fill > 0 and avg_px > 0:
+                    price_exec = avg_px
             else:
-                filled_total = float(open_ext[oid]["filled"])
+                # уточняем по trades: средняя фактическая цена лучше чем от ордера
+                filled_total, avg_px = _filled_of_order(oid)
+                if filled_total > 0 and avg_px > 0:
+                    price_exec = avg_px
                 new_fill = max(0.0, filled_total - prev_filled)
 
             if new_fill > 0.0:
@@ -371,9 +389,11 @@ def run_live_trade(
 
                 ext_orders[oid]["filled"] = prev_filled + new_fill
 
-            # если ордера нет в стакане и исполнений нет — удалить (отменён на бирже)
-            if (not in_open) and (filled_total <= 0.0 + 1e-12):
-                ext_orders.pop(oid, None)
+            # если ордера нет и исполнений нет — удалить (отменён)
+            if (not in_open):
+                filled_total, _ = _filled_of_order(oid)
+                if filled_total <= 0.0 + 1e-12:
+                    ext_orders.pop(oid, None)
 
         # сохранить стейт после синка
         st2 = {
@@ -385,7 +405,38 @@ def run_live_trade(
             "eq_day_start": eq_day_start,
             "ext_orders": ext_orders,
         }
-        _save_state(state_json, st2)
+        state_writer.save(st2)
+
+    # --- reconcile: периодически сверяем фактическую позицию с биржей ---
+    last_reconcile = 0.0
+
+    def _reconcile_with_exchange(price_now: float) -> None:
+        nonlocal pos_qty, cash_eur, last_reconcile
+        if time.time() - last_reconcile < 60:
+            return
+        last_reconcile = time.time()
+        try:
+            info = exmo.user_info()
+            b = info.get("balances") or {}
+            base = pair.split("_")[0]
+            base_free = float((b.get(base) or {}).get("available", 0.0))
+            base_locked = float((b.get(base) or {}).get("reserved", 0.0))
+            on_exchange_qty = base_free + base_locked
+            target_pos = max(0.0, on_exchange_qty)
+            if abs(target_pos - pos_qty) > max(rules.qty_step or 0.0, 1e-9):
+                print(f"[sync] reconcile pos: local {pos_qty:.6f} -> exchange {target_pos:.6f}")
+                pos_qty = target_pos
+                stx = {
+                    "pos_qty": pos_qty, "cash_eur": cash_eur, "avg_price": avg_price,
+                    "pnl_sum_pos": pnl_sum_pos, "pnl_sum_neg": pnl_sum_neg,
+                    "round_trips": round_trips, "wins": wins,
+                    "cooldown_left": cooldown_left,
+                    "daily_date": daily_date, "daily_realized_bps": daily_realized_bps,
+                    "eq_day_start": eq_day_start, "ext_orders": ext_orders,
+                }
+                state_writer.save(stx)
+        except Exception as e:
+            print(f"[sync] warn: {e!r}")
 
     # candles poll loop
     last_ts: Optional[pd.Timestamp] = None
@@ -458,6 +509,9 @@ def run_live_trade(
             _ensure_daily(price)
             _tick_cooldown()
 
+            # reconcile локального состояния с биржей (раз в 60с)
+            _reconcile_with_exchange(price)
+
             # синхронизация частичных исполнений внешних ордеров
             _sync_external_orders(current_price=price, fee_bps_val=fee_bps)
 
@@ -479,7 +533,6 @@ def run_live_trade(
             if force_entry in ("buy", "sell"):
                 signal = force_entry
 
-            regime = "LONG" if f >= s else "FLAT"
             base_note = "align" if force_entry == "" else "force"
 
             # --- inner attempts loop (place → wait → status → cancel-if-not-full → (reprice)) ---
@@ -495,6 +548,12 @@ def run_live_trade(
                     if eur_to_use <= 0:
                         return
                     qty_raw = eur_to_use / price
+                    # risk: cap по размеру позиции
+                    if max_position_pct < 100.0:
+                        eq_now = _equity(price)
+                        max_pos_qty = (eq_now * (max_position_pct / 100.0)) / max(price, 1e-12)
+                        allowed_qty = max(0.0, max_pos_qty - pos_qty)
+                        qty_raw = min(qty_raw, allowed_qty)
                     qty = _round_step(qty_raw, rules.qty_step, "floor") if rules.qty_step > 0 else qty_raw
                     if qty <= 0:
                         return
@@ -517,10 +576,16 @@ def run_live_trade(
                     oid, _ = _place_limit(side, lim, qty, client_id_prefix="rt")
 
                     time.sleep(max(0.5, float(fok_wait_sec)))
+                    # статус
                     st_ord = ExmoPrivate.order_status(exmo, pair=pair, order_id=oid)
-                    status = str(st_ord.get("status") or "").lower()
                     filled_qty = float(st_ord.get("quantity_processed") or st_ord.get("filled_qty") or 0.0)
                     price_exec = float(st_ord.get("price") or lim)
+
+                    # уточняем среднюю цену/объём по фактическим сделкам
+                    qsum, avg_px = _filled_of_order(oid)
+                    if qsum > 0:
+                        filled_qty = qsum
+                        price_exec = avg_px or price_exec
 
                     # если ордер не исполнен полностью — отменить перед репрайсом/выходом
                     try:
@@ -539,18 +604,14 @@ def run_live_trade(
                             new_pos = pos_qty + filled_qty
                             avg_price = (pos_qty * avg_price + filled_qty * price_exec) / max(new_pos, 1e-9)
                             pos_qty = new_pos
-                            # кэш уменьшаем на стоимость + комиссию
                             cash_eur -= filled_qty * price_exec
                             cash_eur -= fee_eur
                         else:
                             qty_closed = min(filled_qty, pos_qty)
-                            # валовый pnl по цене
                             pnl_gross = (price_exec - avg_price) * qty_closed
-                            # выручка минус комиссия
                             cash_eur += qty_closed * price_exec - fee_eur
                             pos_qty = max(0.0, pos_qty - qty_closed)
 
-                            # реализованный pnl после комиссии продажи
                             pnl_net = pnl_gross - fee_eur
                             if pnl_net >= 0:
                                 pnl_sum_pos += pnl_net
@@ -558,12 +619,10 @@ def run_live_trade(
                             else:
                                 pnl_sum_neg += pnl_net
 
-                            # дневной bps от equity начала дня
                             if eq_day_start > 0:
                                 pnl_bps = (pnl_net / eq_day_start) * 1e4
                                 daily_realized_bps += float(pnl_bps)
 
-                            # если позиция практически нулевая — считаем закрыт rt
                             if pos_qty <= (rules.qty_step or 0.0) / 2:
                                 pos_qty = 0.0
                                 avg_price = 0.0
@@ -578,22 +637,19 @@ def run_live_trade(
                                     wins, f"{pnl_sum_pos:.10f}", f"{pnl_sum_neg:.10f}"
                                 ])
 
-                        # лог сделки
                         _append_csv(trades_csv, [
                             ts.isoformat(), side, f"{price_exec:.10f}", f"{filled_qty:.10f}", f"{fee_eur:.10f}", note
                         ])
 
-                        # сохранить стейт
                         st3 = {
                             "pos_qty": pos_qty, "cash_eur": cash_eur, "avg_price": avg_price,
                             "pnl_sum_pos": pnl_sum_pos, "pnl_sum_neg": pnl_sum_neg,
                             "round_trips": round_trips, "wins": wins,
                             "cooldown_left": cooldown_left,
                             "daily_date": daily_date, "daily_realized_bps": daily_realized_bps,
-                            "eq_day_start": eq_day_start,
-                            "ext_orders": ext_orders,
+                            "eq_day_start": eq_day_start, "ext_orders": ext_orders,
                         }
-                        _save_state(state_json, st3)
+                        state_writer.save(st3)
                         break  # stop attempts after fill
 
                 # equity log
@@ -610,6 +666,12 @@ def run_live_trade(
 
             if ((signal == "sell" and pos_qty > 0) or (force_entry == "sell")) and pos_qty > 0:
                 _attempts_loop("sell", 0.0, base_note)
+
+            # risk: стоп-лосс (простой, от avg_price)
+            if pos_qty > 0 and stop_loss_bps > 0 and avg_price > 0:
+                if price <= avg_price * (1.0 - stop_loss_bps / 1e4):
+                    print(f"[risk] stop-loss hit @ {price:.6f} (avg {avg_price:.6f})")
+                    _attempts_loop("sell", 0.0, "stoploss")
 
             # heartbeat
             now = time.time()
