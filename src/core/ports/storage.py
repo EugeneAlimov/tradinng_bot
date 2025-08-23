@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Protocol, Dict, Any
-from src.core.domain.models import Position, TradeFill, TradingPair
+from src.core.domain.models import Position, TradingPair
 
 
 class StoragePort(Protocol):

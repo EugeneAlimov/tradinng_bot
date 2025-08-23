@@ -12,11 +12,10 @@ from src.core.ports.notify import NotifierPort
 Signal = Literal["BUY", "SELL", "HOLD"]
 
 # Стратегии
-from src.domain.strategy.mean_reversion import MeanReversion
 
 # Новая SMA-стратегия (если не используешь — импорт можно убрать)
 try:
-    from src.domain.strategy.sma_crossover import SmaCrossover, SmaCfg
+    from src.domain.strategy.sma_crossover import SmaCrossover
 except Exception:  # на случай, если файл ещё не добавлен
     SmaCrossover = None  # type: ignore
 

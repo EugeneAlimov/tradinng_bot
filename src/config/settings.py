@@ -2,7 +2,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal
 import os
-from typing import Optional
 from src.config.env import load_env, env_str
 
 SETTINGS_SINGLETON = None

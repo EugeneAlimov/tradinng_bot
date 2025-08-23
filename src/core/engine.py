@@ -2,7 +2,7 @@
 from typing import List, Dict, Tuple
 from dataclasses import dataclass
 from .resample import normalize_row
-from src.strategies.sma import Bar, SmaCross, Signal
+from src.strategies.sma import Bar, SmaCross
 
 
 @dataclass

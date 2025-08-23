@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Dict, Any
 from src.config.settings import RiskCfg
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 from datetime import date
 

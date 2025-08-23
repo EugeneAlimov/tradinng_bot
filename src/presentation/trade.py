@@ -18,7 +18,6 @@ def _place_limit(
     Создаёт ЛИМИТ-ордер с количеством в БАЗОВОЙ валюте (DOGE).
     Требование EXMO: client_id должен быть ЧИСЛОМ. Используем timestamp-ms (31 бит).
     """
-    import math
     ts_ms = int(time.time() * 1000)
     cid_int = int(ts_ms % 2_147_483_647)
 

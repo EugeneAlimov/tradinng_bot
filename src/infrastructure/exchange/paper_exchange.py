@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_DOWN
-from typing import Iterable, Dict, List, Tuple, Optional
+from decimal import Decimal
+from typing import Iterable, Dict, List, Optional
 import itertools
 import random
 import time
