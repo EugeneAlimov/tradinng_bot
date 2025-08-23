@@ -1,168 +1,249 @@
-# -*- coding: utf-8 -*-
+# src/presentation/cli/app.py
 from __future__ import annotations
 
 import argparse
-import sys
+from pathlib import Path
+from datetime import datetime
 from typing import Optional
 
-from src.presentation.live import run_live_observe  # если есть
-from src.presentation.paper import run_live_paper    # если есть
-from src.presentation.live_trade import run_live_trade
-
 from src.backtest.vectorized_bt import BtConfig, run_backtest_vectorized
-# Если у тебя есть старый backtest (simple_bt), можно оставить как fallback:
-try:
-    from src.backtest.simple_bt import run_backtest as run_backtest_legacy  # type: ignore
-except Exception:
-    run_backtest_legacy = None  # type: ignore
+from src.backtest.sweep import run_sweep, SweepCfg, _parse_int_list, _parse_float_list
+from src.backtest.walkforward import run_walkforward, WFConfig
+from src.backtest.robustness import compute_stability as rb_compute, _resolve_csv as rb_resolve
+
+import pandas as pd
 
 
-def _arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser("tradinng_bot cli")
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="tradinng-bot",
+        description="EXMO SMA-crossover bot • backtests, sweep, walk-forward, robustness",
+    )
+    sub = p.add_subparsers(dest="cmd", required=False)
 
-    # режимы
-    gmode = p.add_mutually_exclusive_group(required=True)
-    gmode.add_argument("--backtest", action="store_true", help="Run backtest")
-    gmode.add_argument("--live", choices=["observe", "paper", "trade"], help="Live mode")
+    # backtest
+    pb = sub.add_parser("backtest", help="Run a single backtest")
+    pb.add_argument("--vectorized", action="store_true", help="Use vectorized engine.")
+    pb.add_argument("--exmo-pair", type=str, default="DOGE_EUR")
+    pb.add_argument("--exmo-candles", type=str, default="1m:2000")
+    pb.add_argument("--resample", type=str, default=None)
+    pb.add_argument("--fast", type=int, default=6)
+    pb.add_argument("--slow", type=int, default=25)
+    pb.add_argument("--hysteresis-bps", type=int, default=0)
+    pb.add_argument("--cooldown-bars", type=int, default=0)
+    pb.add_argument("--enter-on-start", action="store_true")
+    pb.add_argument("--fee-bps", type=int, default=10)
+    pb.add_argument("--slip-bps", type=int, default=0)
+    pb.add_argument("--qty-eur", type=float, default=50.0)
+    pb.add_argument("--max-daily-loss-bps", type=int, default=0)
+    pb.add_argument("--out-dir", type=str, default="data/backtests")
+    pb.add_argument("--json-metrics", type=str, default=None)
 
-    # рынок/данные
-    p.add_argument("--exmo-pair", dest="pair", required=True, help="EXMO pair, e.g. DOGE_EUR")
-    p.add_argument("--exmo-candles", dest="span", default="1m:1000", help="source candles span like 1m:1000")
-    p.add_argument("--resample", dest="rule", default="5m", help="resample rule like 5m")
+    # sweep
+    ps = sub.add_parser("sweep", help="Grid search over params with single aggregated CSV output")
+    ps.add_argument("--exmo-pair", required=True, type=str)
+    ps.add_argument("--exmo-candles", required=True, type=str)
+    ps.add_argument("--resample", default=None, type=str)
+    ps.add_argument("--fast-list", default="5:15:5", type=str)
+    ps.add_argument("--slow-list", default="20:40:5", type=str)
+    ps.add_argument("--hyst-list", default="0,5,10,15", type=str)
+    ps.add_argument("--cooldown-list", default="0,3,5", type=str)
+    ps.add_argument("--qty-list", default="50,100", type=str)
+    ps.add_argument("--fee-bps", default=10, type=int)
+    ps.add_argument("--slip-bps", default=0, type=int)
+    ps.add_argument("--max-daily-loss-bps", default=0, type=int)
+    ps.add_argument("--out-dir", default="data/sweep", type=str)
+    ps.add_argument("--sort-by", default="calmar", type=str)
+    ps.add_argument("--top-n", default=20, type=int)
+    ps.add_argument("--save-per-config-csv", action="store_true")
+    ps.add_argument("--save-per-config-metrics", action="store_true")
+    ps.add_argument("--verbose", action="store_true")
 
-    # стратегия SMA
-    p.add_argument("--fast", type=int, default=6)
-    p.add_argument("--slow", type=int, default=25)
-    p.add_argument("--hysteresis-bps", type=float, default=0.0)
+    # walk-forward
+    pw = sub.add_parser("walk-forward", help="Walk-forward validation")
+    pw.add_argument("--exmo-pair", required=True)
+    pw.add_argument("--exmo-candles", required=True)
+    pw.add_argument("--resample", default=None)
+    pw.add_argument("--fast", required=True, type=int)
+    pw.add_argument("--slow", required=True, type=int)
+    pw.add_argument("--hysteresis-bps", default=0, type=int)
+    pw.add_argument("--cooldown-bars", default=0, type=int)
+    pw.add_argument("--enter-on-start", action="store_true")
+    pw.add_argument("--fee-bps", default=10, type=int)
+    pw.add_argument("--slip-bps", default=0, type=int)
+    pw.add_argument("--qty-eur", default=50.0, type=float)
+    pw.add_argument("--max-daily-loss-bps", default=0, type=int)
+    pw.add_argument("--folds", default=4, type=int)
+    pw.add_argument("--min-train-bars", default=150, type=int)
+    pw.add_argument("--min-valid-bars", default=100, type=int)
+    pw.add_argument("--out-dir", default="data/walkforward")
+    pw.add_argument("--out-json", default=None)
+    pw.add_argument("--out-csv", default=None)
 
-    # риск/объемы
-    p.add_argument("--qty-eur", type=float, default=0.0, help="fixed EUR size per entry (0=use position_pct)")
-    p.add_argument("--position-pct", type=float, default=100.0, help="% of equity to use if qty-eur=0")
-    p.add_argument("--fee-bps", type=float, default=10.0)
-    p.add_argument("--slip-bps", type=float, default=2.0)
-    p.add_argument("--cooldown-bars", type=int, default=0)
-    p.add_argument("--max-daily-loss-bps", type=float, default=0.0)
-    p.add_argument("--enter-on-start", action="store_true")
+    # robustness
+    pr = sub.add_parser("robustness", help="Neighborhood robustness ranking for a sweep CSV")
+    pr.add_argument("--sweep-csv", required=True, type=str)
+    pr.add_argument("--metric", default="calmar", type=str)
+    pr.add_argument("--min-trades", default=4, type=int)
+    pr.add_argument("--d-fast", default=2, type=int)
+    pr.add_argument("--d-slow", default=5, type=int)
+    pr.add_argument("--d-hyst", default=5, type=int)
+    pr.add_argument("--d-cd", default=2, type=int)
+    pr.add_argument("--out-csv", default=None, type=str)
+    pr.add_argument("--top-n", default=20, type=int)
 
-    # live specific
-    p.add_argument("--poll-sec", type=int, default=15)
-    p.add_argument("--heartbeat-sec", type=int, default=60)
-    p.add_argument("--price-tick", type=float, default=0.0)
-    p.add_argument("--qty-step", type=float, default=0.0)
-    p.add_argument("--min-quote", type=float, default=0.0)
-    p.add_argument("--confirm-live-trade", action="store_true")
-    p.add_argument("--align-on-state", action="store_true")
-    p.add_argument("--fok-wait-sec", type=float, default=1.0)
-    p.add_argument("--reprice-attempts", type=int, default=0)
-    p.add_argument("--reprice-step-bps", type=float, default=0.0)
-    p.add_argument("--aggr-limit", action="store_true")
-    p.add_argument("--aggr-ticks", type=int, default=0)
-    p.add_argument("--force-entry", choices=["", "buy", "sell"], default="")
-    p.add_argument("--start-eur", type=float, default=1000.0)
-
-    # vectorized backtest switch
-    p.add_argument("--vectorized", action="store_true", help="Use vectorized backtest engine")
+    # legacy
+    p.add_argument("--backtest", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--vectorized", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--exmo-pair", type=str, help=argparse.SUPPRESS)
+    p.add_argument("--exmo-candles", type=str, help=argparse.SUPPRESS)
+    p.add_argument("--resample", type=str, help=argparse.SUPPRESS)
+    p.add_argument("--fast", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--slow", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--hysteresis-bps", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--cooldown-bars", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--enter-on-start", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--fee-bps", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--slip-bps", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--qty-eur", type=float, help=argparse.SUPPRESS)
+    p.add_argument("--max-daily-loss-bps", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--out-dir", type=str, help=argparse.SUPPRESS)
+    p.add_argument("--json-metrics", type=str, help=argparse.SUPPRESS)
 
     return p
 
 
+def _run_backtest_mode(args: argparse.Namespace) -> None:
+    cfg = BtConfig(
+        pair=args.exmo_pair,
+        span=args.exmo_candles,
+        resample_rule=args.resample,
+        fast=int(args.fast),
+        slow=int(args.slow),
+        hysteresis_bps=int(args.hysteresis_bps),
+        cooldown_bars=int(args.cooldown_bars),
+        enter_on_start=bool(args.enter_on_start),
+        fee_bps=int(args.fee_bps),
+        slip_bps=int(args.slip_bps),
+        qty_eur=float(args.qty_eur),
+        max_daily_loss_bps=int(args.max_daily_loss_bps),
+        print_summary=True,
+    )
+    od = Path(args.out_dir)
+    od.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    base = f"{cfg.pair.replace('/', '_')}_{(cfg.resample_rule or 'raw')}_{cfg.fast}-{cfg.slow}_{stamp}"
+    cfg.out_trades_csv = od / f"{base}_trades.csv"
+    cfg.out_equity_csv = od / f"{base}_equity.csv"
+    if getattr(args, "json_metrics", None):
+        cfg.out_metrics_json = Path(args.json_metrics)
+    run_backtest_vectorized(cfg)
+
+
 def main(argv: Optional[list] = None) -> None:
-    args = _arg_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
 
-    pair = args.pair
-    span = args.span
-    rule = args.rule
-
-    if args.backtest:
-        if args.vectorized:
-            cfg = BtConfig(
-                pair=pair,
-                span=span,
-                resample_rule=rule,
-                fast=int(args.fast),
-                slow=int(args.slow),
-                hysteresis_bps=float(args.hysteresis_bps),
-                start_eur=float(args.start_eur),
-                qty_eur=float(args.qty_eur),
-                position_pct=float(args.position_pct),
-                fee_bps=float(args.fee_bps),
-                slip_bps=float(args.slip_bps),
-                cooldown_bars=int(args.cooldown_bars),
-                max_daily_loss_bps=float(args.max_daily_loss_bps),
-                enter_on_start=bool(args.enter_on_start),
-            )
-            res = run_backtest_vectorized(cfg)
-            m = res.metrics
-            print("[bt-v] metrics:")
-            for k in ["bars", "trades", "round_trips", "win_rate_pct",
-                      "return_pct", "sharpe_like", "max_drawdown_pct",
-                      "start_equity", "final_equity"]:
-                print(f"  {k}: {m.get(k)}")
-            print(f"[bt-v] trades -> {cfg.out_trades_csv}")
-            print(f"[bt-v] equity -> {cfg.out_equity_csv}")
-        else:
-            if run_backtest_legacy is None:
-                print("Legacy backtest is not available. Use --vectorized.", file=sys.stderr)
-                sys.exit(2)
-            # legacy path, keep previous signature as-is
-            run_backtest_legacy(
-                pair=pair, span=span, resample_rule=rule,
-                fast=args.fast, slow=args.slow,
-                hysteresis_bps=args.hysteresis_bps,
-                fee_bps=args.fee_bps, slip_bps=args.slip_bps,
-                start_eur=args.start_eur, qty_eur=args.qty_eur,
-                position_pct=args.position_pct,
-                cooldown_bars=args.cooldown_bars,
-                max_daily_loss_bps=args.max_daily_loss_bps,
-                enter_on_start=args.enter_on_start,
-            )
+    if args.cmd == "backtest":
+        if not args.vectorized:
+            raise SystemExit("Only --vectorized engine is implemented.")
+        _run_backtest_mode(args)
         return
 
-    # ---- LIVE MODES ----
-    if args.live == "observe":
-        run_live_observe(
-            pair=pair, span=span, resample_rule=rule,
-            fast=args.fast, slow=args.slow,
-            poll_sec=args.poll_sec, heartbeat_sec=args.heartbeat_sec
+    if args.cmd == "sweep":
+        scfg = SweepCfg(
+            pair=args.exmo_pair,
+            span=args.exmo_candles,
+            resample=args.resample,
+            fast_list=_parse_int_list(args.fast_list),
+            slow_list=_parse_int_list(args.slow_list),
+            hyst_list=_parse_int_list(args.hyst_list),
+            cooldown_list=_parse_int_list(args.cooldown_list),
+            qty_list=_parse_float_list(args.qty_list),
+            fee_bps=int(args.fee_bps),
+            slip_bps=int(args.slip_bps),
+            max_daily_loss_bps=int(args.max_daily_loss_bps),
+            out_dir=Path(args.out_dir),
+            sort_by=str(args.sort_by),
+            top_n=int(args.top_n),
+            save_per_config_csv=bool(args.save_per_config_csv),
+            save_per_config_metrics=bool(args.save_per_config_metrics),
+            quiet_runs=(not bool(args.verbose)),
         )
+        out_csv = run_sweep(scfg)
+        print(f"\nSweep saved to: {out_csv}")
         return
 
-    if args.live == "paper":
-        run_live_paper(
-            pair=pair, span=span, resample_rule=rule,
-            fast=args.fast, slow=args.slow,
-            fee_bps=args.fee_bps, slip_bps=args.slip_bps,
-            poll_sec=args.poll_sec, heartbeat_sec=args.heartbeat_sec,
-            start_eur=args.start_eur, qty_eur=args.qty_eur, position_pct=args.position_pct,
+    if args.cmd == "walk-forward":
+        wcfg = WFConfig(
+            pair=args.exmo_pair,
+            span=args.exmo_candles,
+            resample=args.resample,
+            fast=int(args.fast),
+            slow=int(args.slow),
+            hysteresis_bps=int(args.hysteresis_bps),
+            cooldown_bars=int(args.cooldown_bars),
+            enter_on_start=bool(args.enter_on_start),
+            fee_bps=int(args.fee_bps),
+            slip_bps=int(args.slip_bps),
+            qty_eur=float(args.qty_eur),
+            max_daily_loss_bps=int(args.max_daily_loss_bps),
+            folds=int(args.folds),
+            min_train_bars=int(args.min_train_bars),
+            min_valid_bars=int(args.min_valid_bars),
+            out_dir=Path(args.out_dir),
+            out_json=Path(args.out_json) if args.out_json else None,
+            out_csv=Path(args.out_csv) if args.out_csv else None,
         )
+        run_walkforward(wcfg)
         return
 
-    if args.live == "trade":
-        run_live_trade(
-            pair=pair, span=span, resample_rule=rule,
-            fast=args.fast, slow=args.slow,
-            start_eur=args.start_eur,
-            qty_eur=args.qty_eur, position_pct=args.position_pct,
-            fee_bps=args.fee_bps, slip_bps=args.slip_bps,
-            price_tick=args.price_tick, qty_step=args.qty_step, min_quote=args.min_quote,
-            poll_sec=args.poll_sec, heartbeat_sec=args.heartbeat_sec,
-            max_daily_loss_bps=args.max_daily_loss_bps,
-            cooldown_bars=args.cooldown_bars,
-            confirm_live_trade=args.confirm_live_trade,
-            align_on_state=args.align_on_state,
-            enter_on_start=args.enter_on_start,
-            fok_wait_sec=args.fok_wait_sec,
-            reprice_attempts=args.reprice_attempts,
-            reprice_step_bps=args.reprice_step_bps,
-            aggr_limit=args.aggr_limit,
-            aggr_ticks=args.aggr_ticks,
-            force_entry=args.force_entry,
-            hysteresis_bps=args.hysteresis_bps,
+    if args.cmd == "robustness":
+        resolved = rb_resolve(args.sweep_csv)
+        ranked = rb_compute(
+            csv_path=resolved,
+            min_trades=int(args.min_trades),
+            metric=str(args.metric),
+            d_fast=int(args.d_fast),
+            d_slow=int(args.d_slow),
+            d_hyst=int(args.d_hyst),
+            d_cd=int(args.d_cd),
         )
+        if args.out_csv:
+            out_p = Path(args.out_csv)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            ranked.to_csv(out_p, index=False)
+
+        print(f"\nUsing sweep CSV: {resolved}\n")
+        top = ranked.head(int(args.top_n))
+        with pd.option_context("display.max_columns", None, "display.width", 200):
+            print(top.to_string(index=False))
+        if args.out_csv:
+            print(f"\nSaved ranked table to: {args.out_csv}")
         return
 
-    print("Unknown mode", file=sys.stderr)
-    sys.exit(2)
+    # Backward-compat: old flags
+    if args.backtest and args.vectorized:
+        class _Obj: pass
+        la = _Obj()
+        la.exmo_pair = args.exmo_pair or "DOGE_EUR"
+        la.exmo_candles = args.exmo_candles or "1m:2000"
+        la.resample = args.resample
+        la.fast = args.fast or 6
+        la.slow = args.slow or 25
+        la.hysteresis_bps = args.hysteresis_bps or 0
+        la.cooldown_bars = args.cooldown_bars or 0
+        la.enter_on_start = bool(args.enter_on_start)
+        la.fee_bps = args.fee_bps or 10
+        la.slip_bps = args.slip_bps or 0
+        la.qty_eur = args.qty_eur or 50.0
+        la.max_daily_loss_bps = args.max_daily_loss_bps or 0
+        la.out_dir = args.out_dir or "data/backtests"
+        la.json_metrics = args.json_metrics
+        _run_backtest_mode(la)
+        return
+
+    parser.print_help()
 
 
 if __name__ == "__main__":
