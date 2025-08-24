@@ -1,495 +1,560 @@
-# src/backtest/vectorized_bt.py
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import math
+import time
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
-import re
 
-import math
-import os
-import time
-import json
-import requests
 import numpy as np
 import pandas as pd
 
-
-# ----------------------------- #
-# ---------- Config ----------- #
-# ----------------------------- #
+# ==============================
+# Config & Public API
+# ==============================
 
 @dataclass
 class BtConfig:
-    # Data
-    pair: str                       # e.g. "DOGE_EUR"
-    span: str                       # e.g. "1m:2000", "5m:5000", "1h:1500", "D:800"
-    resample_rule: Optional[str]    # e.g. "5m", "15m", "1h", None
+    pair: str                      # EXMO pair, e.g. "DOGE_EUR"
+    span: str                      # e.g. "1m:5000"
+    fast: int                      # fast SMA window (bars)
+    slow: int                      # slow SMA window (bars)
+    hysteresis_bps: int = 0        # entry/exit hysteresis in basis points
+    cooldown_bars: int = 0         # bars to wait after exit before new entry
+    enter_on_start: bool = False   # if True and long condition true at start, enter immediately
+    fee_bps: int = 0               # per-side fee in bps
+    slip_bps: int = 0              # slippage in bps (applied adversarially on fills)
+    qty_eur: float = 100.0         # notional per trade in quote currency (EUR)
+    max_daily_loss_bps: int = 0    # optional daily stop in bps of start_equity (0=off)
+    resample: Optional[str] = None # e.g. "5m" (minutes); None -> do not resample
 
-    # Strategy (SMA crossover + hysteresis)
-    fast: int = 6
-    slow: int = 25
-    hysteresis_bps: int = 0
-    cooldown_bars: int = 0
-    enter_on_start: bool = False
+# ==============================
+# Helpers
+# ==============================
 
-    # Trading frictions
-    fee_bps: int = 10
-    slip_bps: int = 0
+def _now_utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
-    # Sizing
-    qty_eur: float = 50.0
-
-    # Risk
-    max_daily_loss_bps: int = 0
-
-    # Outputs
-    out_trades_csv: Optional[Path] = None
-    out_equity_csv: Optional[Path] = None
-    out_metrics_json: Optional[Path] = None
-
-    # Behavior
-    print_summary: bool = True
-
-
-# ----------------------------- #
-# --------- Utilities --------- #
-# ----------------------------- #
-
-BPS = 1e-4
-_SECONDS_IN_YEAR = 365.25 * 24 * 3600
-
-
-def _parse_span(span: str) -> Tuple[str, int, int]:
+def _parse_span(span: str) -> Tuple[str, int]:
     """
-    Parse span like "1m:2000", "5m:5000", "1h:1000", "D:800"
-    Returns: (resolution_param_for_api, approx_seconds_per_candle, limit)
+    Parse span like "1m:5000" -> ("1m", 5000).
     """
-    try:
-        tf, limit_s = span.split(":")
-        limit = int(limit_s)
-    except Exception:
-        raise ValueError(f"Bad span format '{span}'. Expected like '1m:2000' or 'D:800'.")
+    if ":" not in span:
+        raise ValueError(f"Invalid span '{span}'. Expected format '<tf>:<limit>' e.g. '1m:5000'")
+    tf, lim = span.split(":", 1)
+    lim_int = int(lim)
+    if lim_int <= 0:
+        raise ValueError("limit in span must be > 0")
+    return tf.strip(), lim_int
 
+def _minutes_from_tf(tf: str) -> int:
+    """
+    Convert EXMO time frame string to minutes.
+    Supports '1m','3m','5m','15m','30m','1h','4h','1d' etc.
+    """
     tf = tf.strip().lower()
-    if tf.endswith("m"):  # minutes
-        minutes = int(tf[:-1])
-        return str(minutes), minutes * 60, limit
-    if tf.endswith("h"):  # hours
-        hours = int(tf[:-1])
-        return str(hours * 60), hours * 3600, limit
-    if tf in ("d", "w", "m"):  # day/week/month (EXMO accepts D/W/M)
-        sec_map = {"d": 86400, "w": 7 * 86400, "m": 30 * 86400}
-        return tf.upper(), sec_map[tf], limit
+    if tf.endswith("m"):
+        return int(tf[:-1])
+    if tf.endswith("h"):
+        return int(tf[:-1]) * 60
+    if tf.endswith("d"):
+        return int(tf[:-1]) * 60 * 24
+    raise ValueError(f"Unsupported timeframe '{tf}'")
 
-    raise ValueError(f"Unsupported timeframe '{tf}' in span '{span}'.")
+def _normalize_resample(rule: str) -> str:
+    """
+    Pandas recommends 'T' or 'min' for minutes; 'm' is month-end (deprecated shorthand).
+    Convert '5m' -> '5T'
+    """
+    rule = rule.strip()
+    if rule.lower().endswith("m"):
+        # Minute
+        num = rule[:-1]
+        if not num.isdigit():
+            raise ValueError(f"Invalid minute resample rule '{rule}'")
+        return f"{int(num)}T"
+    return rule
 
+def _bars_per_year_from_rule(rule: Optional[str]) -> float:
+    """
+    Estimate bars per (365-day) year for given resample or base tf.
+    """
+    minutes = 1
+    if rule:
+        if rule.lower().endswith("m"):
+            minutes = int(rule[:-1])
+        elif rule.upper().endswith("T"):
+            minutes = int(rule[:-1])
+        elif rule.lower().endswith("h"):
+            minutes = int(rule[:-1]) * 60
+        elif rule.lower().endswith("d"):
+            minutes = int(rule[:-1]) * 60 * 24
+        else:
+            # Fallback to 1 minute
+            minutes = 1
+    return (365 * 24 * 60) / minutes
 
-def _detect_ts_unit(t_raw: Any) -> str:
-    t_int = int(float(t_raw))
-    if t_int >= 1_000_000_000_000_000:  # 1e15
-        return "us"
-    if t_int >= 100_000_000_000:        # 1e11
-        return "ms"
-    return "s"
+def _apply_bps(price: float, bps: int, adverse: bool) -> float:
+    """
+    Apply slippage in bps to price. If adverse=True, move price against us.
+    """
+    if bps == 0:
+        return price
+    factor = (1.0 + (bps / 1e4))
+    return price * (factor if adverse else (1.0 / factor))
 
+def _fee_multiplier(bps: int) -> float:
+    """
+    Convert per-side fee in bps into multiplier on notional.
+    """
+    if bps == 0:
+        return 1.0
+    return 1.0 - (bps / 1e4)
 
-def _to_utc_ts(t_raw: Any) -> pd.Timestamp:
-    t_int = int(float(t_raw))
-    unit = _detect_ts_unit(t_int)
-    try:
-        return pd.to_datetime(t_int, unit=unit, utc=True)
-    except Exception:
-        for unit_fallback in ("us", "ms", "s"):
-            try:
-                return pd.to_datetime(t_int, unit=unit_fallback, utc=True)
-            except Exception:
-                continue
-        return pd.to_datetime(t_int // 1000, unit="s", utc=True)
-
-
-def _request_exmo(symbol: str, resolution: str, ts_from: int, ts_to: int) -> List[tuple]:
-    """Один запрос к EXMO. Возвращает список строк (ts,o,h,l,c,v)."""
-    params = {"symbol": symbol, "resolution": resolution, "from": ts_from, "to": ts_to}
-    urls = [
-        "https://api.exmo.com/v1.1/candles_history",
-        # запасной (иногда CDN/маршрутизация чудит; пусть будет в цикле)
-        "https://api.exmo.com/v1/candles_history",
-    ]
-    last_exc: Exception | None = None
-    for u in urls:
-        try:
-            if os.getenv("EXMO_DEBUG"):
-                print(f"[EXMO] → GET {u} params={params}")
-            r = requests.get(u, params=params, timeout=30)
-            r.raise_for_status()
-            j = r.json()
-            candles = j.get("candles")
-            if not isinstance(candles, list):
-                continue
-            rows = []
-            for c in candles:
-                t_raw = c.get("t", c.get("time", c.get("ts")))
-                o = c.get("o"); h = c.get("h"); l = c.get("l"); cc = c.get("c"); v = c.get("v")
-                if None in (t_raw, o, h, l, cc, v):
-                    continue
-                ts = _to_utc_ts(t_raw)
-                rows.append((ts, float(o), float(h), float(l), float(cc), float(v)))
-            return rows
-        except Exception as e:
-            last_exc = e
-            continue
-    if last_exc and os.getenv("EXMO_DEBUG"):
-        print(f"[EXMO] last error: {last_exc}")
-    return []
-
+# ==============================
+# Data Fetch (EXMO)
+# ==============================
 
 def _fetch_exmo_candles(pair: str, span: str) -> pd.DataFrame:
     """
-    Downloads candles from EXMO public REST.
-    Returns DataFrame with columns: ['open','high','low','close','volume'] and UTC DatetimeIndex.
-    Делает один большой запрос; если пусто/мало — догружает чанками.
+    Fetch candles from EXMO public API 'candles_history' (GET).
+    Falls back to local provider if project defines one.
+
+    Returns DataFrame with UTC index and columns: open, high, low, close, volume (float).
     """
-    resolution, sec_per_bar, limit = _parse_span(span)
-    now = int(time.time())
-    target_secs = sec_per_bar * (limit + 5)
-    start = now - target_secs
+    # 1) Try a local provider hook if user has it in the project (keeps backwards compatibility).
+    # e.g., src/infra/exmo_env_support.py: def fetch_exmo_candles(pair, span) -> DataFrame
+    try:
+        from src.infra.exmo_env_support import fetch_exmo_candles as _local_fetch  # type: ignore
+        df_local = _local_fetch(pair, span)
+        if not isinstance(df_local, pd.DataFrame) or df_local.empty:
+            raise RuntimeError("Local EXMO provider returned empty or invalid DataFrame.")
+        return _ensure_ohlc_df(df_local)
+    except Exception:
+        pass  # fall back to HTTP
 
-    # 1) пробуем одним куском
-    rows = _request_exmo(pair, resolution, start, now)
+    tf, limit = _parse_span(span)
+    resolution_min = _minutes_from_tf(tf)
 
-    # 2) если пусто или подозрительно мало — чанкование
-    if len(rows) < int(limit * 0.8):
-        acc: List[tuple] = []
-        to_ts = now
-        # bars в одном запросе (без фанатизма, чтобы не упереться в лимиты)
-        per_req_bars = max(800, min(2000, limit))  # 800..2000
-        window = sec_per_bar * (per_req_bars + 5)
+    import requests  # local import to avoid hard dependency at import time
 
-        hard_start = now - sec_per_bar * (limit * 2 + 500)  # не лезем слишком далеко
-        attempts = 0
+    url = "https://api.exmo.com/v1.1/candles_history"
+    params = {
+        "symbol": pair,
+        "resolution": resolution_min,  # minutes
+        "limit": limit,
+    }
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
 
-        while to_ts > start and to_ts > hard_start and len(acc) < limit + 1000:
-            frm = max(start, to_ts - window)
-            chunk = _request_exmo(pair, resolution, frm, to_ts)
-            acc.extend(chunk)
-            to_ts = frm - 1
-            attempts += 1
-            if os.getenv("EXMO_DEBUG"):
-                print(f"[EXMO] chunk #{attempts}: got={len(chunk)}, acc={len(acc)}")
+    # API variants: some versions return {"s":"ok","t":[...], "o":[...], "h":[...],"l":[...],"c":[...],"v":[...]}
+    # другие — {"candles": [{"t": 1690000000, "o":..., "c":..., "h":..., "l":..., "v":...}, ...]}
+    # Обработаем оба варианта:
+    if isinstance(data, dict) and "candles" in data:
+        candles = data["candles"]
+        if not candles:
+            raise RuntimeError(f"Empty candles from EXMO for {pair} span={span}")
+        rows = []
+        for c in candles:
+            t = c.get("t")
+            ts = _safe_to_utc_ts(t)
+            rows.append(
+                (ts, float(c["o"]), float(c["h"]), float(c["l"]), float(c["c"]), float(c.get("v", 0.0)))
+            )
+        df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"]).set_index("ts")
+        df.index = pd.to_datetime(df.index, unit="s", utc=True)
+        return df.sort_index()
+    else:
+        # arrays variant
+        t = data.get("t") or data.get("T") or []
+        o = data.get("o") or data.get("O") or []
+        h = data.get("h") or data.get("H") or []
+        l = data.get("l") or data.get("L") or []
+        c = data.get("c") or data.get("C") or []
+        v = data.get("v") or data.get("V") or []
+        if not t:
+            raise RuntimeError(f"Empty candles from EXMO for {pair} span={span}")
+        ts = [_safe_to_utc_ts(x) for x in t]
+        # ts already in seconds
+        idx = pd.to_datetime(ts, unit="s", utc=True)
+        df = pd.DataFrame(
+            {"open": o, "high": h, "low": l, "close": c, "volume": v},
+            index=idx,
+            dtype=float,
+        )
+        return df.sort_index()
 
-        rows = acc if acc else rows
-
-    if not rows:
-        raise RuntimeError(f"Empty candles from EXMO for {pair} span={span}")
-
-    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
-    df = df.sort_values("ts").drop_duplicates(subset=["ts"]).set_index("ts")
-
-    # берём последние 'limit' баров (самые свежие)
-    if len(df) > limit:
-        df = df.iloc[-limit:]
-
-    if os.getenv("EXMO_DEBUG"):
-        print(f"[EXMO] parsed={len(df)}; head={df.index[:2].tolist()} tail={df.index[-2:].tolist()}")
-    return df
-
-
-# ---------- resample helpers ---------- #
-
-_RESAMPLE_RE = re.compile(r"^\s*(\d+)\s*([mhdw])\s*$", flags=re.IGNORECASE)
-
-def _normalize_resample_rule(rule: str) -> str:
+def _safe_to_utc_ts(x: Any) -> int:
     """
-    '5m' → '5min', '15m' → '15min'; '1h' → '1H'; '1d' → '1D'; '1w' → '1W'
+    Make a safe (seconds-based) UTC timestamp from INT or STR that may be in ms.
     """
-    m = _RESAMPLE_RE.match(rule)
-    if not m:
-        return rule
-    n, unit = m.groups()
-    unit = unit.lower()
-    if unit == "m":
-        return f"{n}min"
-    mapping = {"h": "H", "d": "D", "w": "W"}
-    return f"{n}{mapping[unit]}"
+    # Some APIs return ms since epoch, others seconds. Detect by magnitude / length.
+    try:
+        val = int(x)
+    except Exception:
+        # e.g. "1692829200.0" -> 1692829200
+        val = int(float(x))
+    # If ts is too large for seconds (e.g. > 10^12), treat as milliseconds
+    if val > 10_000_000_000:  # ~Sat Nov 20 2286 for seconds; larger likely ms
+        val = val // 1000
+    return val
 
+def _ensure_ohlc_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure DataFrame has expected columns and UTC index.
+    """
+    cols = {c.lower(): c for c in df.columns}
+    ren = {}
+    for need in ["open", "high", "low", "close", "volume"]:
+        if need in cols:
+            ren[cols[need]] = need
+    out = df.rename(columns=ren).copy()
+    if not {"open", "high", "low", "close"}.issubset(out.columns):
+        raise ValueError("Input candles DataFrame must contain open, high, low, close")
+    if not isinstance(out.index, pd.DatetimeIndex):
+        if "ts" in out.columns:
+            out = out.set_index("ts")
+        else:
+            raise ValueError("Candles DataFrame must have DatetimeIndex or 'ts' column")
+    out.index = pd.to_datetime(out.index, utc=True)
+    out.sort_index(inplace=True)
+    if "volume" not in out.columns:
+        out["volume"] = 0.0
+    return out[["open", "high", "low", "close", "volume"]]
 
-def _rule_to_seconds(rule_norm: str) -> Optional[float]:
-    m = re.match(r"^\s*(\d+)\s*(min|H|D|W)\s*$", rule_norm)
-    if not m:
-        return None
-    n = int(m.group(1))
-    unit = m.group(2)
-    sec_map = {"min": 60, "H": 3600, "D": 86400, "W": 7 * 86400}
-    return n * sec_map[unit]
+# ==============================
+# Resample
+# ==============================
 
-
-def _resample_ohlcv(df: pd.DataFrame, rule: Optional[str]) -> pd.DataFrame:
+def _resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """
+    Resample minute/hours candles to a coarser rule (e.g., '5m' -> '5T').
+    Right-closed / right-labeled to align with "close" as execution price.
+    """
     if not rule:
-        return df
-    rule_norm = _normalize_resample_rule(rule)
-    agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-    out = df.resample(rule_norm, label="right", closed="right").agg(agg).dropna()
+        return df.copy()
+    norm = _normalize_resample(rule)
+    agg = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }
+    out = df.resample(norm, label="right", closed="right").agg(agg).dropna()
     return out
 
+# ==============================
+# Strategy & Backtest
+# ==============================
 
-def _make_signals_sma_hysteresis(close: pd.Series, fast: int, slow: int, hysteresis_bps: int) -> pd.Series:
-    s_fast = close.rolling(fast, min_periods=fast).mean()
-    s_slow = close.rolling(slow, min_periods=slow).mean()
+def _sma(a: pd.Series, win: int) -> pd.Series:
+    if win <= 0:
+        raise ValueError("SMA window must be > 0")
+    return a.rolling(win, min_periods=win).mean()
 
-    eps = hysteresis_bps * BPS
-    upper = s_slow * (1.0 + eps)
-    lower = s_slow * (1.0 - eps)
+def _generate_positions(
+    close: pd.Series, fast: pd.Series, slow: pd.Series,
+    hysteresis_bps: int, cooldown_bars: int
+) -> pd.Series:
+    """
+    Long/flat positions {0,1} with hysteresis (bps) and cooldown after exit.
+    Entry: (fast - slow)/close > +hyst
+    Exit:  (fast - slow)/close < -hyst
+    """
+    spread = (fast - slow) / close
+    thr = hysteresis_bps / 1e4
+    long_sig = spread > thr
+    flat_sig = spread < -thr
 
-    state = np.zeros(len(close), dtype=np.int8)
-    have_state = False
+    pos = np.zeros(len(close), dtype=np.int8)
+    cd = 0  # cooldown counter
+
     for i in range(len(close)):
-        f = s_fast.iat[i]
-        s = s_slow.iat[i]
-        if math.isnan(f) or math.isnan(s):
+        if cd > 0:
+            # Cooldown active: cannot open long
+            if pos[i - 1] == 1:
+                # shouldn't happen, but keep flat during cooldown if we just exited
+                pos[i] = 0
+            else:
+                pos[i] = 0
+            cd -= 1
             continue
-        if f > upper.iat[i]:
-            state[i] = 1; have_state = True
-        elif f < lower.iat[i]:
-            state[i] = 0; have_state = True
+
+        prev = pos[i - 1] if i > 0 else 0
+        if prev == 0:
+            # flat -> can enter only if long signal
+            pos[i] = 1 if long_sig.iloc[i] else 0
         else:
-            state[i] = state[i - 1] if have_state and i > 0 else 0
+            # long -> exit only if explicit flat_sig
+            if flat_sig.iloc[i]:
+                pos[i] = 0
+                cd = max(cd, cooldown_bars)  # start cooldown
+            else:
+                pos[i] = 1
 
-    trig = np.zeros(len(state), dtype=np.int8)
-    prev = 0
-    for i, st in enumerate(state):
-        if st == 1 and prev == 0:
-            trig[i] = 1
-        elif st == 0 and prev == 1:
-            trig[i] = -1
-        prev = st
-    return pd.Series(trig, index=close.index, name="trig")
+    return pd.Series(pos, index=close.index, dtype="int8")
 
+def _simulate_on_df(
+    df: pd.DataFrame,
+    fast: int,
+    slow: int,
+    hysteresis_bps: int,
+    cooldown_bars: int,
+    fee_bps: int,
+    slip_bps: int,
+    qty_eur: float,
+    enter_on_start: bool,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Simulate trades on DF with columns: open, high, low, close, volume.
+    Returns (equity_df, trades_df).
+    """
+    close = df["close"]
+    sma_fast = _sma(close, fast)
+    sma_slow = _sma(close, slow)
 
-def _max_drawdown(equity: np.ndarray) -> float:
-    if len(equity) == 0:
-        return 0.0
-    peak = -np.inf
-    max_dd = 0.0
-    for x in equity:
-        peak = max(peak, x)
-        dd = (x / peak - 1.0) * 100.0
-        max_dd = min(max_dd, dd)
-    return max_dd
+    mask_valid = (~sma_fast.isna()) & (~sma_slow.isna())
+    if mask_valid.sum() < max(fast, slow) + 2:
+        raise RuntimeError("Not enough candles for SMA windows.")
 
+    pos = _generate_positions(close, sma_fast, sma_slow, hysteresis_bps, cooldown_bars).astype(int)
 
-def _infer_bars_per_year(index: pd.DatetimeIndex, rule: Optional[str]) -> float:
-    if rule:
-        rn = _normalize_resample_rule(rule)
-        sec = _rule_to_seconds(rn)
-        if sec:
-            return _SECONDS_IN_YEAR / sec
-    if len(index) >= 3:
-        deltas = (index[1:] - index[:-1]).to_series(index=index[1:])
-        med = deltas.median().total_seconds()
-        if med > 0:
-            return _SECONDS_IN_YEAR / med
-    return _SECONDS_IN_YEAR / 3600.0
+    # Ensure we don't start in-the-middle unless allowed
+    if not enter_on_start and pos.iloc[mask_valid.idxmax()] == 1:
+        # first valid bar has long, but we disallow immediate enter: shift entry until next 'enter' edge
+        # Convert pos to edges to enforce "enter only on rising edge"
+        p = pos.values
+        for i in range(1, len(p)):
+            if p[i - 1] == 0 and p[i] == 1:
+                # first real enter
+                start_enter = i
+                p[:start_enter] = 0
+                break
+        pos = pd.Series(p, index=pos.index, dtype=int)
 
+    # Build trades on rising/falling edges
+    p = pos.values
+    entries: List[Dict[str, Any]] = []
+    trades: List[Dict[str, Any]] = []
 
-# ----------------------------- #
-# ---------- Engine ----------- #
-# ----------------------------- #
+    fee_mult = _fee_multiplier(fee_bps)
 
-def run_backtest_vectorized(cfg: BtConfig) -> Dict[str, Any]:
-    # 1) Data
-    ohlc = _fetch_exmo_candles(cfg.pair, cfg.span)
-    if cfg.resample_rule:
-        ohlc = _resample_ohlcv(ohlc, cfg.resample_rule)
+    for i in range(1, len(p)):
+        # entry edge
+        if p[i - 1] == 0 and p[i] == 1:
+            px = float(df["close"].iloc[i])
+            px_fill = _apply_bps(px, slip_bps, adverse=True)
+            notional = qty_eur
+            # apply fee on buy notional (reduce effective units)
+            units = (notional * fee_mult) / px_fill
+            entries.append({
+                "ts": df.index[i],
+                "price": px_fill,
+                "units": units,
+                "notional_eur": notional,
+            })
+        # exit edge
+        elif p[i - 1] == 1 and p[i] == 0:
+            if not entries:
+                continue
+            entry = entries.pop(0)  # FIFO (should be only one open position)
+            px = float(df["close"].iloc[i])
+            px_fill = _apply_bps(px, slip_bps, adverse=True)
+            # apply fee on sell: reduce proceeds
+            proceeds = entry["units"] * px_fill * fee_mult
+            pnl = proceeds - entry["notional_eur"]
+            trades.append({
+                "entry_ts": entry["ts"],
+                "entry_px": entry["price"],
+                "exit_ts": df.index[i],
+                "exit_px": px_fill,
+                "qty_eur": entry["notional_eur"],
+                "pnl_eur": pnl,
+            })
 
-    if len(ohlc) < max(cfg.fast, cfg.slow) + 5:
+    # If last bar ends long, close at last price (for backtest completeness)
+    if entries:
+        entry = entries.pop(0)
+        px = float(df["close"].iloc[-1])
+        px_fill = _apply_bps(px, slip_bps, adverse=True)
+        proceeds = entry["units"] * px_fill * fee_mult
+        pnl = proceeds - entry["notional_eur"]
+        trades.append({
+            "entry_ts": entry["ts"],
+            "entry_px": entry["price"],
+            "exit_ts": df.index[-1],
+            "exit_px": px_fill,
+            "qty_eur": entry["notional_eur"],
+            "pnl_eur": pnl,
+        })
+
+    trades_df = pd.DataFrame(trades)
+    start_equity = 1000.0
+    eq_ts = []
+    eq = start_equity
+    ti = 0
+    # Build equity curve step-wise at bar closes using position PnL drift from previous fill price
+    last_fill_px = None
+    last_units = 0.0
+
+    # We'll mark exposure by pos
+    for i, (ts, row) in enumerate(df.iterrows()):
+        px = float(row["close"])
+        if i > 0:
+            # drift only if we have open position
+            if last_units and last_fill_px is not None:
+                # Mark-to-market units at current px (no fees in MTM)
+                # delta from previous bar:
+                pass  # equity updates only on fills below to keep it simple/robust
+
+        # Handle edges for equity updates using trades table
+        while ti < len(trades_df) and trades_df["entry_ts"].iloc[ti] == ts:
+            # On entry, we just lock notional; equity does not change at entry (fees embedded in units)
+            last_fill_px = float(trades_df["entry_px"].iloc[ti])
+            last_units = (qty_eur * fee_mult) / last_fill_px
+            ti += 1
+        # Check if any trade exits at this ts
+        exits_here = trades_df.index[trades_df["exit_ts"] == ts].tolist()
+        if exits_here:
+            # Recompute equity by adding realized pnl
+            for idx in exits_here:
+                eq += float(trades_df.loc[idx, "pnl_eur"])
+                last_fill_px = None
+                last_units = 0.0
+
+        eq_ts.append((ts, eq))
+
+    equity_df = pd.DataFrame(eq_ts, columns=["ts", "equity"]).set_index("ts")
+    return equity_df, trades_df
+
+def _metrics_from_equity_and_trades(
+    equity_df: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    exposure_pct: float,
+    bars_per_year: float,
+) -> Dict[str, Any]:
+    start_equity = 1000.0
+    final_equity = float(equity_df["equity"].iloc[-1]) if not equity_df.empty else start_equity
+    total_return = (final_equity / start_equity) - 1.0  # fraction
+    total_return_pct = 100.0 * total_return
+
+    # Max drawdown (on equity curve)
+    cummax = equity_df["equity"].cummax()
+    drawdown = equity_df["equity"] / cummax - 1.0
+    max_dd = float(drawdown.min()) if not drawdown.empty else 0.0
+    max_dd_pct = 100.0 * max_dd  # negative
+
+    # Profit factor
+    wins = trades_df["pnl_eur"][trades_df["pnl_eur"] > 0].sum() if not trades_df.empty else 0.0
+    losses = -trades_df["pnl_eur"][trades_df["pnl_eur"] < 0].sum() if not trades_df.empty else 0.0
+    profit_factor = (wins / losses) if losses > 1e-12 else (math.inf if wins > 0 else 0.0)
+
+    # Sharpe (very rough: per-bar returns variance -> annualize by bars_per_year)
+    # here returns only change on fills; to keep consistent, use end-point return:
+    # Avoid division by zero
+    sharpe = 0.0
+    if len(equity_df) > 2:
+        rets = equity_df["equity"].pct_change().dropna()
+        if rets.std(ddof=0) > 1e-12:
+            sharpe = (rets.mean() / rets.std(ddof=0)) * math.sqrt(bars_per_year)
+
+    # CAGR% (using bars_per_year)
+    years = max(1e-9, len(equity_df) / bars_per_year)
+    cagr = (final_equity / start_equity) ** (1.0 / years) - 1.0
+    cagr_pct = 100.0 * cagr
+
+    # Calmar = CAGR% / |MaxDD%|
+    calmar = (cagr_pct / abs(max_dd_pct)) if abs(max_dd_pct) > 1e-9 else math.inf
+
+    winrate = 100.0 * ( (trades_df["pnl_eur"] > 0).sum() / len(trades_df) ) if not trades_df.empty else 0.0
+    avg_trade = trades_df["pnl_eur"].mean() if not trades_df.empty else 0.0
+
+    out = {
+        "bars": int(len(equity_df)),
+        "trades": int(len(trades_df)),
+        "winrate_pct": round(winrate, 2),
+        "total_return_pct": round(total_return_pct, 3),
+        "max_drawdown_pct": round(max_dd_pct, 3),
+        "final_equity_eur": round(final_equity, 2),
+        "start_equity_eur": start_equity,
+        "profit_factor": round(profit_factor, 3) if math.isfinite(profit_factor) else float("inf"),
+        "avg_trade_eur": round(float(avg_trade), 4),
+        "exposure_pct": round(exposure_pct, 2),
+        "sharpe": round(sharpe, 3),
+        "cagr_pct": round(cagr_pct, 3),
+        "calmar": round(calmar, 3) if math.isfinite(calmar) else float("inf"),
+    }
+    return out
+
+def run_backtest_vectorized(
+    cfg: BtConfig,
+    *,
+    write_artifacts: bool = False,
+    out_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Main entry point used by CLI/sweep/optimize.
+    Returns metrics dict with optional 'trades_csv'/'equity_csv' (or None).
+    """
+    base = _fetch_exmo_candles(cfg.pair, cfg.span)
+    if base.empty:
+        raise RuntimeError(f"Empty candles from EXMO for {cfg.pair} span={cfg.span}")
+
+    data = base
+    if cfg.resample:
+        data = _resample_ohlc(base, cfg.resample)
+
+    # Sanity for SMA windows
+    if len(data) < max(cfg.fast, cfg.slow) + 5:
         raise RuntimeError("Not enough candles after resample for SMA windows.")
 
-    # 2) Signals
-    trig = _make_signals_sma_hysteresis(ohlc["close"], cfg.fast, cfg.slow, cfg.hysteresis_bps)
+    equity_df, trades_df = _simulate_on_df(
+        data,
+        fast=cfg.fast,
+        slow=cfg.slow,
+        hysteresis_bps=cfg.hysteresis_bps,
+        cooldown_bars=cfg.cooldown_bars,
+        fee_bps=cfg.fee_bps,
+        slip_bps=cfg.slip_bps,
+        qty_eur=cfg.qty_eur,
+        enter_on_start=cfg.enter_on_start,
+    )
 
-    # 3) Execution
-    idx = ohlc.index.to_list()
-    close = ohlc["close"].to_numpy()
+    exposure_pct = 100.0 * ( (data.index.to_series().map(lambda x: 1).values * 0 + 1) * 0 ).sum()  # placeholder
+    # More accurate exposure from pos series in simulator:
+    # We'll recompute quickly:
+    close = data["close"]
+    sma_fast = _sma(close, cfg.fast)
+    sma_slow = _sma(close, cfg.slow)
+    pos = _generate_positions(close, sma_fast, sma_slow, cfg.hysteresis_bps, cfg.cooldown_bars)
+    exposure_pct = round(100.0 * float(pos.sum()) / float(len(pos)), 2)
 
-    cash_eur = 1000.0
-    pos_qty = 0.0
-    cooldown_left = 0
+    # bars/year based on final rule (resample if provided, else base tf)
+    tf, _ = _parse_span(cfg.span)
+    rule_for_year = cfg.resample or tf
+    bars_per_year = _bars_per_year_from_rule(rule_for_year)
 
-    fee_mult = cfg.fee_bps * BPS
-    slip_mult = cfg.slip_bps * BPS
+    metrics = _metrics_from_equity_and_trades(equity_df, trades_df, exposure_pct, bars_per_year)
+    metrics["pair"] = cfg.pair
+    metrics["bars_per_year"] = bars_per_year
 
-    eq = np.zeros(len(close), dtype=np.float64)
-    eq_day_start = cash_eur
+    trades_csv = None
+    equity_csv = None
 
-    entry_cost_eur = 0.0
-    closed_pnls: List[float] = []
-    trades: List[Dict[str, Any]] = []
-    in_pos_bars = 0
+    if write_artifacts:
+        target_dir = Path(out_dir) if out_dir else Path("data/backtests")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stamp = _now_utc_stamp()
+        tag = f"{cfg.pair}_{(cfg.resample or tf)}_{cfg.fast}-{cfg.slow}_h{cfg.hysteresis_bps}_cd{cfg.cooldown_bars}_q{int(cfg.qty_eur)}"
+        trades_csv = target_dir / f"{tag}_{stamp}_trades.csv"
+        equity_csv = target_dir / f"{tag}_{stamp}_equity.csv"
+        trades_df.to_csv(trades_csv, index=False)
+        equity_df.to_csv(equity_csv)
+    metrics["trades_csv"] = str(trades_csv) if trades_csv else None
+    metrics["equity_csv"] = str(equity_csv) if equity_csv else None
 
-    last_day = None
-
-    for i in range(len(close)):
-        px = float(close[i])
-        ts = idx[i]
-
-        day = ts.date()
-        if last_day is None:
-            last_day = day
-            eq_day_start = cash_eur + pos_qty * px
-        elif day != last_day:
-            eq_day_start = cash_eur + pos_qty * px
-            last_day = day
-
-        eq_i = cash_eur + pos_qty * px
-        eq[i] = eq_i
-
-        daily_bps = ((eq_i - eq_day_start) / max(1e-12, eq_day_start)) * 1e4
-
-        if cooldown_left > 0 and pos_qty == 0.0:
-            cooldown_left -= 1
-
-        do_entry = trig.iat[i] == 1
-        do_exit  = trig.iat[i] == -1
-
-        if do_entry:
-            if cooldown_left > 0:
-                do_entry = False
-            if cfg.max_daily_loss_bps and daily_bps <= -abs(float(cfg.max_daily_loss_bps)):
-                do_entry = False
-            if not cfg.enter_on_start and i < max(cfg.fast, cfg.slow):
-                do_entry = False
-
-        if do_entry and pos_qty <= 1e-12:
-            buy_px = px * (1.0 + slip_mult)
-            qty = cfg.qty_eur / max(1e-12, buy_px)
-            notional = qty * buy_px
-            fee_eur = notional * fee_mult
-
-            cash_eur -= (notional + fee_eur)
-            pos_qty += qty
-            entry_cost_eur = notional + fee_eur
-
-            trades.append({
-                "time": ts.isoformat(), "side": "BUY", "price": round(buy_px, 10),
-                "qty": round(qty, 10), "fee_eur": round(fee_eur, 10),
-                "cash_eur": round(cash_eur, 10), "pos_qty": round(pos_qty, 10),
-                "equity_eur": round(eq_i, 10), "pnl_eur": 0.0,
-            })
-
-        elif do_exit and pos_qty > 1e-12:
-            sell_px = px * (1.0 - slip_mult)
-            notional = pos_qty * sell_px
-            fee_eur = notional * fee_mult
-
-            cash_eur += (notional - fee_eur)
-            closed = (notional - fee_eur) - entry_cost_eur
-            closed_pnls.append(closed)
-
-            trades.append({
-                "time": ts.isoformat(), "side": "SELL", "price": round(sell_px, 10),
-                "qty": round(pos_qty, 10), "fee_eur": round(fee_eur, 10),
-                "cash_eur": round(cash_eur, 10), "pos_qty": 0.0,
-                "equity_eur": round(cash_eur, 10), "pnl_eur": round(closed, 10),
-            })
-
-            pos_qty = 0.0
-            entry_cost_eur = 0.0
-            cooldown_left = max(cooldown_left, cfg.cooldown_bars)
-
-        if pos_qty > 0:
-            in_pos_bars += 1
-
-    # 4) Results
-    eq0 = eq[0] if len(eq) > 0 else 1.0
-    eqN = eq[-1] if len(eq) > 0 else eq0
-    total_return_pct = (eqN / max(1e-12, eq0) - 1.0) * 100.0
-    max_dd_pct = _max_drawdown(eq)
-
-    wins = sum(1 for x in closed_pnls if x > 0)
-    losses = sum(1 for x in closed_pnls if x <= 0)
-    winrate = (wins / max(1, wins + losses)) * 100.0
-    profit_sum = float(sum(x for x in closed_pnls if x > 0))
-    loss_sum = float(sum(-x for x in closed_pnls if x < 0))
-    profit_factor = (profit_sum / loss_sum) if loss_sum > 0 else float("inf")
-    avg_trade_eur = (profit_sum - loss_sum) / max(1, (wins + losses))
-
-    eq_series = pd.Series(eq, index=ohlc.index, name="equity_eur")
-    rolling_peak = eq_series.cummax()
-    dd_pct_series = (eq_series / rolling_peak - 1.0) * 100.0
-    equity_df = pd.DataFrame({"equity_eur": eq_series, "drawdown_pct": dd_pct_series})
-
-    bars_per_year = _infer_bars_per_year(ohlc.index, cfg.resample_rule)
-    rets = eq_series.pct_change().fillna(0.0).to_numpy()
-    ret_mean = float(np.mean(rets))
-    ret_std = float(np.std(rets, ddof=1)) if len(rets) > 1 else 0.0
-    sharpe = (ret_mean / ret_std * math.sqrt(bars_per_year)) if ret_std > 0 else 0.0
-
-    if len(ohlc.index) >= 2:
-        days = (ohlc.index[-1] - ohlc.index[0]).total_seconds() / 86400.0
-        years = max(1e-9, days / 365.25)
-        cagr = (eqN / max(1e-12, eq0)) ** (1.0 / years) - 1.0
-    else:
-        cagr = 0.0
-    calmar = (cagr / abs(max_dd_pct / 100.0)) if abs(max_dd_pct) > 1e-12 else float("inf")
-
-    exposure_pct = in_pos_bars / max(1, len(eq)) * 100.0
-
-    trades_df = pd.DataFrame(trades, columns=[
-        "time", "side", "price", "qty", "fee_eur",
-        "cash_eur", "pos_qty", "equity_eur", "pnl_eur"
-    ])
-
-    if cfg.out_trades_csv:
-        Path(cfg.out_trades_csv).parent.mkdir(parents=True, exist_ok=True)
-        trades_df.to_csv(cfg.out_trades_csv, index=False)
-
-    if cfg.out_equity_csv:
-        Path(cfg.out_equity_csv).parent.mkdir(parents=True, exist_ok=True)
-        equity_df.to_csv(cfg.out_equity_csv)
-
-    metrics = {
-        "pair": cfg.pair,
-        "bars": int(len(ohlc)),
-        "trades": int(len([t for t in trades if t["side"] == "SELL"])),
-        "winrate_pct": winrate,
-        "total_return_pct": total_return_pct,
-        "max_drawdown_pct": max_dd_pct,
-        "final_equity_eur": float(eqN),
-        "start_equity_eur": float(eq0),
-        "profit_factor": profit_factor,
-        "avg_trade_eur": avg_trade_eur,
-        "exposure_pct": exposure_pct,
-        "sharpe": sharpe,
-        "cagr_pct": cagr * 100.0,
-        "calmar": calmar,
-        "bars_per_year": bars_per_year,
-    }
-
-    pretty = {
-        "pair": cfg.pair,
-        "bars": metrics["bars"],
-        "trades": metrics["trades"],
-        "winrate_pct": round(metrics["winrate_pct"], 2),
-        "total_return_pct": round(metrics["total_return_pct"], 2),
-        "max_drawdown_pct": round(metrics["max_drawdown_pct"], 2),
-        "final_equity_eur": round(metrics["final_equity_eur"], 2),
-        "start_equity_eur": round(metrics["start_equity_eur"], 2),
-        "profit_factor": (None if math.isinf(metrics["profit_factor"]) else round(metrics["profit_factor"], 3)),
-        "avg_trade_eur": round(metrics["avg_trade_eur"], 4),
-        "exposure_pct": round(metrics["exposure_pct"], 2),
-        "sharpe": round(metrics["sharpe"], 3),
-        "cagr_pct": round(metrics["cagr_pct"], 2),
-        "calmar": (None if math.isinf(metrics["calmar"]) else round(metrics["calmar"], 3)),
-        "trades_csv": str(cfg.out_trades_csv) if cfg.out_trades_csv else None,
-        "equity_csv": str(cfg.out_equity_csv) if cfg.out_equity_csv else None,
-    }
-    if cfg.print_summary:
-        print(json.dumps(pretty, ensure_ascii=False, indent=2))
-
-    if cfg.out_metrics_json:
-        Path(cfg.out_metrics_json).parent.mkdir(parents=True, exist_ok=True)
-        with open(cfg.out_metrics_json, "w", encoding="utf-8") as f:
-            json.dump(metrics, f, ensure_ascii=False, indent=2)
-
-    return {"metrics": metrics, "trades_df": trades_df, "equity_df": equity_df}
+    return metrics

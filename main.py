@@ -1,230 +1,275 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
 import json
-import sys
+from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List
+from typing import Optional
 
-# Backtest/Sweep/WF/Robustness/Optimize
+# backtest / sweep / robustness / walk-forward / optimize
 from src.backtest.vectorized_bt import BtConfig, run_backtest_vectorized
-from src.backtest.sweep import SweepCfg, run_sweep
-from src.backtest.walkforward import WFConfig, run_walkforward
+from src.backtest.sweep import SweepCfg, run_sweep, parse_int_list, parse_float_list
 from src.backtest.robustness import compute_stability
+from src.backtest.walkforward import WFConfig, run_walkforward
 from src.backtest.optimize import run_optimize
 
 
-def _parse_range_list(s: str) -> List[int]:
-    """
-    Accepts:
-      '5:20:5' -> [5,10,15,20]
-      '1,3,7'  -> [1,3,7]
-    """
-    s = s.strip()
-    if ":" in s:
-        parts = s.split(":")
-        if len(parts) != 3:
-            raise argparse.ArgumentTypeError(f"Bad range '{s}', expected start:stop:step")
-        start, stop, step = map(int, parts)
-        if step == 0:
-            raise argparse.ArgumentTypeError("Step cannot be 0")
-        return list(range(start, stop + (1 if step > 0 else -1), step))
-    return [int(x) for x in s.split(",") if x != ""]
+def _p(path_like: Optional[str]) -> Optional[Path]:
+    if path_like is None:
+        return None
+    if isinstance(path_like, Path):
+        return path_like
+    return Path(str(path_like))
 
 
-def _parse_float_list(s: str) -> List[float]:
-    return [float(x) for x in s.split(",") if x != ""]
+# ---------- subcommands ----------
 
-
-def run_backtest_cmd(args: argparse.Namespace) -> None:
+def cmd_backtest(args: argparse.Namespace) -> None:
     cfg = BtConfig(
-        pair=args.exmo_pair, span=args.exmo_candles,
-        fast=args.fast, slow=args.slow,
-        hysteresis_bps=args.hysteresis_bps,
-        cooldown_bars=args.cooldown_bars,
-        enter_on_start=args.enter_on_start,
-        fee_bps=args.fee_bps, slip_bps=args.slip_bps,
-        qty_eur=args.qty_eur,
-        max_daily_loss_bps=args.max_daily_loss_bps,
-        resample=args.resample,
-        out_dir=args.out_dir,
+        pair=str(args.exmo_pair),
+        span=str(args.exmo_candles),
+        resample=str(args.resample) if args.resample else "",
+        fast=int(args.fast),
+        slow=int(args.slow),
+        hysteresis_bps=int(args.hysteresis_bps or 0),
+        cooldown_bars=int(args.cooldown_bars or 0),
+        enter_on_start=bool(args.enter_on_start),
+        fee_bps=int(args.fee_bps or 0),
+        slip_bps=int(args.slip_bps or 0),
+        qty_eur=float(args.qty_eur or 0.0),
+        max_daily_loss_bps=int(args.max_daily_loss_bps or 0),
+        out_dir=_p(args.out_dir),
     )
     metrics = run_backtest_vectorized(cfg)
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
 
-def run_sweep_cmd(args: argparse.Namespace) -> None:
-    cfg = SweepCfg(
-        pair=args.exmo_pair, span=args.exmo_candles, resample=args.resample,
-        fast_list=args.fast_list, slow_list=args.slow_list,
-        hyst_list=args.hyst_list, cooldown_list=args.cooldown_list,
-        qty_list=args.qty_list,
-        fee_bps=args.fee_bps, slip_bps=args.slip_bps,
-        sort_by=args.sort_by, top_n=args.top_n,
-        out_dir=Path(args.out_dir) if args.out_dir else Path("data/sweep"),
-        write_artifacts=False,  # avoid per-run CSV spam
-        verbose=args.verbose,
+def cmd_sweep(args: argparse.Namespace) -> None:
+    scfg = SweepCfg(
+        pair=str(args.exmo_pair),
+        span=str(args.exmo_candles),
+        resample=str(args.resample) if args.resample else "",
+        fast_list=parse_int_list(args.fast_list),
+        slow_list=parse_int_list(args.slow_list),
+        hyst_list=parse_int_list(args.hyst_list),
+        cooldown_list=parse_int_list(args.cooldown_list),
+        qty_list=parse_float_list(args.qty_list),
+        fee_bps=int(args.fee_bps or 0),
+        slip_bps=int(args.slip_bps or 0),
+        sort_by=str(args.sort_by or "calmar"),
+        top_n=int(args.top_n or 20),
+        out_dir=_p(args.out_dir) or Path("data/sweep"),
+        verbose=bool(args.verbose),
     )
-    path = run_sweep(cfg)
+    path = run_sweep(scfg)
     print(f"\nSweep saved to: {path}")
 
 
-def run_wf_cmd(args: argparse.Namespace) -> None:
-    cfg = WFConfig(
-        pair=args.exmo_pair, span=args.exmo_candles, resample=args.resample,
-        fast=args.fast, slow=args.slow,
-        hysteresis_bps=args.hysteresis_bps,
-        cooldown_bars=args.cooldown_bars,
-        fee_bps=args.fee_bps, slip_bps=args.slip_bps,
-        qty_eur=args.qty_eur,
-        max_daily_loss_bps=args.max_daily_loss_bps,
-        folds=args.folds, min_train_bars=args.min_train_bars, min_valid_bars=args.min_valid_bars,
-        out_dir=Path(args.out_dir) if args.out_dir else None,
+def cmd_walk_forward(args: argparse.Namespace) -> None:
+    wcfg = WFConfig(
+        pair=str(args.exmo_pair),
+        span=str(args.exmo_candles),
+        resample=str(args.resample) if args.resample else "",
+        fast=int(args.fast),
+        slow=int(args.slow),
+        hysteresis_bps=int(args.hysteresis_bps or 0),
+        cooldown_bars=int(args.cooldown_bars or 0),
+        fee_bps=int(args.fee_bps or 0),
+        slip_bps=int(args.slip_bps or 0),
+        qty_eur=float(args.qty_eur or 0.0),
+        max_daily_loss_bps=int(args.max_daily_loss_bps or 0),
+        folds=int(args.folds or 4),
+        min_train_bars=int(args.min_train_bars or 150),
+        min_valid_bars=int(args.min_valid_bars or 100),
+        out_dir=_p(args.out_dir) or Path("data/walkforward"),
     )
-    out = run_walkforward(cfg)
+    summary = run_walkforward(wcfg)
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+def cmd_robustness(args: argparse.Namespace) -> None:
+    # поддержка glob
+    resolved: list[Path] = []
+    for patt in str(args.sweep_csv).split(","):
+        resolved += list(Path().glob(patt.strip()))
+    if not resolved:
+        raise FileNotFoundError(f"No sweep csv matched pattern: {args.sweep_csv}")
+
+    # возьмём самый свежий по mtime
+    resolved.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    csv_path = resolved[0]
+
+    ranked = compute_stability(
+        csv_path=csv_path,
+        min_trades=int(args.min_trades or 0),
+        metric=str(args.metric or "calmar"),
+        d_fast=int(args.d_fast or 1),
+        d_slow=int(args.d_slow or 1),
+        d_hyst=int(args.d_hyst or 1),
+        d_cd=int(args.d_cd or 1),
+    )
+
+    out_csv = _p(args.out_csv) or csv_path.with_name("sweep_ranked.csv")
+    ranked.to_csv(out_csv, index=False)
+    print(f"\nSaved ranked table to: {out_csv}")
+
+
+def cmd_optimize(args: argparse.Namespace) -> None:
+    out = run_optimize(
+        pair=str(args.exmo_pair),
+        span=str(args.exmo_candles),
+        resample=str(args.resample) if args.resample else "",
+        fast_list=parse_int_list(args.fast_list),
+        slow_list=parse_int_list(args.slow_list),
+        hyst_list=parse_int_list(args.hyst_list),
+        cooldown_list=parse_int_list(args.cooldown_list),
+        qty_list=parse_float_list(args.qty_list),
+        fee_bps=int(args.fee_bps or 0),
+        slip_bps=int(args.slip_bps or 0),
+        max_daily_loss_bps=int(args.max_daily_loss_bps or 0),
+        metric=str(args.metric or "calmar"),
+        min_trades=int(args.min_trades or 0),
+        d_fast=int(args.d_fast or 1),
+        d_slow=int(args.d_slow or 1),
+        d_hyst=int(args.d_hyst or 1),
+        d_cd=int(args.d_cd or 1),
+        wf_top_n=int(args.wf_top_n or 5),
+        folds=int(args.folds or 4),
+        min_train_bars=int(args.min_train_bars or 150),
+        min_valid_bars=int(args.min_valid_bars or 100),
+        wf_min_pf=float(args.wf_min_pf or 0.0),
+        wf_min_return=float(args.wf_min_return or 0.0),
+        wf_max_dd=float(args.wf_max_dd or 1.0),
+        wf_min_winrate=float(args.wf_min_winrate or 0.0) if args.wf_min_winrate is not None else None,
+        wf_min_sharpe=float(args.wf_min_sharpe or 0.0) if args.wf_min_sharpe is not None else None,
+        wf_min_cagr=float(args.wf_min_cagr or 0.0) if args.wf_min_cagr is not None else None,
+        wf_min_calmar=float(args.wf_min_calmar or 0.0) if args.wf_min_calmar is not None else None,
+        wf_min_folds=int(args.wf_min_folds or 0),
+        wf_min_trades=int(args.wf_min_trades or 0),
+        wf_max_exposure=float(args.wf_max_exposure or 1.0),
+        rank_by=str(args.rank_by or "oos_total_return_pct_mean"),
+        final_backtest=bool(args.final_backtest),
+        out_dir=_p(args.out_dir) or Path("data/optimize"),
+        report_html=_p(args.report_html) if args.report_html else None,
+    )
+    # печатаем финальный JSON (словарь)
     print(json.dumps(out, ensure_ascii=False, indent=2))
 
 
-def run_robustness_cmd(args: argparse.Namespace) -> None:
-    ranked = compute_stability(
-        csv_path=Path(args.sweep_csv),
-        min_trades=int(args.min_trades),
-        metric=str(args.metric),
-        d_fast=int(args.d_fast), d_slow=int(args.d_slow), d_hyst=int(args.d_hyst), d_cd=int(args.d_cd),
+# ---------- CLI ----------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="tradinng-bot",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    out = Path(args.out_csv) if args.out_csv else Path("data/sweep/sweep_ranked.csv")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    ranked.to_csv(out, index=False)
-    print(ranked.head(20).to_string(index=False))
-    print(f"\nSaved ranked table to: {out}")
+    sub = p.add_subparsers(dest="command", required=True)
 
+    # common
+    def add_common(sp: argparse.ArgumentParser):
+        sp.add_argument("--exmo-pair", dest="exmo_pair", default="DOGE_EUR")
+        sp.add_argument("--exmo-candles", dest="exmo_candles", default="1m:2000")
+        sp.add_argument("--resample", default="5m")
+        sp.add_argument("--fee-bps", type=int, default=10)
+        sp.add_argument("--slip-bps", type=int, default=2)
+        sp.add_argument("--max-daily-loss-bps", type=int, default=0)
+        sp.add_argument("--out-dir", default=None)
 
-def run_optimize_cmd(args: argparse.Namespace) -> None:
-    result = run_optimize(
-        pair=str(args.exmo_pair), span=str(args.exmo_candles), resample=str(args.resample),
-        fast_list=list(args.fast_list), slow_list=list(args.slow_list),
-        hyst_list=list(args.hyst_list), cooldown_list=list(args.cooldown_list),
-        qty_list=list(args.qty_list),
-        fee_bps=int(args.fee_bps), slip_bps=int(args.slip_bps), max_daily_loss_bps=int(args.max_daily_loss_bps),
-        metric=str(args.metric), min_trades=int(args.min_trades),
-        d_fast=int(args.d_fast), d_slow=int(args.d_slow), d_hyst=int(args.d_hyst), d_cd=int(args.d_cd),
-        wf_top_n=int(args.wf_top_n), folds=int(args.folds),
-        min_train_bars=int(args.min_train_bars), min_valid_bars=int(args.min_valid_bars),
-        wf_min_pf=float(args.wf_min_pf), wf_min_return=float(args.wf_min_return), wf_max_dd=float(args.wf_max_dd),
-        wf_min_winrate=float(args.wf_min_winrate), wf_min_sharpe=float(args.wf_min_sharpe),
-        wf_min_cagr=float(args.wf_min_cagr), wf_min_calmar=float(args.wf_min_calmar),
-        wf_min_folds=int(args.wf_min_folds), wf_min_trades=int(args.wf_min_trades),
-        wf_max_exposure=float(args.wf_max_exposure),
-        rank_by=str(args.rank_by), final_backtest=bool(args.final_backtest),
-        out_dir=Path(args.out_dir) if args.out_dir else None,
-        report_html=(Path(args.report_html) if args.report_html else None),
-    )
-    # expose summary again as JSON for piping
-    print()
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    # backtest
+    sp_b = sub.add_parser("backtest")
+    add_common(sp_b)
+    sp_b.add_argument("--vectorized", action="store_true")
+    sp_b.add_argument("--fast", type=int, default=15)
+    sp_b.add_argument("--slow", type=int, default=25)
+    sp_b.add_argument("--hysteresis-bps", type=int, default=0)
+    sp_b.add_argument("--cooldown-bars", type=int, default=0)
+    sp_b.add_argument("--enter-on-start", action="store_true")
+    sp_b.add_argument("--qty-eur", type=float, default=100.0)
+    sp_b.set_defaults(func=cmd_backtest)
 
+    # sweep
+    sp_s = sub.add_parser("sweep")
+    add_common(sp_s)
+    sp_s.add_argument("--fast-list", default="5:20:5")
+    sp_s.add_argument("--slow-list", default="20:40:5")
+    sp_s.add_argument("--hyst-list", default="0,5,10,15")
+    sp_s.add_argument("--cooldown-list", default="0,3,5")
+    sp_s.add_argument("--qty-list", default="50,100")
+    sp_s.add_argument("--sort-by", default="calmar")
+    sp_s.add_argument("--top-n", type=int, default=20)
+    sp_s.add_argument("--verbose", action="store_true")
+    sp_s.set_defaults(func=cmd_sweep)
 
-def _add_shared_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--exmo-pair", dest="exmo_pair", default="DOGE_EUR")
-    p.add_argument("--exmo-candles", dest="exmo_candles", default="1m:2000")
-    p.add_argument("--resample", default="5m")
-    p.add_argument("--fast", type=int, default=15)
-    p.add_argument("--slow", type=int, default=25)
-    p.add_argument("--hysteresis-bps", type=int, default=0)
-    p.add_argument("--cooldown-bars", type=int, default=5)
-    p.add_argument("--enter-on-start", action="store_true", default=False)
-    p.add_argument("--fee-bps", type=int, default=10)
-    p.add_argument("--slip-bps", type=int, default=2)
-    p.add_argument("--qty-eur", type=float, default=100.0)
-    p.add_argument("--max-daily-loss-bps", type=int, default=0)
-    p.add_argument("--out-dir", default=None)
-    p.add_argument("--json-metrics", default=None)
+    # walk-forward
+    sp_wf = sub.add_parser("walk-forward")
+    add_common(sp_wf)
+    sp_wf.add_argument("--fast", type=int, default=15)
+    sp_wf.add_argument("--slow", type=int, default=25)
+    sp_wf.add_argument("--hysteresis-bps", type=int, default=0)
+    sp_wf.add_argument("--cooldown-bars", type=int, default=0)
+    sp_wf.add_argument("--qty-eur", type=float, default=100.0)
+    sp_wf.add_argument("--folds", type=int, default=4)
+    sp_wf.add_argument("--min-train-bars", type=int, default=150)
+    sp_wf.add_argument("--min-valid-bars", type=int, default=100)
+    sp_wf.set_defaults(func=cmd_walk_forward)
+
+    # robustness
+    sp_r = sub.add_parser("robustness")
+    add_common(sp_r)
+    sp_r.add_argument("--sweep-csv", required=True)
+    sp_r.add_argument("--metric", default="calmar")
+    sp_r.add_argument("--min-trades", type=int, default=4)
+    sp_r.add_argument("--d-fast", type=int, default=2)
+    sp_r.add_argument("--d-slow", type=int, default=5)
+    sp_r.add_argument("--d-hyst", type=int, default=5)
+    sp_r.add_argument("--d-cd", type=int, default=2)
+    sp_r.add_argument("--out-csv", default="data/sweep/sweep_ranked.csv")
+    sp_r.set_defaults(func=cmd_robustness)
+
+    # optimize
+    sp_o = sub.add_parser("optimize")
+    add_common(sp_o)
+    sp_o.add_argument("--fast-list", default="5:20:5")
+    sp_o.add_argument("--slow-list", default="20:40:5")
+    sp_o.add_argument("--hyst-list", default="0,5,10,15")
+    sp_o.add_argument("--cooldown-list", default="0,3,5")
+    sp_o.add_argument("--qty-list", default="50,100")
+    sp_o.add_argument("--metric", default="calmar")
+    sp_o.add_argument("--min-trades", type=int, default=4)
+    sp_o.add_argument("--d-fast", type=int, default=2)
+    sp_o.add_argument("--d-slow", type=int, default=5)
+    sp_o.add_argument("--d-hyst", type=int, default=5)
+    sp_o.add_argument("--d-cd", type=int, default=2)
+    sp_o.add_argument("--wf-top-n", type=int, default=5)
+    sp_o.add_argument("--folds", type=int, default=4)
+    sp_o.add_argument("--min-train-bars", type=int, default=150)
+    sp_o.add_argument("--min-valid-bars", type=int, default=100)
+    sp_o.add_argument("--wf-min-pf", type=float, default=1.0)
+    sp_o.add_argument("--wf-min-return", type=float, default=0.0)
+    sp_o.add_argument("--wf-max-dd", type=float, default=0.35)
+    sp_o.add_argument("--wf-min-winrate", type=float, default=None)
+    sp_o.add_argument("--wf-min-sharpe", type=float, default=None)
+    sp_o.add_argument("--wf-min-cagr", type=float, default=None)
+    sp_o.add_argument("--wf-min-calmar", type=float, default=None)
+    sp_o.add_argument("--wf-min-folds", type=int, default=3)
+    sp_o.add_argument("--wf-min-trades", type=int, default=0)
+    sp_o.add_argument("--wf-max-exposure", type=float, default=1.0)
+    sp_o.add_argument("--rank-by",
+                      choices=["oos_profit_factor_mean", "oos_total_return_pct_mean", "oos_calmar_mean",
+                               "oos_sharpe_mean", "oos_cagr_pct_mean"],
+                      default="oos_total_return_pct_mean")
+    sp_o.add_argument("--final-backtest", action="store_true")
+    sp_o.add_argument("--report-html", default=None)
+    sp_o.set_defaults(func=cmd_optimize)
+
+    return p
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(prog="tradinng-bot")
-    sub = ap.add_subparsers(required=True, dest="command")
-
-    # backtest
-    p_bt = sub.add_parser("backtest")
-    _add_shared_args(p_bt)
-    p_bt.set_defaults(func=run_backtest_cmd)
-
-    # sweep
-    p_sw = sub.add_parser("sweep")
-    _add_shared_args(p_sw)
-    p_sw.add_argument("--fast-list", type=_parse_range_list, required=True)
-    p_sw.add_argument("--slow-list", type=_parse_range_list, required=True)
-    p_sw.add_argument("--hyst-list", type=_parse_range_list, required=True)
-    p_sw.add_argument("--cooldown-list", type=_parse_range_list, required=True)
-    p_sw.add_argument("--qty-list", type=_parse_float_list, required=True)
-    p_sw.add_argument("--sort-by", default="calmar")
-    p_sw.add_argument("--top-n", type=int, default=0)
-    p_sw.add_argument("--verbose", action="store_true", default=False)
-    p_sw.set_defaults(func=run_sweep_cmd)
-
-    # walk-forward
-    p_wf = sub.add_parser("walk-forward")
-    _add_shared_args(p_wf)
-    p_wf.add_argument("--folds", type=int, default=4)
-    p_wf.add_argument("--min-train-bars", type=int, default=150)
-    p_wf.add_argument("--min-valid-bars", type=int, default=100)
-    p_wf.set_defaults(func=run_wf_cmd)
-
-    # robustness
-    p_rb = sub.add_parser("robustness")
-    p_rb.add_argument("--sweep-csv", required=True)
-    p_rb.add_argument("--metric", default="calmar")
-    p_rb.add_argument("--min-trades", type=int, default=0)
-    p_rb.add_argument("--d-fast", type=int, default=1)
-    p_rb.add_argument("--d-slow", type=int, default=1)
-    p_rb.add_argument("--d-hyst", type=int, default=1)
-    p_rb.add_argument("--d-cd", type=int, default=1)
-    p_rb.add_argument("--out-csv", default="data/sweep/sweep_ranked.csv")
-    p_rb.set_defaults(func=run_robustness_cmd)
-
-    # optimize
-    p_opt = sub.add_parser("optimize")
-    _add_shared_args(p_opt)
-    p_opt.add_argument("--fast-list", type=_parse_range_list, required=True)
-    p_opt.add_argument("--slow-list", type=_parse_range_list, required=True)
-    p_opt.add_argument("--hyst-list", type=_parse_range_list, required=True)
-    p_opt.add_argument("--cooldown-list", type=_parse_range_list, required=True)
-    p_opt.add_argument("--qty-list", type=_parse_float_list, required=True)
-
-    p_opt.add_argument("--metric", default="calmar")
-    p_opt.add_argument("--min-trades", type=int, default=0)
-    p_opt.add_argument("--d-fast", type=int, default=1)
-    p_opt.add_argument("--d-slow", type=int, default=1)
-    p_opt.add_argument("--d-hyst", type=int, default=1)
-    p_opt.add_argument("--d-cd", type=int, default=1)
-
-    p_opt.add_argument("--wf-top-n", type=int, default=10)
-    p_opt.add_argument("--folds", type=int, default=4)
-    p_opt.add_argument("--min-train-bars", type=int, default=150)
-    p_opt.add_argument("--min-valid-bars", type=int, default=100)
-
-    # WF filters
-    p_opt.add_argument("--wf-min-pf", type=float, default=0.0)
-    p_opt.add_argument("--wf-min-return", type=float, default=0.0)
-    p_opt.add_argument("--wf-max-dd", type=float, default=1.0)
-    p_opt.add_argument("--wf-min-winrate", type=float, default=0.0)
-    p_opt.add_argument("--wf-min-sharpe", type=float, default=-999.0)
-    p_opt.add_argument("--wf-min-cagr", type=float, default=-999.0)
-    p_opt.add_argument("--wf-min-calmar", type=float, default=-999.0)
-    p_opt.add_argument("--wf-min-folds", type=int, default=1)
-    p_opt.add_argument("--wf-min-trades", type=int, default=0)
-    p_opt.add_argument("--wf-max-exposure", type=float, default=1.0)
-
-    p_opt.add_argument("--rank-by",
-                       choices=["oos_profit_factor_mean", "oos_total_return_pct_mean", "oos_calmar_mean",
-                                "oos_sharpe_mean", "oos_cagr_pct_mean"],
-                       default="oos_total_return_pct_mean")
-    p_opt.add_argument("--final-backtest", action="store_true", default=False)
-    p_opt.add_argument("--report-html", default=None)
-    p_opt.set_defaults(func=run_optimize_cmd)
-
-    args = ap.parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
     args.func(args)
 
 
