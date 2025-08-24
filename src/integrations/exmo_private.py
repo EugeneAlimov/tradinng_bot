@@ -1,222 +1,172 @@
-# -*- coding: utf-8 -*-
+# src/integrations/exmo_private.py
 from __future__ import annotations
-import hashlib
-import hmac
+
 import os
 import time
+import hmac
+import hashlib
 import urllib.parse
-from typing import Any, Dict, Optional, Union, List
+import logging
+from typing import Any, Dict, Optional
 
 import requests
 
+from src.infrastructure.exchange.nonce_manager import ThreadSafeNonceManager
+from src.infrastructure.exchange.order_manager import OrderIDGenerator  # для резервной генерации client_id (если не задан)
 
-Number = Union[int, float, str]
+logger = logging.getLogger(__name__)
 
 
 class ExmoPrivate:
     """
-    Мини-клиент приватного REST API EXMO v1.1.
-    Авторизация: заголовки Key/Sign, подпись HMAC-SHA512 по urlencoded(body), параметр nonce.
-    База: https://api.exmo.com/v1.1/{method}
+    Минимальная приватная интеграция c EXMO v1.1 с:
+      - thread/process-safe nonce
+      - безопасной генерацией client_id (если не задан)
+      - без вывода ключей в логи
 
-    Поддержано:
-      - order_create(..., immediate_or_cancel=True/False)
-      - order_status(pair, order_id) (best-effort: trades -> open orders -> canceled)
+    Методы, ожидаемые остальным кодом:
+      - user_info()
+      - user_open_orders(pair: Optional[str] = None)
+      - order_create(pair, quantity, price, side, client_id: Optional[object] = None)
+      - order_cancel(order_id)
+      - order_trades(order_id)
+      - ticker_pair(pair)   # через общий 'ticker'
     """
 
-    def __init__(self, api_key: str, api_secret: str, base_url: str = "https://api.exmo.com/v1.1", timeout: int = 20):
-        if not api_key or not api_secret:
-            raise ValueError("EXMO key/secret are required")
-        self.key = api_key
-        self.secret = api_secret.encode("utf-8")
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        base_url: str = "https://api.exmo.com/v1.1",
+        timeout: int = 20,
+        nonce_storage: Optional[str] = None,
+    ) -> None:
+        self.key = str(api_key or "")
+        self.secret = str(api_secret or "").encode("utf-8")
         self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
-        self._last_nonce: int = 0
-        self._nonce_file = os.environ.get("EXMO_NONCE_FILE", "data/.exmo_nonce")
+        self.timeout = int(timeout)
 
-    # ---------- низкоуровневые утилиты ----------
+        # nonce с файловой блокировкой
+        nonce_file = nonce_storage or os.environ.get("EXMO_NONCE_FILE", "data/.exmo_nonce")
+        self.nonce = ThreadSafeNonceManager(nonce_file)
 
-    def _nonce(self) -> int:
-        now = int(time.time() * 1000)  # мс
-        last = self._last_nonce
-        if os.path.exists(self._nonce_file):
-            try:
-                with open(self._nonce_file, "r") as f:
-                    last = max(last, int(f.read().strip() or "0"))
-            except Exception:
-                pass
-        n = max(now, last + 1)
-        self._last_nonce = n
-        try:
-            os.makedirs(os.path.dirname(self._nonce_file), exist_ok=True)
-            with open(self._nonce_file, "w") as f:
-                f.write(str(n))
-        except Exception:
-            pass
-        return n
+        # сессия HTTP
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "tradinng-bot/EXMO"})
 
-    def _sign(self, params: Dict[str, Any]) -> str:
-        payload = urllib.parse.urlencode(params).encode("utf-8")
-        return hmac.new(self.secret, payload, hashlib.sha512).hexdigest()
+        # резервный генератор client_id (если вызывающая сторона не передала)
+        self._client_id_gen = OrderIDGenerator()
 
-    def _post(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        import random
-        params = dict(params or {})
+    # ------------------------- низкоуровневые утилиты -------------------------
 
-        def _once(payload: Dict[str, Any]) -> Dict[str, Any]:
-            payload = dict(payload)
-            payload["nonce"] = self._nonce()
-            headers = {
-                "Key": self.key,
-                "Sign": self._sign(payload),
-                "Content-Type": "application/x-www-form-urlencoded",
-            }
-            url = f"{self.base_url}/{method}"
-            r = requests.post(url, data=payload, headers=headers, timeout=self.timeout)
-            r.raise_for_status()
-            data = r.json()
-            if isinstance(data, dict) and data.get("error"):
-                raise RuntimeError(str(data.get("error")))
-            return data
-
-        max_tries = 5
-        delay = 0.8
-        for attempt in range(1, max_tries + 1):
-            try:
-                return _once(params)
-            except requests.HTTPError as e:
-                code = e.response.status_code if e.response is not None else None
-                if code in (429, 500, 502, 503, 504) and attempt < max_tries:
-                    time.sleep(delay)
-                    delay *= 1.7
-                    continue
-                raise
-            except (requests.Timeout, requests.ConnectionError):
-                if attempt < max_tries:
-                    time.sleep(delay)
-                    delay *= 1.7
-                    continue
-                raise
-            except RuntimeError as e:
-                msg = str(e).lower()
-                if any(k in msg for k in ("nonce", "flood", "too many", "try again")) and attempt < max_tries:
-                    time.sleep(delay + random.random() * 0.5)  # type: ignore[name-defined]
-                    delay *= 1.7
-                    continue
-                raise
-
-    def _get_public(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _sign_and_post(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{self.base_url}/{method}"
-        r = requests.get(url, params=params or {}, timeout=self.timeout)
-        r.raise_for_status()
-        return r.json()
+        p: Dict[str, Any] = dict(params or {})
+        # гарантируем уникальный nonce
+        p["nonce"] = self.nonce.get_next_nonce()
 
-    # ---------- публичные ----------
+        payload = urllib.parse.urlencode(p).encode("utf-8")
+        sign = hmac.new(self.secret, payload, hashlib.sha512).hexdigest()
 
-    def pair_settings(self, pair: Optional[str] = None) -> Dict[str, Any]:
-        data = self._get_public("pair_settings")
-        if pair:
-            if isinstance(data, dict):
-                return data.get(pair, {})
-            return {}
+        headers = {
+            "Key": self.key,
+            "Sign": sign,
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+
+        # ВНИМАНИЕ: не логируем ключ/секрет!
+        # Логируем только имя метода и набор ключей параметров без значений
+        try:
+            resp = self.session.post(url, data=p, headers=headers, timeout=self.timeout)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.exceptions.RequestException as e:
+            logger.error("HTTP error %s on %s: %s", method, url, e)
+            raise
+        except ValueError as e:
+            logger.error("JSON decode error on %s: %s", method, e)
+            raise
+
+        if isinstance(data, dict) and data.get("error"):
+            # EXMO специфичная строка ошибки
+            err = str(data.get("error"))
+            logger.warning("EXMO error on %s: %s", method, err)
+            raise RuntimeError(f"EXMO API error: {err}")
+
         return data
 
-    def ticker(self, pair: str) -> Dict[str, Any]:
-        try:
-            data = self._get_public("ticker")
-        except Exception:
-            return {}
-        t = data.get(pair)
-        return t if isinstance(t, dict) else {}
-
-    def order_book(self, pair: str, limit: int = 20) -> Dict[str, Any]:
-        try:
-            data = self._get_public("order_book", params={"pair": pair, "limit": limit})
-        except Exception:
-            return {}
-        ob = data.get(pair)
-        return ob if isinstance(ob, dict) else {}
-
-    # ---------- приватные ----------
+    # ------------------------- публичные методы, ожидаемые проектом -------------------------
 
     def user_info(self) -> Dict[str, Any]:
-        return self._post("user_info")
+        return self._sign_and_post("user_info")
 
     def user_open_orders(self, pair: Optional[str] = None) -> Dict[str, Any]:
         params: Dict[str, Any] = {}
         if pair:
             params["pair"] = pair
-        return self._post("user_open_orders", params)
+        return self._sign_and_post("user_open_orders", params)
 
     def order_create(
         self,
         pair: str,
-        quantity: Number,
-        price: Number,
-        side: str,                     # "buy" | "sell"
+        quantity: Any,
+        price: Any,
+        side: str,
         client_id: Optional[object] = None,
-        immediate_or_cancel: bool = False,
     ) -> Dict[str, Any]:
-        """EXMO v1.1: order_create(pair, quantity, price, type, [client_id], [immediate_or_cancel])."""
-        def _num(x: Number) -> str:
-            if isinstance(x, str):
-                return x
-            return f"{x:.16f}".rstrip("0").rstrip(".") if isinstance(x, float) else str(x)
+        """
+        Создание ордера. Гарантируем уникальный и валидный client_id.
+        EXMO ожидает:
+          - pair: "DOGE_EUR"
+          - quantity: str/float
+          - price: str/float
+          - type: "buy"/"sell"
+          - client_id: str (целое положительное, обычно <= int32)
+        """
+        if not pair or "_" not in pair:
+            raise ValueError(f"Invalid pair: {pair}")
+
+        side = str(side or "").lower()
+        if side not in ("buy", "sell"):
+            raise ValueError(f"Invalid side: {side}")
 
         params: Dict[str, Any] = {
             "pair": pair,
-            "quantity": _num(quantity),
-            "price": _num(price),
+            "quantity": str(quantity),
+            "price": str(price),
             "type": side,
         }
-        if client_id is not None:
+
+        # безопасная обработка client_id
+        if client_id is None:
+            cid = self._client_id_gen.generate()
+        else:
             try:
-                params["client_id"] = str(int(str(client_id).strip()))
+                cid = int(str(client_id).strip())
+                if cid <= 0:
+                    raise ValueError("client_id must be positive")
             except Exception:
-                pass
+                # если пришло мусорное значение — сгенерируем сами
+                cid = self._client_id_gen.generate()
 
-        if immediate_or_cancel:
-            params["immediate_or_cancel"] = "true"
+        # EXMO обычно принимает client_id как строку
+        params["client_id"] = str(cid % 2_147_483_647)
 
-        return self._post("order_create", params)
+        return self._sign_and_post("order_create", params)
 
-    def order_cancel(self, order_id: str) -> Dict[str, Any]:
-        return self._post("order_cancel", {"order_id": order_id})
+    def order_cancel(self, order_id: Any) -> Dict[str, Any]:
+        params = {"order_id": str(order_id)}
+        return self._sign_and_post("order_cancel", params)
 
-    def order_trades(self, order_id: str) -> Dict[str, Any]:
-        return self._post("order_trades", {"order_id": order_id})
+    def order_trades(self, order_id: Any) -> Dict[str, Any]:
+        params = {"order_id": str(order_id)}
+        return self._sign_and_post("order_trades", params)
 
-    def order_status(self, pair: str, order_id: str) -> Dict[str, Any]:
-        """Best-effort статус ордера (trades → open_orders → canceled)."""
-        filled_qty = 0.0
-        last_price = None
-
-        try:
-            tr = self.order_trades(order_id)
-            trades: List[Dict[str, Any]] = tr.get("trades") or tr.get("response") or []
-            if isinstance(trades, dict):
-                trades = list(trades.values())
-            for t in trades:
-                q = float(t.get("quantity") or t.get("qty") or 0.0)
-                p = float(t.get("price") or 0.0)
-                filled_qty += q
-                last_price = p or last_price
-        except Exception:
-            pass
-
-        if filled_qty > 0:
-            return {"status": "filled", "quantity_processed": filled_qty, "price": last_price}
-
-        try:
-            open_orders = self.user_open_orders(pair=pair)
-            orders = open_orders.get(pair) if isinstance(open_orders, dict) else None
-            if isinstance(orders, list):
-                for o in orders:
-                    if str(o.get("order_id")) == str(order_id):
-                        qp = float(o.get("quantity_processed") or o.get("filled_qty") or 0.0)
-                        pr = float(o.get("price") or 0.0)
-                        return {"status": "open", "quantity_processed": qp, "price": pr}
-        except Exception:
-            pass
-
-        return {"status": "canceled", "quantity_processed": 0.0, "price": last_price or 0.0}
+    def ticker_pair(self, pair: str) -> Optional[Dict[str, Any]]:
+        """
+        EXMO v1.1 'ticker' возвращает весь скоуп. Здесь — обертка по конкретной паре.
+        """
+        data = self._sign_and_post("ticker")
+        if isinstance(data, dict):
+            return data.get(pair)
+        return None
