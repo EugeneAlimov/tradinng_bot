@@ -1,63 +1,26 @@
-from pathlib import Path
+# src/backtest/optimize.py
+from __future__ import annotations
+
+import html
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import json
-import sys
-import subprocess
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
 import pandas as pd
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MAIN_PY = PROJECT_ROOT / "main.py"
-
-
-def _ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-
-
-def _ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
-
-def _run_cli(args: list[str]) -> str:
-    """
-    Запускает CLI-команду и возвращает stdout (text).
-    Бросает CalledProcessError, если возврат не 0.
-    """
-    proc = subprocess.run(
-        [sys.executable, str(MAIN_PY), *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        text=True,
-    )
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, proc.args, output=proc.stdout, stderr=proc.stderr)
-    return proc.stdout
-
-
-def _find_json_lines(text: str) -> list[dict]:
-    objs = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("{") and line.endswith("}"):
-            try:
-                objs.append(json.loads(line))
-            except Exception:
-                pass
-    return objs
-
-
-def _latest_file(dir_: Path, pattern: str) -> Path | None:
-    files = sorted(dir_.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
-    return files[0] if files else None
-
-
-def _normalize_resample_tag(s: str) -> str:
-    """Стабильный тег интервальной метки в именах файлов (5m вместо 5T)."""
-    s = s.strip()
-    return s.lower().replace("t", "m")
+from .sweep import SweepCfg, run_sweep
+from .compat import (
+    fetch_exmo_candles_cached,
+    normalize_resample_rule,
+    resample_ohlc,
+    SimConfig,
+    simulate_on_df,
+)
+from .walkforward import WFConfig, run_walkforward
+from .robustness import compute_stability
 
 
 @dataclass
@@ -65,244 +28,227 @@ class OptimizeInput:
     pair: str
     span: str
     resample: str
-    fast_list: str
-    slow_list: str
-    hyst_list: str
-    cooldown_list: str
-    qty_list: str
+
+    fast_list: Sequence[int]
+    slow_list: Sequence[int]
+    hyst_list: Sequence[int]
+    cooldown_list: Sequence[int]
+    qty_list: Sequence[float]
+
     fee_bps: int
     slip_bps: int
     max_daily_loss_bps: int
-    metric: str
-    min_trades: int
-    d_fast: int
-    d_slow: int
-    d_hyst: int
-    d_cd: int
-    wf_top_n: int
-    folds: int
-    min_train_bars: int
-    min_valid_bars: int
-    wf_min_pf: float
-    wf_min_return: float
-    wf_max_dd: float
-    wf_min_folds: int
-    rank_by: str
-    final_backtest: bool
-    out_dir: Path
-    report_html: Path | None
+
+    metric: str = "calmar"
+    min_trades: int = 0
+    d_fast: int = 2
+    d_slow: int = 5
+    d_hyst: int = 5
+    d_cd: int = 2
+
+    wf_top_n: int = 10
+    folds: int = 4
+    min_train_bars: int = 150
+    min_valid_bars: int = 100
+
+    wf_min_pf: float = 0.0
+    wf_min_return: float = -1.0
+    wf_max_dd: float = 1.0
+    wf_min_winrate: float = 0.0
+    wf_min_sharpe: float = -1e9
+    wf_min_cagr: float = -1e9
+    wf_min_calmar: float = -1e9
+    wf_min_folds: int = 1
+    wf_min_trades: int = 0
+    wf_max_exposure: float = 100.0
+
+    rank_by: str = "oos_total_return_pct_mean"  # one of enum accepted by main.py
+    final_backtest: bool = False
+
+    out_dir: Path | str = Path("data/optimize")
+    report_html: Optional[Path] = None
 
 
-def _sweep(inp: OptimizeInput, out_root: Path) -> Path:
-    _ensure_dir(out_root)
-    resample_tag = _normalize_resample_tag(inp.resample)
-    sweep_dir = out_root
-    sweep_args = [
-        "sweep",
-        "--exmo-pair", inp.pair,
-        "--exmo-candles", inp.span,
-        "--resample", inp.resample,
-        "--fast-list", inp.fast_list,
-        "--slow-list", inp.slow_list,
-        "--hyst-list", inp.hyst_list,
-        "--cooldown-list", inp.cooldown_list,
-        "--qty-list", inp.qty_list,
-        "--fee-bps", str(inp.fee_bps),
-        "--slip-bps", str(inp.slip_bps),
-        "--out-dir", str(sweep_dir),
+def _now_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
+def _safe_float(x: Any) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return np.nan
+
+
+def _filter_wf(df: pd.DataFrame, inp: OptimizeInput) -> pd.DataFrame:
+    w = df.copy()
+    # условия соответствуют аргументам CLI
+    conds = [
+        w["folds"] >= inp.wf_min_folds,
+        w["oos_profit_factor_mean"] >= inp.wf_min_pf,
+        w["oos_total_return_pct_mean"] >= inp.wf_min_return,
+        w["oos_max_drawdown_pct_mean"] >= -abs(inp.wf_max_dd),  # max_dd is negative
+        w["oos_winrate_pct_mean"] >= inp.wf_min_winrate,
+        w["oos_sharpe_mean"] >= inp.wf_min_sharpe,
+        w["oos_cagr_pct_mean"] >= inp.wf_min_cagr,
+        w["oos_calmar_mean"] >= inp.wf_min_calmar,
     ]
-    _run_cli(sweep_args)
-    sweep_csv = _latest_file(sweep_dir, f"sweep_{inp.pair}_{resample_tag}_*.csv")
-    if not sweep_csv:
-        sweep_csv = _latest_file(sweep_dir, "sweep_*.csv")
-    if not sweep_csv:
-        raise RuntimeError("Sweep did not produce a CSV.")
-    return sweep_csv
+    if "oos_trades_mean" in w.columns and inp.wf_min_trades > 0:
+        conds.append(w["oos_trades_mean"] >= inp.wf_min_trades)
+    if "oos_exposure_pct_mean" in w.columns and inp.wf_max_exposure < 100.0:
+        conds.append(w["oos_exposure_pct_mean"] <= inp.wf_max_exposure)
+
+    mask = np.logical_and.reduce(conds) if conds else np.array([True] * len(w))
+    return w.loc[mask].reset_index(drop=True)
 
 
-def _robustness(inp: OptimizeInput, sweep_csv: Path, out_root: Path) -> Path:
-    ranked_csv = out_root / f"ranked_{sweep_csv.name.replace('sweep_', '')}"
-    args = [
-        "robustness",
-        "--sweep-csv", str(sweep_csv),
-        "--metric", inp.metric,
-        "--min-trades", str(inp.min_trades),
-        "--d-fast", str(inp.d_fast),
-        "--d-slow", str(inp.d_slow),
-        "--d-hyst", str(inp.d_hyst),
-        "--d-cd", str(inp.d_cd),
-        "--top-n", str(inp.wf_top_n),
-        "--out-csv", str(ranked_csv),
+def _rank_key_name(rank_by: str) -> str:
+    # В main.py доступные значения уже ограничены, но на всякий случай проверим:
+    allowed = {
+        "oos_profit_factor_mean",
+        "oos_total_return_pct_mean",
+        "oos_calmar_mean",
+        "oos_sharpe_mean",
+        "oos_cagr_pct_mean",
+    }
+    if rank_by not in allowed:
+        # fallback по здравому смыслу
+        return "oos_total_return_pct_mean"
+    return rank_by
+
+
+def _make_report_html(path: Path, sweep_csv: Optional[Path], ranked_csv: Optional[Path],
+                      wf_csv: Optional[Path], final_block: Optional[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parts: List[str] = [
+        "<!doctype html><meta charset='utf-8'><title>Optimize Report</title>",
+        "<style>body{font:14px system-ui,Roboto,Arial} table{border-collapse:collapse;margin:12px 0} td,th{border:1px solid #ddd;padding:4px 8px} h2{margin-top:24px}</style>",
+        "<h1>Optimize Report</h1>",
+        f"<p>Generated: {html.escape(datetime.now().isoformat(sep=' ', timespec='seconds'))}</p>"
     ]
-    _run_cli(args)
-    if not ranked_csv.exists():
-        candidate = _latest_file(out_root, "ranked_*.csv") or _latest_file(out_root, "sweep_ranked*.csv")
-        if candidate:
-            ranked_csv = candidate
-    if not ranked_csv.exists():
-        raise RuntimeError("Robustness did not produce a ranked CSV.")
-    return ranked_csv
 
+    def _tbl(title: str, df: Optional[pd.DataFrame], max_rows: int = 50):
+        if df is None or df.empty:
+            parts.append(f"<h2>{html.escape(title)}</h2><p><em>empty</em></p>")
+            return
+        parts.append(f"<h2>{html.escape(title)}</h2>")
+        parts.append(df.head(max_rows).to_html(index=False, border=0))
 
-def _walkforward_for_rows(inp: OptimizeInput, ranked: pd.DataFrame, out_root: Path) -> Path | None:
-    if ranked.empty:
-        return None
+    if sweep_csv and Path(sweep_csv).exists():
+        try:
+            df = pd.read_csv(sweep_csv)
+        except Exception:
+            df = None
+        _tbl("Sweep (head)", df)
 
-    rows = ranked.copy()
-    required = ["fast", "slow", "hysteresis_bps", "cooldown_bars", "qty_eur"]
-    for c in required:
-        if c not in rows.columns:
-            if c == "hysteresis_bps" and "hysteresis-bps" in rows.columns:
-                rows["hysteresis_bps"] = rows["hysteresis-bps"]
-            else:
-                raise RuntimeError(f"Ranked CSV lacks column '{c}'")
+    if ranked_csv and Path(ranked_csv).exists():
+        try:
+            df = pd.read_csv(ranked_csv)
+        except Exception:
+            df = None
+        _tbl("Ranked (head)", df)
 
-    wf_records = []
-    for _, r in rows.iterrows():
-        args = [
-            "walk-forward",
-            "--exmo-pair", inp.pair,
-            "--exmo-candles", inp.span,
-            "--resample", inp.resample,
-            "--fast", str(int(r["fast"])),
-            "--slow", str(int(r["slow"])),
-            "--hysteresis-bps", str(int(r["hysteresis_bps"])),
-            "--cooldown-bars", str(int(r["cooldown_bars"])),
-            "--fee-bps", str(inp.fee_bps),
-            "--slip-bps", str(inp.slip_bps),
-            "--qty-eur", str(float(r["qty_eur"])),
-            "--folds", str(inp.folds),
-            "--min-train-bars", str(inp.min_train_bars),
-            "--min-valid-bars", str(inp.min_valid_bars),
-        ]
-        text = _run_cli(args)
-        objs = _find_json_lines(text)
-        if not objs:
-            continue
-        wf = objs[-1]
-        wf.update({
-            "fast": int(r["fast"]),
-            "slow": int(r["slow"]),
-            "hysteresis_bps": int(r["hysteresis_bps"]),
-            "cooldown_bars": int(r["cooldown_bars"]),
-            "qty_eur": float(r["qty_eur"]),
-        })
-        wf_records.append(wf)
+    if wf_csv and Path(wf_csv).exists():
+        try:
+            df = pd.read_csv(wf_csv)
+        except Exception:
+            df = None
+        _tbl("Walk-forward (head)", df)
 
-    if not wf_records:
-        return None
+    if final_block:
+        parts.append("<h2>Final backtest</h2>")
+        parts.append("<pre>" + html.escape(json.dumps(final_block, ensure_ascii=False, indent=2)) + "</pre>")
 
-    df = pd.DataFrame(wf_records)
-    wf_csv = out_root / f"wf_{inp.pair}_{_normalize_resample_tag(inp.resample)}_{_ts()}.csv"
-    df.to_csv(wf_csv, index=False)
-    return wf_csv
-
-
-def _filter_and_pick(df: pd.DataFrame, inp: OptimizeInput) -> dict | None:
-    if df is None or df.empty:
-        return None
-    keep = df.copy()
-    if "oos_profit_factor_mean" in keep.columns:
-        keep = keep[keep["oos_profit_factor_mean"] >= inp.wf_min_pf]
-    if "oos_total_return_pct_mean" in keep.columns:
-        keep = keep[keep["oos_total_return_pct_mean"] >= inp.wf_min_return]
-    if "oos_max_drawdown_pct_mean" in keep.columns:
-        keep = keep[keep["oos_max_drawdown_pct_mean"] >= -inp.wf_max_dd]  # DD отрицательная
-    if "folds" in keep.columns:
-        keep = keep[keep["folds"] >= inp.wf_min_folds]
-
-    if keep.empty:
-        keep = df
-
-    rank_key = inp.rank_by if inp.rank_by in keep.columns else None
-    if not rank_key:
-        for k in ["oos_total_return_pct_mean", "oos_calmar_mean", "oos_profit_factor_mean", "oos_sharpe_mean"]:
-            if k in keep.columns:
-                rank_key = k
-                break
-
-    winner = keep.sort_values(rank_key, ascending=False).iloc[0].to_dict()
-    return winner
-
-
-def _final_backtest(inp: OptimizeInput, winner: dict, out_root: Path) -> dict | None:
-    if not winner:
-        return None
-    args = [
-        "backtest", "--vectorized",
-        "--exmo-pair", inp.pair,
-        "--exmo-candles", inp.span,
-        "--resample", inp.resample,
-        "--fast", str(int(winner["fast"])),
-        "--slow", str(int(winner["slow"])),
-        "--hysteresis-bps", str(int(winner["hysteresis_bps"])),
-        "--cooldown-bars", str(int(winner["cooldown_bars"])),
-        "--fee-bps", str(inp.fee_bps),
-        "--slip-bps", str(inp.slip_bps),
-        "--qty-eur", str(float(winner["qty_eur"])),
-        "--out-dir", str(out_root),
-    ]
-    text = _run_cli(args)
-    objs = _find_json_lines(text)
-    return objs[-1] if objs else None
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(parts))
 
 
 def run_optimize(
+    *,
     pair: str,
     span: str,
     resample: str,
-    fast_list: str,
-    slow_list: str,
-    hyst_list: str,
-    cooldown_list: str,
-    qty_list: str,
+    fast_list: Sequence[int],
+    slow_list: Sequence[int],
+    hyst_list: Sequence[int],
+    cooldown_list: Sequence[int],
+    qty_list: Sequence[float],
     fee_bps: int,
     slip_bps: int,
     max_daily_loss_bps: int,
-    metric: str,
-    min_trades: int,
-    d_fast: int,
-    d_slow: int,
-    d_hyst: int,
-    d_cd: int,
-    wf_top_n: int,
-    folds: int,
-    min_train_bars: int,
-    min_valid_bars: int,
-    wf_min_pf: float,
-    wf_min_return: float,
-    wf_max_dd: float,
-    wf_min_folds: int,
-    rank_by: str,
-    final_backtest: bool,
-    out_dir: Path,
-    report_html: Path | None = None,
-) -> dict:
+
+    metric: str = "calmar",
+    min_trades: int = 0,
+    d_fast: int = 2,
+    d_slow: int = 5,
+    d_hyst: int = 5,
+    d_cd: int = 2,
+
+    wf_top_n: int = 10,
+    folds: int = 4,
+    min_train_bars: int = 150,
+    min_valid_bars: int = 100,
+
+    wf_min_pf: float = 0.0,
+    wf_min_return: float = -1.0,
+    wf_max_dd: float = 1.0,
+    wf_min_winrate: float = 0.0,
+    wf_min_sharpe: float = -1e9,
+    wf_min_cagr: float = -1e9,
+    wf_min_calmar: float = -1e9,
+    wf_min_folds: int = 1,
+    wf_min_trades: int = 0,
+    wf_max_exposure: float = 100.0,
+
+    rank_by: str = "oos_total_return_pct_mean",
+    final_backtest: bool = False,
+
+    out_dir: Path | str = Path("data/optimize"),
+    report_html: Optional[Path] = None,
+) -> Dict[str, Any]:
     """
-    Оркестрация: sweep -> robustness -> WF top-N -> выбор -> (опц.) финальный бэктест -> отчёт.
+    Полный цикл: свип -> робастность -> WF по топ-N -> финальный БТ (опционально) -> HTML
+    Возвращает сводный словарь с путями артефактов.
     """
-    opt_root = out_dir
-    _ensure_dir(opt_root)
+    rr = normalize_resample_rule(resample)
+    out_root = Path(out_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
 
-    inp = OptimizeInput(
-        pair=pair, span=span, resample=resample,
-        fast_list=fast_list, slow_list=slow_list, hyst_list=hyst_list,
-        cooldown_list=cooldown_list, qty_list=qty_list,
-        fee_bps=fee_bps, slip_bps=slip_bps, max_daily_loss_bps=max_daily_loss_bps,
-        metric=metric, min_trades=min_trades, d_fast=d_fast, d_slow=d_slow, d_hyst=d_hyst, d_cd=d_cd,
-        wf_top_n=wf_top_n, folds=folds, min_train_bars=min_train_bars, min_valid_bars=min_valid_bars,
-        wf_min_pf=wf_min_pf, wf_min_return=wf_min_return, wf_max_dd=wf_max_dd, wf_min_folds=wf_min_folds,
-        rank_by=rank_by, final_backtest=final_backtest, out_dir=opt_root, report_html=report_html,
-    )
+    # 1) sweep
+    sweep_path = run_sweep(SweepCfg(
+        pair=pair, span=span, resample=rr,
+        fast_list=fast_list, slow_list=slow_list,
+        hyst_list=hyst_list, cooldown_list=cooldown_list,
+        qty_list=qty_list, fee_bps=fee_bps, slip_bps=slip_bps,
+        max_daily_loss_bps=max_daily_loss_bps,
+        out_dir=out_root,
+    ))
+    sweep_csv = Path(sweep_path)
 
-    sweep_csv = _sweep(inp, opt_root)
+    # 2) robustness ranking
+    try:
+        ranked_df = compute_stability(
+            csv_path=sweep_csv,
+            min_trades=min_trades, metric=metric,
+            d_fast=d_fast, d_slow=d_slow, d_hyst=d_hyst, d_cd=d_cd,
+        )
+    except RuntimeError as e:
+        # Частый кейс: свип весь с ошибками -> прекратить
+        result = {
+            "sweep_csv": str(sweep_csv),
+            "ranked_csv": str(out_root / f"ranked_{pair}_{rr}_{_now_stamp()}.csv"),
+            "wf_csv": None,
+            "report_html": str(report_html) if report_html else None,
+            "message": str(e) if str(e) else "Ranked table is empty or contains only errors; stopping before WF.",
+        }
+        # Пишем пустой ranked, чтобы было куда смотреть
+        pd.DataFrame().to_csv(result["ranked_csv"], index=False)
+        if report_html:
+            _make_report_html(Path(report_html), sweep_csv, Path(result["ranked_csv"]), None, None)
+        return result
 
-    ranked_csv = _robustness(inp, sweep_csv, opt_root)
-    ranked_df = pd.read_csv(ranked_csv)
-    if "error" in ranked_df.columns:
-        ranked_df = ranked_df[ranked_df["error"].isna() | (ranked_df["error"] == "")]
-    ranked_df = ranked_df.dropna(subset=["fast", "slow", "hysteresis_bps", "cooldown_bars", "qty_eur"], how="any")
-    ranked_df = ranked_df.head(wf_top_n)
+    ranked_csv = out_root / f"ranked_{pair}_{rr}_{_now_stamp()}.csv"
+    ranked_df.to_csv(ranked_csv, index=False)
 
     if ranked_df.empty:
         result = {
@@ -313,32 +259,112 @@ def run_optimize(
             "message": "Ranked table is empty or contains only errors; stopping before WF.",
         }
         if report_html:
-            _ensure_dir(report_html.parent)
-            (report_html).write_text(json.dumps(result, ensure_ascii=False, indent=2))
+            _make_report_html(Path(report_html), sweep_csv, ranked_csv, None, None)
         return result
 
-    wf_csv = _walkforward_for_rows(inp, ranked_df, opt_root)
-    wf_df = pd.read_csv(wf_csv) if wf_csv and wf_csv.exists() else pd.DataFrame()
+    # 3) take top-N (by robustness metric already) and run WF for each
+    top = ranked_df.head(max(1, int(wf_top_n))).copy()
+    wf_rows: List[Dict[str, Any]] = []
 
-    winner = _filter_and_pick(wf_df, inp)
+    for _, r in top.iterrows():
+        fast = int(r["fast"])
+        slow = int(r["slow"])
+        hyst = int(r["hysteresis_bps"])
+        cd = int(r["cooldown_bars"])
+        qty = float(r["qty_eur"])
 
-    final_bt = None
-    if final_backtest and winner:
-        final_bt = _final_backtest(inp, winner, opt_root)
+        wcfg = WFConfig(
+            pair=pair, span=span, resample=rr,
+            fast=fast, slow=slow, hysteresis_bps=hyst, cooldown_bars=cd,
+            fee_bps=fee_bps, slip_bps=slip_bps, qty_eur=qty,
+            max_daily_loss_bps=max_daily_loss_bps,
+            folds=folds, min_train_bars=min_train_bars, min_valid_bars=min_valid_bars,
+            out_dir=None,  # CSVы по WF в сводной таблице ниже
+        )
+        try:
+            out = run_walkforward(wcfg)
+        except Exception as e:
+            out = {
+                "pair": pair, "resample": rr,
+                "fast": fast, "slow": slow, "hysteresis_bps": hyst, "cooldown_bars": cd,
+                "fee_bps": fee_bps, "slip_bps": slip_bps, "qty_eur": qty,
+                "max_daily_loss_bps": max_daily_loss_bps,
+                "folds": 0,
+                "oos_total_return_pct_mean": np.nan,
+                "oos_total_return_pct_std": np.nan,
+                "oos_max_drawdown_pct_mean": np.nan,
+                "oos_winrate_pct_mean": np.nan,
+                "oos_profit_factor_mean": np.nan,
+                "oos_sharpe_mean": np.nan,
+                "oos_cagr_pct_mean": np.nan,
+                "oos_calmar_mean": np.nan,
+                "error": str(e),
+            }
+        wf_rows.append(out)
 
-    report = {
-        "pair": pair,
-        "resample": resample,
+    wf_df = pd.DataFrame(wf_rows)
+    wf_csv = out_root / f"wf_{pair}_{rr}_{_now_stamp()}.csv"
+    wf_df.to_csv(wf_csv, index=False)
+
+    # 4) WF filters + pick best
+    filtered = _filter_wf(wf_df, OptimizeInput(
+        pair=pair, span=span, resample=rr,
+        fast_list=fast_list, slow_list=slow_list, hyst_list=hyst_list,
+        cooldown_list=cooldown_list, qty_list=qty_list,
+        fee_bps=fee_bps, slip_bps=slip_bps, max_daily_loss_bps=max_daily_loss_bps,
+        metric=metric, min_trades=min_trades, d_fast=d_fast, d_slow=d_slow, d_hyst=d_hyst, d_cd=d_cd,
+        wf_top_n=wf_top_n, folds=folds, min_train_bars=min_train_bars, min_valid_bars=min_valid_bars,
+        wf_min_pf=wf_min_pf, wf_min_return=wf_min_return, wf_max_dd=wf_max_dd, wf_min_winrate=wf_min_winrate,
+        wf_min_sharpe=wf_min_sharpe, wf_min_cagr=wf_min_cagr, wf_min_calmar=wf_min_calmar,
+        wf_min_folds=wf_min_folds, wf_min_trades=wf_min_trades, wf_max_exposure=wf_max_exposure,
+        rank_by=rank_by, final_backtest=final_backtest, out_dir=out_root, report_html=report_html
+    ))
+    pool = filtered if not filtered.empty else wf_df
+    key = _rank_key_name(rank_by)
+    best = pool.sort_values(by=[key], ascending=False).head(1)
+
+    final_block: Optional[dict] = None
+
+    # 5) final backtest on full history
+    if final_backtest and not best.empty:
+        b = best.iloc[0]
+        fast = int(b["fast"]); slow = int(b["slow"])
+        hyst = int(b["hysteresis_bps"]); cd = int(b["cooldown_bars"]); qty = float(b["qty_eur"])
+
+        # candles full resampled
+        raw = fetch_exmo_candles_cached(pair, span)
+        df = resample_ohlc(raw, rr)
+        scfg = SimConfig(
+            fast=fast, slow=slow, hysteresis_bps=hyst, cooldown_bars=cd,
+            fee_bps=fee_bps, slip_bps=slip_bps, qty_eur=qty,
+            max_daily_loss_bps=max_daily_loss_bps, resample=rr,
+        )
+        trades_df, equity_df, metrics = simulate_on_df(df, scfg)
+
+        # filenames
+        tag = f"{pair}_{rr}_{fast}-{slow}_h{hyst}_cd{cd}_q{int(qty) if float(qty).is_integer() else qty}"
+        trades_csv = out_root / f"final_{tag}_trades.csv"
+        equity_csv = out_root / f"final_{tag}_equity.csv"
+        trades_df.to_csv(trades_csv, index=False)
+        equity_df.to_csv(equity_csv, index=False)
+
+        final_block = {
+            "metrics": metrics,
+            "trades_csv": str(trades_csv),
+            "equity_csv": str(equity_csv),
+        }
+
+    # 6) report
+    if report_html:
+        _make_report_html(Path(report_html), sweep_csv, ranked_csv, wf_csv, final_block)
+
+    # 7) summary
+    out = {
         "sweep_csv": str(sweep_csv),
         "ranked_csv": str(ranked_csv),
-        "wf_csv": str(wf_csv) if wf_csv else None,
+        "wf_csv": str(wf_csv),
         "report_html": str(report_html) if report_html else None,
-        "wf_rank_by": rank_by,
-        "selected": winner,
-        "final_metrics": final_bt,
     }
-    if report_html:
-        _ensure_dir(report_html.parent)
-        Path(report_html).write_text(json.dumps(report, ensure_ascii=False, indent=2))
-
-    return report
+    if filtered.empty and not wf_df.empty:
+        out["message"] = "WF filtered count: 0 / total {}; Selected from: unfiltered".format(len(wf_df))
+    return out

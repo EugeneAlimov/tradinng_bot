@@ -1,188 +1,198 @@
+# src/backtest/sweep.py
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-from datetime import datetime, timezone
 import itertools
 import json
-import sys
-import subprocess
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, List, Sequence, Tuple
+
+import numpy as np
 import pandas as pd
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MAIN_PY = PROJECT_ROOT / "main.py"
+from .compat import (
+    fetch_exmo_candles_cached,
+    normalize_resample_rule,
+    resample_ohlc,
+    SimConfig,
+    simulate_on_df,
+)
 
 
-def _ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+# ------------------------ parsing helpers ------------------------
 
-
-def _ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
-
-def parse_int_list(spec: str) -> list[int]:
+def _parse_range_token(tok: str) -> Iterable[int]:
     """
-    '5:20:5' -> [5,10,15,20] ; '0,3,5' -> [0,3,5]
+    Parse 'start:end:step' (inclusive of start, exclusive of end) into ints.
+    Example: '5:20:5' -> [5,10,15]
     """
-    spec = str(spec).strip()
-    if ":" in spec:
-        parts = spec.split(":")
-        if len(parts) not in (2, 3):
-            raise ValueError(f"Bad int list spec: {spec}")
-        start = int(parts[0])
-        end = int(parts[1])
-        step = int(parts[2]) if len(parts) == 3 else 1
-        if step == 0:
-            raise ValueError("step must be non-zero")
-        vals = list(range(start, end + (1 if (end - start) * step >= 0 else -1), step))
-        return vals
-    else:
-        return [int(x) for x in spec.split(",") if x.strip() != ""]
+    parts = tok.split(":")
+    if len(parts) != 3:
+        raise ValueError(f"Bad range token '{tok}', expected start:end:step")
+    s, e, st = (int(parts[0]), int(parts[1]), int(parts[2]))
+    if st == 0:
+        raise ValueError("step must be non-zero")
+    # как в Python range: end не включаем
+    return range(s, e, st)
 
 
-def parse_float_list(spec: str) -> list[float]:
-    spec = str(spec).strip()
-    if ":" in spec:
-        parts = spec.split(":")
-        if len(parts) not in (2, 3):
-            raise ValueError(f"Bad float list spec: {spec}")
-        start = float(parts[0])
-        end = float(parts[1])
-        step = float(parts[2]) if len(parts) == 3 else 1.0
-        if step == 0:
-            raise ValueError("step must be non-zero")
-        vals = []
-        x = start
-        ascending = step > 0
-        eps = step / 1000.0
-        if ascending:
-            while x <= end + eps:
-                vals.append(round(x, 10))
-                x += step
+def parse_int_list(spec: str) -> List[int]:
+    """
+    Accepts comma-separated ints OR range tokens 'a:b:c'.
+    Examples:
+      '5,10,15' -> [5,10,15]
+      '5:20:5'  -> [5,10,15]
+      '5:20:5,25' -> [5,10,15,25]
+    """
+    out: List[int] = []
+    for tok in [t.strip() for t in spec.split(",") if t.strip()]:
+        if ":" in tok:
+            out.extend(list(_parse_range_token(tok)))
         else:
-            while x >= end - eps:
-                vals.append(round(x, 10))
-                x += step
-        return vals
-    else:
-        return [float(x) for x in spec.split(",") if x.strip() != ""]
+            out.append(int(tok))
+    # dedup but keep order
+    seen = set()
+    uniq: List[int] = []
+    for v in out:
+        if v not in seen:
+            uniq.append(v)
+            seen.add(v)
+    return uniq
 
 
-def _normalize_resample_tag(s: str) -> str:
-    return s.lower().replace("t", "m")
+def parse_float_list(spec: str) -> List[float]:
+    out: List[float] = []
+    for tok in [t.strip() for t in spec.split(",") if t.strip()]:
+        if ":" in tok:
+            rng = list(_parse_range_token(tok))
+            out.extend([float(x) for x in rng])
+        else:
+            out.append(float(tok))
+    # dedup keep order
+    seen = set()
+    uniq: List[float] = []
+    for v in out:
+        if v not in seen:
+            uniq.append(v)
+            seen.add(v)
+    return uniq
 
+
+# ------------------------ config ------------------------
 
 @dataclass
 class SweepCfg:
     pair: str
-    span: str                # e.g. "1m:5000"
-    resample: str            # e.g. "5m"
-    fast_list: list[int]
-    slow_list: list[int]
-    hyst_list: list[int]
-    cooldown_list: list[int]
-    qty_list: list[float]
+    span: str                 # ex: "1m:5000"
+    resample: str = "5m"      # "5m" | "5T" | "1H" ...
+    fast_list: Sequence[int] = (10,)
+    slow_list: Sequence[int] = (20,)
+    hyst_list: Sequence[int] = (0,)
+    cooldown_list: Sequence[int] = (0, 3, 5)
+    qty_list: Sequence[float] = (100.0,)
     fee_bps: int = 10
     slip_bps: int = 2
     max_daily_loss_bps: int = 0
-    out_dir: Path | None = None
+    out_dir: Path | str = Path("data/sweep")
 
 
-def _run_backtest_cli(args: list[str]) -> tuple[dict | None, str | None]:
-    """
-    Возвращает (json_metrics, error_message)
-    """
-    proc = subprocess.run(
-        [sys.executable, str(MAIN_PY), "backtest", *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if proc.returncode != 0:
-        return None, proc.stderr.strip() or f"backtest_failed (code {proc.returncode})"
-
-    metrics = None
-    for line in proc.stdout.splitlines()[::-1]:
-        line = line.strip()
-        if line.startswith("{") and line.endswith("}"):
-            try:
-                obj = json.loads(line)
-                metrics = obj
-                break
-            except Exception:
-                continue
-    if not metrics:
-        return None, "no_json_from_backtest"
-    return metrics, None
-
+# ------------------------ core ------------------------
 
 def run_sweep(cfg: SweepCfg) -> str:
-    out_dir = cfg.out_dir or (PROJECT_ROOT / "data" / "sweep")
-    _ensure_dir(out_dir)
-    resample_tag = _normalize_resample_tag(cfg.resample)
-    out_csv = out_dir / f"sweep_{cfg.pair}_{resample_tag}_{_ts()}.csv"
+    """
+    Выполняет свип всех комбинаций и пишет один CSV.
+    Возвращает путь к CSV (str).
+    """
+    rr_user = cfg.resample
+    rr = normalize_resample_rule(rr_user)
 
-    rows = []
-    for fast, slow, hyst, cd, qty in itertools.product(cfg.fast_list, cfg.slow_list, cfg.hyst_list, cfg.cooldown_list, cfg.qty_list):
-        bt_args = [
-            "--exmo-pair", cfg.pair,
-            "--exmo-candles", cfg.span,
-            "--resample", cfg.resample,
-            "--fast", str(fast),
-            "--slow", str(slow),
-            "--hysteresis-bps", str(hyst),
-            "--cooldown-bars", str(cd),
-            "--fee-bps", str(cfg.fee_bps),
-            "--slip-bps", str(cfg.slip_bps),
-            "--qty-eur", str(qty),
-        ]
-        metrics, err = _run_backtest_cli(bt_args)
-        if metrics:
+    out_root = Path(cfg.out_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    # в имени файла придерживаемся твоей схемы: 5T для минут
+    file_resample = rr.replace("T", "m") if rr.endswith("T") else rr
+    # но в успешных логах у тебя встречались и 5m и 5T — оставим 5m для читаемости
+    file_resample = "5m" if rr in ("5T", "5m") else rr
+    out_csv = out_root / f"sweep_{cfg.pair}_{file_resample}_{timestamp}.csv"
+
+    rows: List[dict] = []
+
+    # 1) fetch & resample один раз
+    try:
+        raw = fetch_exmo_candles_cached(cfg.pair, cfg.span)
+        df = resample_ohlc(raw, rr)
+        if df.empty:
+            raise RuntimeError(f"Empty resampled candles for {cfg.pair} {cfg.span} -> {rr}")
+    except Exception as e:
+        # записываем компактный CSV с ошибкой
+        pd.DataFrame(
+            [{"pair": cfg.pair, "error": f"fetch_or_resample_failed: {e}"}]
+        ).to_csv(out_csv, index=False)
+        return str(out_csv)
+
+    # 2) перебор комбинаций
+    combos = list(itertools.product(
+        list(cfg.fast_list),
+        list(cfg.slow_list),
+        list(cfg.hyst_list),
+        list(cfg.cooldown_list),
+        list(cfg.qty_list),
+    ))
+
+    for fast, slow, hyst, cd, qty in combos:
+        row_base = {
+            "pair": cfg.pair,
+            # метрики заполним после
+            "bars_per_year": np.nan,  # заполним из метрик симулятора
+            "fast": int(fast),
+            "slow": int(slow),
+            "hysteresis_bps": int(hyst),
+            "cooldown_bars": int(cd),
+            "qty_eur": float(qty),
+            "fee_bps": int(cfg.fee_bps),
+            "slip_bps": int(cfg.slip_bps),
+            "max_daily_loss_bps": int(cfg.max_daily_loss_bps),
+            "trades_csv": None,
+            "equity_csv": None,
+        }
+        try:
+            scfg = SimConfig(
+                fast=int(fast),
+                slow=int(slow),
+                hysteresis_bps=int(hyst),
+                cooldown_bars=int(cd),
+                fee_bps=int(cfg.fee_bps),
+                slip_bps=int(cfg.slip_bps),
+                qty_eur=float(qty),
+                max_daily_loss_bps=int(cfg.max_daily_loss_bps),
+                resample=rr,
+            )
+            trades_df, equity_df, metrics = simulate_on_df(df, scfg)
+
             row = {
-                "pair": cfg.pair,
-                "bars": metrics.get("bars"),
-                "trades": metrics.get("trades"),
-                "winrate_pct": metrics.get("winrate_pct"),
-                "total_return_pct": metrics.get("total_return_pct"),
-                "max_drawdown_pct": metrics.get("max_drawdown_pct"),
-                "final_equity_eur": metrics.get("final_equity_eur"),
-                "start_equity_eur": metrics.get("start_equity_eur", 1000.0),
-                "profit_factor": metrics.get("profit_factor"),
-                "avg_trade_eur": metrics.get("avg_trade_eur"),
-                "exposure_pct": metrics.get("exposure_pct"),
-                "sharpe": metrics.get("sharpe"),
-                "cagr_pct": metrics.get("cagr_pct"),
-                "calmar": metrics.get("calmar"),
-                "bars_per_year": metrics.get("bars_per_year"),
-                "fast": fast,
-                "slow": slow,
-                "hysteresis_bps": hyst,
-                "cooldown_bars": cd,
-                "qty_eur": qty,
-                "fee_bps": cfg.fee_bps,
-                "slip_bps": cfg.slip_bps,
-                "max_daily_loss_bps": cfg.max_daily_loss_bps,
-                "trades_csv": metrics.get("trades_csv"),
-                "equity_csv": metrics.get("equity_csv"),
-                "error": None,
+                **row_base,
+                "bars": int(metrics["bars"]),
+                "trades": int(metrics["trades"]),
+                "winrate_pct": float(metrics["winrate_pct"]),
+                "total_return_pct": float(metrics["total_return_pct"]),
+                "max_drawdown_pct": float(metrics["max_drawdown_pct"]),
+                "final_equity_eur": float(metrics["final_equity_eur"]),
+                "start_equity_eur": float(metrics["start_equity_eur"]),
+                "profit_factor": float(metrics["profit_factor"]),
+                "avg_trade_eur": float(metrics["avg_trade_eur"]),
+                "exposure_pct": float(metrics["exposure_pct"]),
+                "sharpe": float(metrics["sharpe"]),
+                "cagr_pct": float(metrics["cagr_pct"]),
+                "calmar": float(metrics["calmar"]),
+                "bars_per_year": float(metrics["bars_per_year"]),
+                "trades_csv": None,
+                "equity_csv": None,
             }
-        else:
-            row = {
-                "pair": cfg.pair,
-                "bars": None, "trades": None, "winrate_pct": None,
-                "total_return_pct": None, "max_drawdown_pct": None, "final_equity_eur": None,
-                "start_equity_eur": 1000.0, "profit_factor": None, "avg_trade_eur": None,
-                "exposure_pct": None, "sharpe": None, "cagr_pct": None, "calmar": None,
-                "bars_per_year": None,
-                "fast": fast, "slow": slow, "hysteresis_bps": hyst, "cooldown_bars": cd,
-                "qty_eur": qty, "fee_bps": cfg.fee_bps, "slip_bps": cfg.slip_bps,
-                "max_daily_loss_bps": cfg.max_daily_loss_bps,
-                "trades_csv": None, "equity_csv": None,
-                "error": err or "unknown_error",
-            }
+        except Exception as e:
+            row = {**row_base, "error": str(e)}
+
         rows.append(row)
 
-    df = pd.DataFrame(rows)
-    df.to_csv(out_csv, index=False)
+    pd.DataFrame(rows).to_csv(out_csv, index=False)
     return str(out_csv)
