@@ -42,9 +42,9 @@ def _load_csv_maybe_glob(path: Path) -> pd.DataFrame:
 
 
 def compute_stability(
-    *, csv_path: Path, metric: str, min_trades: int,
-    d_fast: int, d_slow: int, d_hyst: int, d_cd: int,
-    top_n: int = 20,
+        *, csv_path: Path, metric: str, min_trades: int,
+        d_fast: int, d_slow: int, d_hyst: int, d_cd: int,
+        top_n: int = 20,
 ) -> pd.DataFrame:
     try:
         df = _load_csv_maybe_glob(csv_path)

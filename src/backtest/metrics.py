@@ -114,10 +114,10 @@ class OOSAgg:
 
 
 def aggregate_oos_folds(
-    folds: Iterable[Mapping[str, float]],
-    *,
-    resample: str,
-    agg_equity: Optional[pd.Series] = None,
+        folds: Iterable[Mapping[str, float]],
+        *,
+        resample: str,
+        agg_equity: Optional[pd.Series] = None,
 ) -> OOSAgg:
     """
     folds: iterable of per-fold dicts with keys like:

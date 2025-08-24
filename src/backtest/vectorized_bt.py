@@ -11,24 +11,26 @@ from typing import Optional, Tuple, Dict, Any, List
 import numpy as np
 import pandas as pd
 
+
 # ==============================
 # Config & Public API
 # ==============================
 
 @dataclass
 class BtConfig:
-    pair: str                      # EXMO pair, e.g. "DOGE_EUR"
-    span: str                      # e.g. "1m:5000"
-    fast: int                      # fast SMA window (bars)
-    slow: int                      # slow SMA window (bars)
-    hysteresis_bps: int = 0        # entry/exit hysteresis in basis points
-    cooldown_bars: int = 0         # bars to wait after exit before new entry
-    enter_on_start: bool = False   # if True and long condition true at start, enter immediately
-    fee_bps: int = 0               # per-side fee in bps
-    slip_bps: int = 0              # slippage in bps (applied adversarially on fills)
-    qty_eur: float = 100.0         # notional per trade in quote currency (EUR)
-    max_daily_loss_bps: int = 0    # optional daily stop in bps of start_equity (0=off)
-    resample: Optional[str] = None # e.g. "5m" (minutes); None -> do not resample
+    pair: str  # EXMO pair, e.g. "DOGE_EUR"
+    span: str  # e.g. "1m:5000"
+    fast: int  # fast SMA window (bars)
+    slow: int  # slow SMA window (bars)
+    hysteresis_bps: int = 0  # entry/exit hysteresis in basis points
+    cooldown_bars: int = 0  # bars to wait after exit before new entry
+    enter_on_start: bool = False  # if True and long condition true at start, enter immediately
+    fee_bps: int = 0  # per-side fee in bps
+    slip_bps: int = 0  # slippage in bps (applied adversarially on fills)
+    qty_eur: float = 100.0  # notional per trade in quote currency (EUR)
+    max_daily_loss_bps: int = 0  # optional daily stop in bps of start_equity (0=off)
+    resample: Optional[str] = None  # e.g. "5m" (minutes); None -> do not resample
+
 
 # ==============================
 # Helpers
@@ -36,6 +38,7 @@ class BtConfig:
 
 def _now_utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
 
 def _parse_span(span: str) -> Tuple[str, int]:
     """
@@ -48,6 +51,7 @@ def _parse_span(span: str) -> Tuple[str, int]:
     if lim_int <= 0:
         raise ValueError("limit in span must be > 0")
     return tf.strip(), lim_int
+
 
 def _minutes_from_tf(tf: str) -> int:
     """
@@ -63,6 +67,7 @@ def _minutes_from_tf(tf: str) -> int:
         return int(tf[:-1]) * 60 * 24
     raise ValueError(f"Unsupported timeframe '{tf}'")
 
+
 def _normalize_resample(rule: str) -> str:
     """
     Pandas recommends 'T' or 'min' for minutes; 'm' is month-end (deprecated shorthand).
@@ -76,6 +81,7 @@ def _normalize_resample(rule: str) -> str:
             raise ValueError(f"Invalid minute resample rule '{rule}'")
         return f"{int(num)}T"
     return rule
+
 
 def _bars_per_year_from_rule(rule: Optional[str]) -> float:
     """
@@ -96,6 +102,7 @@ def _bars_per_year_from_rule(rule: Optional[str]) -> float:
             minutes = 1
     return (365 * 24 * 60) / minutes
 
+
 def _apply_bps(price: float, bps: int, adverse: bool) -> float:
     """
     Apply slippage in bps to price. If adverse=True, move price against us.
@@ -105,6 +112,7 @@ def _apply_bps(price: float, bps: int, adverse: bool) -> float:
     factor = (1.0 + (bps / 1e4))
     return price * (factor if adverse else (1.0 / factor))
 
+
 def _fee_multiplier(bps: int) -> float:
     """
     Convert per-side fee in bps into multiplier on notional.
@@ -112,6 +120,7 @@ def _fee_multiplier(bps: int) -> float:
     if bps == 0:
         return 1.0
     return 1.0 - (bps / 1e4)
+
 
 # ==============================
 # Data Fetch (EXMO)
@@ -187,6 +196,7 @@ def _fetch_exmo_candles(pair: str, span: str) -> pd.DataFrame:
         )
         return df.sort_index()
 
+
 def _safe_to_utc_ts(x: Any) -> int:
     """
     Make a safe (seconds-based) UTC timestamp from INT or STR that may be in ms.
@@ -201,6 +211,7 @@ def _safe_to_utc_ts(x: Any) -> int:
     if val > 10_000_000_000:  # ~Sat Nov 20 2286 for seconds; larger likely ms
         val = val // 1000
     return val
+
 
 def _ensure_ohlc_df(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -225,6 +236,7 @@ def _ensure_ohlc_df(df: pd.DataFrame) -> pd.DataFrame:
         out["volume"] = 0.0
     return out[["open", "high", "low", "close", "volume"]]
 
+
 # ==============================
 # Resample
 # ==============================
@@ -247,6 +259,7 @@ def _resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     out = df.resample(norm, label="right", closed="right").agg(agg).dropna()
     return out
 
+
 # ==============================
 # Strategy & Backtest
 # ==============================
@@ -256,9 +269,10 @@ def _sma(a: pd.Series, win: int) -> pd.Series:
         raise ValueError("SMA window must be > 0")
     return a.rolling(win, min_periods=win).mean()
 
+
 def _generate_positions(
-    close: pd.Series, fast: pd.Series, slow: pd.Series,
-    hysteresis_bps: int, cooldown_bars: int
+        close: pd.Series, fast: pd.Series, slow: pd.Series,
+        hysteresis_bps: int, cooldown_bars: int
 ) -> pd.Series:
     """
     Long/flat positions {0,1} with hysteresis (bps) and cooldown after exit.
@@ -298,16 +312,17 @@ def _generate_positions(
 
     return pd.Series(pos, index=close.index, dtype="int8")
 
+
 def _simulate_on_df(
-    df: pd.DataFrame,
-    fast: int,
-    slow: int,
-    hysteresis_bps: int,
-    cooldown_bars: int,
-    fee_bps: int,
-    slip_bps: int,
-    qty_eur: float,
-    enter_on_start: bool,
+        df: pd.DataFrame,
+        fast: int,
+        slow: int,
+        hysteresis_bps: int,
+        cooldown_bars: int,
+        fee_bps: int,
+        slip_bps: int,
+        qty_eur: float,
+        enter_on_start: bool,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Simulate trades on DF with columns: open, high, low, close, volume.
@@ -431,11 +446,12 @@ def _simulate_on_df(
     equity_df = pd.DataFrame(eq_ts, columns=["ts", "equity"]).set_index("ts")
     return equity_df, trades_df
 
+
 def _metrics_from_equity_and_trades(
-    equity_df: pd.DataFrame,
-    trades_df: pd.DataFrame,
-    exposure_pct: float,
-    bars_per_year: float,
+        equity_df: pd.DataFrame,
+        trades_df: pd.DataFrame,
+        exposure_pct: float,
+        bars_per_year: float,
 ) -> Dict[str, Any]:
     start_equity = 1000.0
     final_equity = float(equity_df["equity"].iloc[-1]) if not equity_df.empty else start_equity
@@ -470,7 +486,7 @@ def _metrics_from_equity_and_trades(
     # Calmar = CAGR% / |MaxDD%|
     calmar = (cagr_pct / abs(max_dd_pct)) if abs(max_dd_pct) > 1e-9 else math.inf
 
-    winrate = 100.0 * ( (trades_df["pnl_eur"] > 0).sum() / len(trades_df) ) if not trades_df.empty else 0.0
+    winrate = 100.0 * ((trades_df["pnl_eur"] > 0).sum() / len(trades_df)) if not trades_df.empty else 0.0
     avg_trade = trades_df["pnl_eur"].mean() if not trades_df.empty else 0.0
 
     out = {
@@ -490,11 +506,12 @@ def _metrics_from_equity_and_trades(
     }
     return out
 
+
 def run_backtest_vectorized(
-    cfg: BtConfig,
-    *,
-    write_artifacts: bool = False,
-    out_dir: Optional[Path] = None,
+        cfg: BtConfig,
+        *,
+        write_artifacts: bool = False,
+        out_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Main entry point used by CLI/sweep/optimize.
@@ -524,7 +541,7 @@ def run_backtest_vectorized(
         enter_on_start=cfg.enter_on_start,
     )
 
-    exposure_pct = 100.0 * ( (data.index.to_series().map(lambda x: 1).values * 0 + 1) * 0 ).sum()  # placeholder
+    exposure_pct = 100.0 * ((data.index.to_series().map(lambda x: 1).values * 0 + 1) * 0).sum()  # placeholder
     # More accurate exposure from pos series in simulator:
     # We'll recompute quickly:
     close = data["close"]

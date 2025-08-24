@@ -7,23 +7,23 @@ import pandas as pd
 
 
 def apply_wf_filters(
-    df: pd.DataFrame,
-    min_pf: float = 1.0,
-    min_return: float = 0.0,
-    max_dd: float = 1.0,
-    min_winrate: Optional[float] = None,
-    min_sharpe: Optional[float] = None,
-    min_cagr: Optional[float] = None,
-    min_calmar: Optional[float] = None,
-    min_folds: int = 0,
-    min_trades: int = 0,
-    max_exposure: float = 1.0,
+        df: pd.DataFrame,
+        min_pf: float = 1.0,
+        min_return: float = 0.0,
+        max_dd: float = 1.0,
+        min_winrate: Optional[float] = None,
+        min_sharpe: Optional[float] = None,
+        min_cagr: Optional[float] = None,
+        min_calmar: Optional[float] = None,
+        min_folds: int = 0,
+        min_trades: int = 0,
+        max_exposure: float = 1.0,
 ) -> pd.Series:
     """Ожидаются метрики с префиксом 'oos_' и суффиксом '_mean' или '_agg'."""
     m = pd.Series(True, index=df.index)
 
     def col(name: str) -> pd.Series:
-        return df[name] if name in df.columns else pd.Series([math.nan]*len(df), index=df.index)
+        return df[name] if name in df.columns else pd.Series([math.nan] * len(df), index=df.index)
 
     m &= col("oos_profit_factor_mean") >= float(min_pf)
     m &= col("oos_total_return_pct_mean") >= float(min_return)

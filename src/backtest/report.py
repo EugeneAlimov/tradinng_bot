@@ -16,12 +16,12 @@ def _box(title: str, body_html: str) -> str:
 
 
 def write_report_html(
-    html_path: Path,
-    sweep_csv: Path,
-    ranked_csv: Path,
-    wf_csv: Path,
-    best_row: dict,
-    final_metrics: Optional[dict],
+        html_path: Path,
+        sweep_csv: Path,
+        ranked_csv: Path,
+        wf_csv: Path,
+        best_row: dict,
+        final_metrics: Optional[dict],
 ) -> None:
     html_path = Path(html_path)
     html_path.parent.mkdir(parents=True, exist_ok=True)
