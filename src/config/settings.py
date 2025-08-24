@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from decimal import getcontext
+from decimal import getcontext, Decimal
 from pathlib import Path
 from typing import Final
 
@@ -64,6 +64,7 @@ SLIP_BPS: Final[int] = env_int("SLIP_BPS", 2)
 # ---------- Risk config expected by some modules ----------
 @dataclass(frozen=True)
 class RiskCfg:
+    position_size_usd: Decimal = Decimal("0")
     max_position_pct: int = 30
     max_daily_loss_pct: int = 5
     max_drawdown_pct: int = 20

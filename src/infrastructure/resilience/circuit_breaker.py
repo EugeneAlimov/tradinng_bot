@@ -22,10 +22,10 @@ class CircuitState(Enum):
 
 @dataclass
 class CircuitBreakerConfig:
-    failure_threshold: int = 5            # сколько ошибок подряд, чтобы открыть
-    recovery_timeout: int = 60            # сек до попытки half-open
-    success_threshold: int = 3            # успешных вызовов, чтобы закрыть
-    window_size: int = 60                 # окно для подсчёта ошибок (сек)
+    failure_threshold: int = 5  # сколько ошибок подряд, чтобы открыть
+    recovery_timeout: int = 60  # сек до попытки half-open
+    success_threshold: int = 3  # успешных вызовов, чтобы закрыть
+    window_size: int = 60  # окно для подсчёта ошибок (сек)
 
 
 class CircuitOpenError(Exception):
@@ -36,6 +36,7 @@ class CircuitBreaker:
     """
     Потокобезопасный circuit breaker с half-open и скользящим окном ошибок.
     """
+
     def __init__(self, name: str, config: Optional[CircuitBreakerConfig] = None):
         self.name = name
         self.config = config or CircuitBreakerConfig()
@@ -123,6 +124,22 @@ class RetryWithBackoff:
     def __init__(self, cfg: Optional[RetryConfig] = None):
         self.cfg = cfg or RetryConfig()
 
+    def execute(self, func, *args, **kwargs):
+        """
+        Совместимость с тестами: синоним основного запуска с ретраями.
+        """
+        last_exception = None
+        for attempt in range(self.config.max_attempts):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                last_exception = e
+                if attempt < self.config.max_attempts - 1:
+                    delay = self._calculate_delay(attempt)
+                    logger.warning("Attempt %s failed: %s. Retrying in %.2fs", attempt + 1, e, delay)
+                    time.sleep(delay)
+        raise last_exception
+
     def _delay_for(self, attempt: int) -> float:
         delay = min(self.cfg.base_delay * (self.cfg.exponential_base ** attempt), self.cfg.max_delay)
         if self.cfg.jitter:
@@ -150,6 +167,7 @@ class ErrorRecoverySystem:
     """
     Унифицированный слой защиты: circuit breaker + retry.
     """
+
     def __init__(self):
         self._cb_map: Dict[str, CircuitBreaker] = {}
         self._retry = RetryWithBackoff()
@@ -161,8 +179,10 @@ class ErrorRecoverySystem:
 
     def protected_call(self, name: str, fn: Callable[..., Any], *args, **kwargs) -> Any:
         cb = self.breaker(name)
+
         def _wrapped():
             return cb.call(fn, *args, **kwargs)
+
         return self._retry.run(_wrapped)
 
     def get_status(self) -> Dict[str, Any]:

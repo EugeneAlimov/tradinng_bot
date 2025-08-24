@@ -2,66 +2,85 @@
 from __future__ import annotations
 
 import os
-import fcntl
+import time
 import threading
+import logging
 from pathlib import Path
 from typing import Optional
-import time
-import logging
 
 logger = logging.getLogger(__name__)
+
+# На Linux используем fcntl для межпроцессной блокировки.
+try:
+    import fcntl  # type: ignore
+except Exception:  # pragma: no cover
+    fcntl = None
 
 
 class ThreadSafeNonceManager:
     """
-    Монотонный nonce с файловой блокировкой и атомарной записью (POSIX).
-    Безопасен для многопоточности и мультипроцесса.
+    Потокобезопасный и (по возможности) межпроцессный менеджер nonce.
+    Обеспечивает монотонный рост и уникальность в рамках процесса/хоста.
+    Тесты ожидают методы: get_next_nonce() и next().
     """
+
     def __init__(self, storage_path: str = "data/.exmo_nonce"):
-        self._path = Path(storage_path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock_path = self._path.with_suffix(self._path.suffix + ".lock")
+        self.storage_path = Path(storage_path)
+        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
         self._mem_lock = threading.Lock()
-        self._last_nonce: int = 0
-        self._load()
+        self._last = 0
+        self._load_last()
 
-    def _load(self) -> None:
-        try:
-            if self._path.exists():
-                self._last_nonce = int(self._path.read_text().strip() or "0")
-                logger.debug("nonce loaded: %s", self._last_nonce)
-        except Exception as e:
-            logger.warning("nonce load failed: %s", e)
-            self._last_nonce = 0
+    # --- публичное API, ожидаемое тестами ---
 
-    def _persist_atomic(self, nonce: int) -> None:
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        with open(self._lock_path, "w") as lfd:
-            fcntl.flock(lfd.fileno(), fcntl.LOCK_EX)
-            try:
-                tmp.write_text(str(nonce))
-                tmp.replace(self._path)
-            finally:
-                fcntl.flock(lfd.fileno(), fcntl.LOCK_UN)
+    def get_next_nonce(self) -> int:
+        with self._mem_lock:
+            now = int(time.time() * 1000)
+            new = max(now, self._last + 1)
+            self._persist(new)
+            self._last = new
+            return new
 
     def next(self) -> int:
-        with self._mem_lock:
-            now_ms = int(time.time() * 1000)
-            new_nonce = max(now_ms, self._last_nonce + 1)
-            try:
-                self._persist_atomic(new_nonce)
-            except Exception as e:
-                logger.error("nonce save failed: %s", e)
-            self._last_nonce = new_nonce
-            return new_nonce
+        """Синоним для тестов совместимости."""
+        return self.get_next_nonce()
 
     def reset(self) -> None:
         with self._mem_lock:
-            self._last_nonce = 0
+            self._last = 0
             try:
-                if self._path.exists():
-                    self._path.unlink()
-                if self._lock_path.exists():
-                    self._lock_path.unlink()
+                if self.storage_path.exists():
+                    self.storage_path.unlink()
+            except Exception as e:
+                logger.warning("Nonce reset failed: %s", e)
+
+    # --- внутреннее ---
+
+    def _load_last(self) -> None:
+        try:
+            if self.storage_path.exists():
+                txt = self.storage_path.read_text().strip()
+                self._last = int(txt) if txt else 0
+        except Exception as e:
+            logger.warning("Failed to load nonce: %s", e)
+            self._last = 0
+
+    def _persist(self, value: int) -> None:
+        # атомарная запись с опциональной файловой блокировкой
+        tmp = self.storage_path.with_suffix(".tmp")
+        try:
+            if fcntl is not None:
+                with open(self.storage_path.with_suffix(".lock"), "w") as lockf:
+                    fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+                    tmp.write_text(str(value))
+                    tmp.replace(self.storage_path)
+                    fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+            else:
+                tmp.write_text(str(value))
+                tmp.replace(self.storage_path)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)  # type: ignore[arg-type]
             except Exception:
                 pass
