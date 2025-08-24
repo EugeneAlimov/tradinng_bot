@@ -8,6 +8,7 @@ import math
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Callable, Optional, Any, Sequence, Dict, List, Tuple
 
 from src.config.settings import get_settings
@@ -57,6 +58,23 @@ def _parse_exmo_candles(spec: Optional[str]) -> Tuple[int, int]:
     return 1, 300
 
 
+def _unix_seconds(ts_like: Any) -> Optional[int]:
+    """
+    Приводит ts к UNIX-секундам.
+    Поддерживает секунды (~1e9), миллисекунды (~1e12) и микросекунды (~1e15).
+    Возвращает int секунд или None, если распарсить не удалось.
+    """
+    try:
+        ts = float(ts_like)
+    except Exception:
+        return None
+    if ts > 1e15:       # микросекунды
+        ts = ts / 1_000_000.0
+    elif ts > 1e12:     # миллисекунды
+        ts = ts / 1_000.0
+    return int(ts)
+
+
 def _sma(series: List[float], window: int) -> List[Optional[float]]:
     if window <= 0:
         raise ValueError("window must be > 0")
@@ -91,6 +109,10 @@ def _cross_signals(prices: List[float], fast: int, slow: int) -> List[int]:
             last_state = state
     return signals
 
+
+# ---------------------------
+# BACKTEST (с CSV/сводкой)
+# ---------------------------
 
 def _backtest_sma(prices: List[float], timestamps: List[int], signals: List[int],
                   fee_bps: int, slip_bps: int) -> Dict[str, Any]:
@@ -137,7 +159,7 @@ def _backtest_sma(prices: List[float], timestamps: List[int], signals: List[int]
             equity_steps.append((ts, equity))
             position = 0
 
-    # Закрытие в конце по последней цене (для консистентности отчёта)
+    # Закрытие в конце по последней цене
     if position == 1 and prices:
         px = prices[-1]
         ts = timestamps[-1]
@@ -163,7 +185,7 @@ def _backtest_sma(prices: List[float], timestamps: List[int], signals: List[int]
     avg_pnl = (total_pnl / n) if n else 0.0
     win_rate = (wins / n) if n else 0.0
 
-    # Max Drawdown по ступенчатой кривой equity
+    # Max Drawdown (по ступенчатой equity)
     mdd = 0.0
     peak = -1e18
     for _, eq in equity_steps:
@@ -171,7 +193,7 @@ def _backtest_sma(prices: List[float], timestamps: List[int], signals: List[int]
             peak = eq
         mdd = min(mdd, eq - peak)  # отрицательная величина
 
-    # Sharpe по доходностям сделок (условно)
+    # Sharpe по доходностям сделок
     if len(rets) >= 2:
         mu = sum(rets) / len(rets)
         var = sum((r - mu) ** 2 for r in rets) / (len(rets) - 1)
@@ -187,7 +209,7 @@ def _backtest_sma(prices: List[float], timestamps: List[int], signals: List[int]
         "total_pnl": total_pnl,
         "avg_pnl": avg_pnl,
         "win_rate": win_rate,
-        "mdd": mdd,          # отрицательное число
+        "mdd": mdd,
         "sharpe": sharpe,
     }
 
@@ -215,8 +237,10 @@ def _save_equity_csv(path: str, equity_steps: List[Tuple[int, float]]) -> None:
 def _register_common_flags(sp: argparse._SubParsersAction) -> None:
     """
     Подкоманды + флаги. Для backtest добавлены: fast/slow/fee/slip и CSV-выгрузки.
+    Для trade-live добавлен --mode observe и интервалы опроса.
     """
-    for name in ("backtest", "sweep", "walk-forward", "robustness", "optimize", "trade-live"):
+    # ---- backtest / sweep / walk-forward / robustness / optimize ----
+    for name in ("backtest", "sweep", "walk-forward", "robustness", "optimize"):
         cmd = sp.add_parser(name, help=f"{name} command")
 
         # Базовые флаги
@@ -230,16 +254,18 @@ def _register_common_flags(sp: argparse._SubParsersAction) -> None:
         cmd.add_argument("--fee-bps", type=int, default=10)
         cmd.add_argument("--slip-bps", type=int, default=2)
 
-        # CSV/репорты
+        # CSV/репорты (для backtest)
         cmd.add_argument("--csv-trades", type=str, default=None, help="Путь для сохранения trades.csv")
         cmd.add_argument("--csv-equity", type=str, default=None, help="Путь для сохранения equity.csv")
         cmd.add_argument("--summary-alert", action="store_true", help="Отправить сводку в Telegram (если настроен)")
 
-        # Stage‑A: Risk / Alerts / Reconcile
+        # Stage-A: Risk / Alerts / Reconcile
         cmd.add_argument("--max-position-pct", type=float, default=None,
                          help="Max position fraction of equity, e.g. 0.25")
         cmd.add_argument("--stop-loss-bps", type=int, default=None,
                          help="Stop loss in bps, e.g. 300 = 3%")
+        cmd.add_argument("--max-daily-loss-bps", type=int, default=None,
+                         help="Daily loss hard limit in bps, blocks new trades when reached")
         cmd.add_argument("--reconcile-threshold-qty", type=float, default=None,
                          help="Reconcile threshold on position qty delta")
 
@@ -249,8 +275,33 @@ def _register_common_flags(sp: argparse._SubParsersAction) -> None:
         # Отладка
         cmd.add_argument("--debug", action="store_true")
         cmd.add_argument("--exmo-debug", action="store_true")
-
         cmd.set_defaults(func=_dispatch_command)
+
+    # ---- trade-live ----
+    live = sp.add_parser("trade-live", help="Live pipelines")
+    live.add_argument("--mode", type=str, choices=["observe"], default="observe",
+                      help="Live mode (observe only in this build)")
+    live.add_argument("--exmo-pair", type=str, default="DOGE_EUR")
+    live.add_argument("--exmo-candles", type=str, default="1m:300")
+    live.add_argument("--fast", type=int, default=6)
+    live.add_argument("--slow", type=int, default=25)
+    live.add_argument("--poll-sec", type=int, default=10)
+    live.add_argument("--heartbeat-sec", type=int, default=30)
+    live.add_argument("--summary-alert", action="store_true",
+                      help="Отправлять в Telegram сигнал при смене состояния и heartbeat")
+
+    # Stage-A: Risk / Alerts / Reconcile (для live тоже пригодится)
+    live.add_argument("--max-position-pct", type=float, default=None)
+    live.add_argument("--stop-loss-bps", type=int, default=None)
+    live.add_argument("--max-daily-loss-bps", type=int, default=None)
+    live.add_argument("--reconcile-threshold-qty", type=float, default=None)
+
+    live.add_argument("--tg-token", type=str, default=None)
+    live.add_argument("--tg-chat", type=str, default=None)
+
+    live.add_argument("--debug", action="store_true")
+    live.add_argument("--exmo-debug", action="store_true")
+    live.set_defaults(func=_dispatch_command)
 
 
 def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
@@ -265,7 +316,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 
 
 # ---------------------------
-# РАНТАЙМ‑КОМПОЗИЦИЯ (Stage‑A)
+# РАНТАЙМ-КОМПОЗИЦИЯ (Stage-A)
 # ---------------------------
 
 def _compose_stage_a(args: argparse.Namespace) -> Dict[str, Any]:
@@ -277,18 +328,18 @@ def _compose_stage_a(args: argparse.Namespace) -> Dict[str, Any]:
         return getattr(s, name) if hasattr(s, name) else default
 
     notifier = TelegramNotifier(
-        _opt(args.tg_token, "tg_token", ""),
-        _opt(args.tg_chat, "tg_chat", "")
+        _opt(getattr(args, "tg_token", None), "tg_token", ""),
+        _opt(getattr(args, "tg_chat", None), "tg_chat", "")
     )
     risk_service = RiskService(RiskCfg(
-        max_position_pct=_opt(args.max_position_pct, "max_position_pct", 0.25),
-        stop_loss_bps=_opt(args.stop_loss_bps, "stop_loss_bps", 300),
-        max_daily_loss_bps=None,
+        max_position_pct=_opt(getattr(args, "max_position_pct", None), "max_position_pct", 0.25),
+        stop_loss_bps=_opt(getattr(args, "stop_loss_bps", None), "stop_loss_bps", 300),
+        max_daily_loss_bps=_opt(getattr(args, "max_daily_loss_bps", None), "max_daily_loss_bps", None),
     ))
     integration = EngineIntegration(
         notifier=notifier,
         risk=risk_service,
-        reconcile_threshold_qty=_opt(args.reconcile_threshold_qty, "reconcile_threshold_qty", 0.0001),
+        reconcile_threshold_qty=_opt(getattr(args, "reconcile_threshold_qty", None), "reconcile_threshold_qty", 0.0001),
     )
     return dict(settings=s, notifier=notifier, risk_service=risk_service, integration=integration)
 
@@ -298,9 +349,6 @@ def _compose_stage_a(args: argparse.Namespace) -> Dict[str, Any]:
 # ---------------------------
 
 def _run_backtest(args: argparse.Namespace, s, notifier: TelegramNotifier) -> int:
-    """
-    Мини‑бэктест (SMA‑кроссы) + отчёты/CSV.
-    """
     pair: str = args.exmo_pair
     res_min, count = _parse_exmo_candles(args.exmo_candles)
     now = int(time.time())
@@ -322,16 +370,19 @@ def _run_backtest(args: argparse.Namespace, s, notifier: TelegramNotifier) -> in
         LOG.error("Unexpected candles format from EXMO: %s", type(data))
         return 2
 
+    # НОРМАЛИЗОВАННЫЙ ПАРСИНГ СЕК/МС/МКС
     rows: List[Tuple[int, float]] = []
     for c in candles:
-        ts = c.get("t") or c.get("time") or c.get("timestamp") or c.get("date")
-        close = c.get("c") or c.get("close")
-        if ts is None or close is None:
+        ts_raw = c.get("t") or c.get("time") or c.get("timestamp") or c.get("date")
+        close_raw = c.get("c") or c.get("close")
+        if ts_raw is None or close_raw is None:
             continue
+        ts = _unix_seconds(ts_raw)
         try:
-            ts = int(ts)
-            close = float(close)
+            close = float(close_raw)
         except Exception:
+            continue
+        if ts is None:
             continue
         rows.append((ts, close))
     rows.sort(key=lambda x: x[0])
@@ -353,16 +404,14 @@ def _run_backtest(args: argparse.Namespace, s, notifier: TelegramNotifier) -> in
     LOG.info("Trades: %d  WinRate: %.1f%%  AvgPnL: %.6f  TotalPnL: %.6f  MaxDD: %.6f  Sharpe(trades): %.2f",
              stats["n_trades"], 100.0 * stats["win_rate"], stats["avg_pnl"], stats["total_pnl"], stats["mdd"], stats["sharpe"])
 
-    # CSV
-    if args.csv_trades:
+    if getattr(args, "csv_trades", None):
         _save_trades_csv(args.csv_trades, stats["trades"])
         LOG.info("Saved trades CSV -> %s", args.csv_trades)
-    if args.csv_equity:
+    if getattr(args, "csv_equity", None):
         _save_equity_csv(args.csv_equity, stats["equity_steps"])
         LOG.info("Saved equity CSV -> %s", args.csv_equity)
 
-    # Telegram summary (если включён и настроен)
-    if args.summary_alert and notifier.enabled:
+    if getattr(args, "summary_alert", False) and notifier.enabled:
         msg = (
             f"<b>Backtest {pair} {args.exmo_candles}</b>\n"
             f"fast={fast} slow={slow} fee={int(args.fee_bps)}bps slip={int(args.slip_bps)}bps\n"
@@ -379,6 +428,126 @@ def _run_backtest(args: argparse.Namespace, s, notifier: TelegramNotifier) -> in
 
 
 # ---------------------------
+# LIVE: OBSERVE
+# ---------------------------
+
+def _run_live_observe(args: argparse.Namespace, s, notifier: TelegramNotifier, integration: EngineIntegration) -> int:
+    """
+    Поллинг последних свечей, расчёт SMA и статуса. Без реальных ордеров.
+    Telegram-алёрты при смене статуса, heartbeat по таймеру.
+    """
+    pair: str = args.exmo_pair
+    res_min, count = _parse_exmo_candles(args.exmo_candles)
+    fast = max(2, int(args.fast))
+    slow = max(fast + 1, int(args.slow))
+    poll_sec = max(1, int(args.poll_sec))
+    hb_sec = max(5, int(args.heartbeat_sec))
+
+    exmo = build_exmo_from_settings()
+
+    last_ts = 0
+    last_state = None   # 1 / -1
+    last_hb = 0.0
+
+    LOG.info("[live] observe %s %s fast=%d slow=%d poll=%ds", pair, args.exmo_candles, fast, slow, poll_sec)
+
+    try:
+        while True:
+            now = int(time.time())
+            since = now - res_min * 60 * count
+            try:
+                data = exmo.candles_history(pair, res_min, since, now)
+            except Exception as e:
+                LOG.error("[live] EXMO error: %s", e)
+                time.sleep(poll_sec)
+                continue
+
+            candles = []
+            if isinstance(data, dict) and "candles" in data and isinstance(data["candles"], list):
+                candles = data["candles"]
+            elif isinstance(data, list):
+                candles = data
+            else:
+                LOG.error("[live] unexpected candles format: %s", type(data))
+                time.sleep(poll_sec)
+                continue
+
+            # НОРМАЛИЗОВАННЫЙ ПАРСИНГ СЕК/МС/МКС
+            rows: List[Tuple[int, float]] = []
+            for c in candles:
+                ts_raw = c.get("t") or c.get("time") or c.get("timestamp") or c.get("date")
+                close_raw = c.get("c") or c.get("close")
+                if ts_raw is None or close_raw is None:
+                    continue
+                ts = _unix_seconds(ts_raw)
+                try:
+                    close = float(close_raw)
+                except Exception:
+                    continue
+                if ts is None:
+                    continue
+                rows.append((ts, close))
+            rows.sort(key=lambda x: x[0])
+
+            if not rows:
+                time.sleep(poll_sec)
+                continue
+
+            ts_list = [ts for ts, _ in rows]
+            prices = [p for _, p in rows]
+            sma_f = _sma(prices, fast)
+            sma_s = _sma(prices, slow)
+            i = len(prices) - 1
+            if i < 0 or sma_f[i] is None or sma_s[i] is None:
+                time.sleep(poll_sec)
+                continue
+
+            ts = ts_list[i]
+            close = prices[i]
+            f = float(sma_f[i])
+            s_val = float(sma_s[i])
+            state = 1 if f > s_val else (-1 if f < s_val else 0)
+
+            # тик/изменение
+            if ts != last_ts:
+                # лог тик
+                t_iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                LOG.info("[live] %s tick  close=%.6f  f=%.6f  s=%.6f", t_iso, close, f, s_val)
+
+                # смена состояния => алерт
+                if args.summary_alert and notifier.enabled and (last_state is None or state != last_state):
+                    arrow = "🔼" if state == 1 else ("🔽" if state == -1 else "⏸")
+                    msg = (
+                        f"<b>Signal {pair}</b> {args.exmo_candles}\n"
+                        f"{arrow} state={state} close={close:.6f}\n"
+                        f"fast={fast} slow={slow}\n"
+                        f"SMAf={f:.6f} SMAs={s_val:.6f}"
+                    )
+                    try:
+                        notifier.send(msg)
+                    except Exception:
+                        pass
+
+                last_ts = ts
+                last_state = state
+
+            # heartbeat
+            now_mono = time.monotonic()
+            if args.summary_alert and notifier.enabled and (now_mono - last_hb >= hb_sec):
+                try:
+                    notifier.send(f"✅ live {pair} ok  close={close:.6f}  f={f:.6f}  s={s_val:.6f}")
+                except Exception:
+                    pass
+                last_hb = now_mono
+
+            time.sleep(poll_sec)
+
+    except KeyboardInterrupt:
+        LOG.info("[live] stop by user")
+        return 0
+
+
+# ---------------------------
 # ОБРАБОТЧИК КОМАНД
 # ---------------------------
 
@@ -392,12 +561,18 @@ def _dispatch_command(args: argparse.Namespace) -> int:
     comps = _compose_stage_a(args)
     s = comps["settings"]
     notifier: TelegramNotifier = comps["notifier"]
+    integration: EngineIntegration = comps["integration"]
 
     cmd = getattr(args, "command", "")
     LOG.info("Command: %s", cmd)
 
     if cmd == "backtest":
         return _run_backtest(args, s, notifier)
+    if cmd == "trade-live":
+        if args.mode == "observe":
+            return _run_live_observe(args, s, notifier, integration)
+        LOG.error("Unsupported live mode: %s", args.mode)
+        return 2
     if cmd == "sweep":
         LOG.info("Sweep pipeline is not wired yet.")
         return 0
@@ -409,9 +584,6 @@ def _dispatch_command(args: argparse.Namespace) -> int:
         return 0
     if cmd == "optimize":
         LOG.info("Optimize pipeline is not wired yet.")
-        return 0
-    if cmd == "trade-live":
-        LOG.info("Live trading is not wired yet.")
         return 0
 
     LOG.error("Unknown command: %r", cmd)
