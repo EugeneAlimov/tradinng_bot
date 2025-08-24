@@ -276,7 +276,7 @@ def run_optimize(
             "wf": {
                 "wf_top_n": wf_top_n, "folds": folds,
                 "min_train_bars": min_train_bars, "min_valid_bars": min_valid_bars,
-                "filters": {
+                "filters.py": {
                     "wf_min_pf": wf_min_pf, "wf_min_return_pct": wf_min_return_pct,
                     "wf_max_dd_pct": wf_max_dd_pct, "wf_min_winrate_pct": wf_min_winrate_pct,
                     "wf_min_sharpe": wf_min_sharpe, "wf_min_cagr_pct": wf_min_cagr_pct,

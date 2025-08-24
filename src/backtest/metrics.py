@@ -1,3 +1,4 @@
+# src/backtest/metrics.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ def _safe_std(x: np.ndarray) -> float:
 def estimate_bars_per_year(index: pd.DatetimeIndex) -> float:
     """
     Оцениваем число баров в год по медианной длительности бара.
-    Работает и для 24/7 крипты, и для нерегулярного ряда.
+    Подходит для 24/7 крипты и нерегулярного ряда.
     """
     if len(index) < 2:
         return 1.0
@@ -33,7 +34,7 @@ def estimate_bars_per_year(index: pd.DatetimeIndex) -> float:
 def max_drawdown(equity: pd.Series) -> Tuple[float, float, float]:
     """
     Возвращает (max_drawdown_pct, peak_value, trough_value)
-    где max_drawdown_pct — отрицательная величина (например, -0.25 == -25%).
+    max_drawdown_pct < 0 (например, -0.25 == -25%).
     """
     if equity.isna().all() or len(equity) == 0:
         return (0.0, np.nan, np.nan)
@@ -42,7 +43,6 @@ def max_drawdown(equity: pd.Series) -> Tuple[float, float, float]:
     running_max = eq.cummax()
     dd = eq / running_max - 1.0
     md = float(dd.min())
-    # peak/trough значения (не даты)
     trough_idx = int(np.argmin(dd.values))
     peak_val = float(running_max.iloc[: trough_idx + 1].max())
     trough_val = float(eq.iloc[trough_idx])
@@ -50,9 +50,6 @@ def max_drawdown(equity: pd.Series) -> Tuple[float, float, float]:
 
 
 def cagr(equity: pd.Series, bars_per_year: float) -> float:
-    """
-    CAGR с учётом частоты баров.
-    """
     if len(equity) < 2:
         return 0.0
     start = float(equity.iloc[0])
@@ -67,8 +64,8 @@ def cagr(equity: pd.Series, bars_per_year: float) -> float:
 
 def sharpe_from_equity(equity: pd.Series, bars_per_year: float, risk_free: float = 0.0) -> float:
     """
-    Sharpe на основе поминутных/побарных доходностей, далее годовой.
-    risk_free задаётся в тех же единицах, что и доходности (на бар).
+    Sharpe по побарным доходностям, затем годование.
+    risk_free — в тех же единицах, что и доходность на бар.
     """
     if len(equity) < 3:
         return 0.0
@@ -84,9 +81,6 @@ def sharpe_from_equity(equity: pd.Series, bars_per_year: float, risk_free: float
 
 
 def profit_factor(trade_pnls: Iterable[float]) -> float:
-    """
-    PF = sum(positive) / |sum(negative)|
-    """
     pos = 0.0
     neg = 0.0
     for p in trade_pnls:
@@ -127,9 +121,6 @@ def compute_equity_metrics(
     risk_free: float = 0.0,
     bars_per_year_hint: Optional[float] = None,
 ) -> EquityMetrics:
-    """
-    Унифицированный расчёт метрик по кривой капитала и PnL сделок.
-    """
     equity = equity.astype(float)
     bars = int(equity.size)
     start = float(equity.iloc[0] if bars > 0 else start_equity)
@@ -142,7 +133,6 @@ def compute_equity_metrics(
     cg = cagr(equity, bpy)
     calmar = (cg / abs(md)) if abs(md) > 1e-12 else float("inf")
     pf = profit_factor(trade_pnls)
-
     avg_trade = (np.mean(list(trade_pnls)) if n_trades > 0 else 0.0)
 
     return EquityMetrics(
@@ -158,6 +148,6 @@ def compute_equity_metrics(
         exposure_pct=exposure_pct,
         sharpe=shp,
         cagr_pct=100.0 * cg,
-        calmar=calmar * 100.0,  # чтобы совпадать по шкале с твоими табличками
+        calmar=calmar * 100.0,  # для согласования со шкалой в текущих таблицах
         bars_per_year=bpy,
     )

@@ -166,7 +166,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--d-hyst", type=int, default=5)
     p.add_argument("--d-cd", type=int, default=2)
 
-    # optimize-only: WF filters / ranking / final backtest
+    # optimize-only: WF filters.py / ranking / final backtest
     p.add_argument("--wf-top-n", type=int, default=5)
     p.add_argument("--wf-min-pf", type=float, default=None)
     p.add_argument("--wf-min-return", type=float, default=None)

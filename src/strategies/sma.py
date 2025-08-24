@@ -1,60 +1,44 @@
-# -*- coding: utf-8 -*-
-from collections import deque
-from typing import Optional, NamedTuple
+# src/strategy/sma.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+import numpy as np
+import pandas as pd
+from .base import Strategy, apply_cooldown
 
 
-class Bar(NamedTuple):
-    ts: int  # unix seconds (UTC)
-    o: float;
-    h: float;
-    l: float;
-    c: float;
-    v: float
+@dataclass
+class SMACrossParams:
+    fast: int
+    slow: int
+    hysteresis_bps: int = 0
+    cooldown_bars: int = 0
 
 
-class Signal(NamedTuple):
-    side: str  # "buy" | "sell"
-    price: float
-    reason: str
+class SMACrossStrategy(Strategy):
+    """
+    Простой SMA crossover:
+    - позиция 1, если (fast - slow)/slow > +hysteresis_bps
+    - позиция 0, если (fast - slow)/slow < -hysteresis_bps
+    - иначе удерживаем предыдущее состояние
+    """
+    def __init__(self, params: SMACrossParams):
+        self.p = params
 
+    def generate_position(self, close: pd.Series) -> pd.Series:
+        fma = close.rolling(self.p.fast, min_periods=self.p.fast).mean()
+        sma = close.rolling(self.p.slow, min_periods=self.p.slow).mean()
+        diff_bps = (fma - sma) / sma.replace(0, np.nan) * 1e4
+        diff_bps = diff_bps.fillna(0.0)
 
-class SMA:
-    def __init__(self, n: int):
-        self.n = n
-        self.q = deque()
-        self.s = 0.0
+        pos = np.zeros(len(close), dtype=np.int8)
+        state = 0
+        for i in range(len(close)):
+            if state == 0 and diff_bps.iat[i] > self.p.hysteresis_bps:
+                state = 1
+            elif state == 1 and diff_bps.iat[i] < -self.p.hysteresis_bps:
+                state = 0
+            pos[i] = state
 
-    def push(self, x: float) -> Optional[float]:
-        self.q.append(x);
-        self.s += x
-        if len(self.q) > self.n:
-            self.s -= self.q.popleft()
-        if len(self.q) == self.n:
-            return self.s / self.n
-        return None
-
-
-class SmaCross:
-    """Простая стратегия: лонг при пересечении fast вверх slow, выход при обратном пересечении."""
-
-    def __init__(self, fast: int, slow: int):
-        assert fast < slow, "fast < slow"
-        self.fast = SMA(fast)
-        self.slow = SMA(slow)
-        self.in_position = False
-        self.last = None  # "up" | "down" | None
-
-    def on_bar(self, bar: Bar) -> Optional[Signal]:
-        f = self.fast.push(bar.c)
-        s = self.slow.push(bar.c)
-        if f is None or s is None:
-            return None
-        if (not self.in_position) and f >= s and self.last != "up":
-            self.in_position = True
-            self.last = "up"
-            return Signal("buy", bar.c, "sma_cross_up")
-        if self.in_position and f < s and self.last != "down":
-            self.in_position = False
-            self.last = "down"
-            return Signal("sell", bar.c, "sma_cross_down")
-        return None
+        raw = pd.Series(pos, index=close.index, name="position")
+        return apply_cooldown(raw, self.p.cooldown_bars)

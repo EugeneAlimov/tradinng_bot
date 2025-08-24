@@ -1,19 +1,19 @@
-import pandas as pd
+# tests/test_walkforward_api.py
 import numpy as np
+import pandas as pd
 
 from src.backtest.walkforward import WFConfig, run_walkforward
 
 
-def make_df(n=1000, freq="5min"):
+def _make_df(n=1200, freq="5min"):
     idx = pd.date_range("2024-01-01", periods=n, freq=freq, tz="UTC")
-    # синтетика: случайный блуждающий close
     rng = np.random.default_rng(42)
-    close = 100 + np.cumsum(rng.normal(0, 0.05, size=n))
-    return pd.DataFrame({"close": close}, index=idx)
+    close = pd.Series(100 + np.cumsum(rng.normal(0, 0.05, size=n)), index=idx)
+    return pd.DataFrame({"close": close})
 
 
 def test_wf_contract():
-    df = make_df(1200, "5min")
+    df = _make_df(1200, "5min")
     cfg = WFConfig(
         pair="TEST_EUR",
         span="1m:5000",
