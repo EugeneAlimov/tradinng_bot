@@ -12,6 +12,7 @@ from __future__ import annotations
   - build_bt_config
   - SimConfig
   - normalize_metrics
+  - run_backtest_compat
 """
 
 from dataclasses import dataclass, asdict
@@ -19,7 +20,7 @@ from typing import Any, Dict, Optional
 
 
 def _sweep() -> Any:
-    # ленивый импорт во избежание циклических зависимостей
+    # Ленивый импорт, чтобы избежать циклических зависимостей при загрузке модулей
     from . import sweep  # type: ignore
     return sweep
 
@@ -187,6 +188,43 @@ def normalize_metrics(metrics: Any, *args: Any, **kwargs: Any) -> Dict[str, Any]
     return out
 
 
+# ---------- Совместимый вызов бэктеста (для optimize/sweep) ----------
+
+def run_backtest_compat(bt_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Унифицированный бэктест:
+      - берёт готовый df из bt_cfg['df'] (если уже получен upstream),
+      - иначе сам скачивает свечи через EXMO-кашер,
+      - нормализует правило ресемплинга и ресемплит,
+      - считает метрики через simulate_on_df.
+    Возвращает dict с метриками (совместим с существующим пайплайном).
+    """
+    # 1) исходный df, если передали заранее
+    df = bt_cfg.get("df")
+
+    # 2) иначе — подтянем свечи
+    if df is None:
+        pair = str(bt_cfg.get("pair"))
+        if not pair:
+            raise ValueError("run_backtest_compat: 'pair' is required in bt_cfg")
+
+        # Поддерживаем несколько ключей для источника свечей
+        span = bt_cfg.get("span") or bt_cfg.get("exmo_candles") or "1m:2000"
+        cache_dir = bt_cfg.get("cache_dir")
+
+        df = fetch_exmo_candles_cached(pair=pair, span=str(span), cache_dir=cache_dir)
+
+    # 3) нормализуем правило ресемплинга и ресемплим
+    rule = normalize_resample_rule(str(bt_cfg.get("resample", "5m")))
+    df_rs = resample_ohlc(df, rule) if rule else df
+
+    # 4) считаем метрики
+    metrics = simulate_on_df(df_rs, bt_cfg)
+
+    # 5) перестраховка: вернуть нормализованные метрики
+    return normalize_metrics(metrics)
+
+
 __all__ = [
     "fetch_exmo_candles_cached",
     "resample_ohlc",
@@ -195,4 +233,5 @@ __all__ = [
     "build_bt_config",
     "SimConfig",
     "normalize_metrics",
+    "run_backtest_compat",
 ]
