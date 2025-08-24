@@ -3,96 +3,107 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Tuple
-import pandas as pd
+from typing import List
 import numpy as np
+import pandas as pd
 
-
-MetricName = Literal[
-    "total_return_pct", "profit_factor", "calmar", "sharpe", "cagr_pct",
-]
 
 @dataclass
-class RobustCfg:
+class StabilityCfg:
     csv_path: Path
-    min_trades: int = 4
-    metric: MetricName = "calmar"
+    metric: str = "calmar"
+    min_trades: int = 0
     d_fast: int = 2
     d_slow: int = 5
     d_hyst: int = 5
     d_cd: int = 2
+    top_n: int = 20
 
 
-def _load_sweep(csv_path: Path) -> pd.DataFrame:
-    if not csv_path.exists():
-        raise FileNotFoundError(f"Sweep CSV not found: {csv_path}")
-    try:
-        df = pd.read_csv(csv_path)
-    except pd.errors.EmptyDataError:
-        raise RuntimeError("Sweep CSV is empty (no data).")
+def _coerce_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
 
-def _neighbors_mask(df: pd.DataFrame, row: pd.Series, d: Tuple[int, int, int, int]) -> pd.Series:
-    d_fast, d_slow, d_hyst, d_cd = d
-    return (
-        (df["fast"].sub(row["fast"]).abs() <= d_fast) &
-        (df["slow"].sub(row["slow"]).abs() <= d_slow) &
-        (df["hysteresis_bps"].sub(row["hysteresis_bps"]).abs() <= d_hyst) &
-        (df["cooldown_bars"].sub(row["cooldown_bars"]).abs() <= d_cd) &
-        (df["qty_eur"] == row["qty_eur"])
-    )
+def _load_csv_maybe_glob(path: Path) -> pd.DataFrame:
+    if any(ch in str(path) for ch in "*?[]"):
+        parts = sorted(path.parent.glob(path.name))
+        dfs = []
+        for p in parts:
+            try:
+                dfs.append(pd.read_csv(p))
+            except Exception:
+                pass
+        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+    else:
+        return pd.read_csv(path)
 
 
 def compute_stability(
-    csv_path: Path,
-    min_trades: int = 4,
-    metric: MetricName = "calmar",
-    d_fast: int = 2, d_slow: int = 5, d_hyst: int = 5, d_cd: int = 2,
+    *, csv_path: Path, metric: str, min_trades: int,
+    d_fast: int, d_slow: int, d_hyst: int, d_cd: int,
+    top_n: int = 20,
 ) -> pd.DataFrame:
-    """
-    Возвращает таблицу с колонками `stability_mean`, `stability_median`, `neighbors`,
-    отсортированную по stability_mean убыв.
-    """
-    df = _load_sweep(csv_path)
+    try:
+        df = _load_csv_maybe_glob(csv_path)
+    except Exception as e:
+        return pd.DataFrame(columns=["error"]).assign(error=f"load_failed: {e}")
 
-    # Важно: оставляем только успешные строки
-    if "error" in df.columns:
-        df = df[(df["error"].isna()) | (df["error"] == "")]
-    # Нужные колонки должны существовать
-    needed_cols = {"fast", "slow", "hysteresis_bps", "cooldown_bars", "qty_eur", "trades"}
-    for c in needed_cols:
-        if c not in df.columns:
-            raise RuntimeError(f"Sweep CSV missing required column: '{c}'")
-
-    df = df[df["trades"].fillna(0).astype(int) >= int(min_trades)].copy()
     if df.empty:
-        raise RuntimeError("Sweep CSV contains no successful rows (all with errors).")
+        return pd.DataFrame(columns=["error"]).assign(error="empty_sweep")
 
-    # Числовая метрика
-    if metric not in df.columns:
-        raise RuntimeError(f"Metric '{metric}' not found in sweep CSV.")
-    vals = pd.to_numeric(df[metric], errors="coerce")
-    df = df[~vals.isna()].copy()
+    num_cols = [
+        "bars", "trades", "winrate_pct", "total_return_pct", "max_drawdown_pct",
+        "final_equity_eur", "start_equity_eur", "profit_factor", "avg_trade_eur",
+        "exposure_pct", "sharpe", "cagr_pct", "calmar",
+        "fast", "slow", "hysteresis_bps", "cooldown_bars", "qty_eur",
+        "fee_bps", "slip_bps", "max_daily_loss_bps",
+    ]
+    df = _coerce_numeric(df, num_cols)
 
-    # Расчёт стабильности по соседям ±d
-    stab_mean = []
-    stab_median = []
-    neigh_count = []
-    for _, r in df.iterrows():
-        mask = _neighbors_mask(df, r, (d_fast, d_slow, d_hyst, d_cd))
-        neighborhood = df.loc[mask, metric].astype(float)
-        neigh_count.append(int(neighborhood.shape[0]))
-        if neighborhood.empty:
-            stab_mean.append(np.nan)
-            stab_median.append(np.nan)
-        else:
-            stab_mean.append(float(neighborhood.mean()))
-            stab_median.append(float(neighborhood.median()))
+    df_ok = df.copy()
+    if "error" in df_ok.columns:
+        df_ok = df_ok[(df_ok["error"].isna()) | (df_ok["error"].astype(str).str.strip() == "")]
 
-    df["stability_mean"] = stab_mean
-    df["stability_median"] = stab_median
-    df["neighbors"] = neigh_count
+    if "trades" in df_ok.columns:
+        df_ok = df_ok[df_ok["trades"].fillna(0) >= int(min_trades)]
 
-    df = df.sort_values(["stability_mean", "stability_median"], ascending=False).reset_index(drop=True)
-    return df
+    if df_ok.empty:
+        return pd.DataFrame(columns=["error"]).assign(error="no_success_rows_after_filtering")
+
+    # соседство/устойчивость
+    for c in ["fast", "slow", "hysteresis_bps", "cooldown_bars"]:
+        if c not in df_ok.columns:
+            df_ok[c] = np.nan
+
+    if metric not in df_ok.columns:
+        df_ok[metric] = np.nan
+
+    rows = []
+    arr = df_ok[["fast", "slow", "hysteresis_bps", "cooldown_bars", metric]].to_numpy()
+    for i in range(len(df_ok)):
+        f, s, h, c, m = arr[i]
+        fast_ok = (np.abs(arr[:, 0] - f) <= d_fast)
+        slow_ok = (np.abs(arr[:, 1] - s) <= d_slow)
+        hyst_ok = (np.abs(arr[:, 2] - h) <= d_hyst)
+        cd_ok = (np.abs(arr[:, 3] - c) <= d_cd)
+        mask = fast_ok & slow_ok & hyst_ok & cd_ok
+        vals = df_ok.loc[mask, metric].dropna().to_numpy()
+        neigh_cnt = int(vals.size)
+        neigh_mean = float(np.nanmean(vals)) if neigh_cnt else np.nan
+        neigh_med = float(np.nanmedian(vals)) if neigh_cnt else np.nan
+        rows.append((neigh_mean, neigh_med, neigh_cnt))
+
+    df_ok = df_ok.copy()
+    df_ok["stability_mean"] = [r[0] for r in rows]
+    df_ok["stability_median"] = [r[1] for r in rows]
+    df_ok["neighbors"] = [r[2] for r in rows]
+
+    df_ok = df_ok.sort_values(by=["stability_mean", metric], ascending=[False, False], kind="mergesort")
+
+    if top_n and top_n > 0:
+        df_ok = df_ok.head(int(top_n)).reset_index(drop=True)
+
+    return df_ok
