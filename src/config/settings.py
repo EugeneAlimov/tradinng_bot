@@ -1,210 +1,75 @@
-from __future__ import annotations
-from dataclasses import dataclass, field
-from decimal import Decimal
-import os
-from src.config.env import load_env, env_str
-
-SETTINGS_SINGLETON = None
-
-
-@dataclass
-class RiskCfg:
-    position_size_usd: Decimal = Decimal(os.getenv("RISK_POSITION_SIZE_USD", "50"))
-    max_daily_loss: float = float(os.getenv("RISK_MAX_DAILY_LOSS", "0.03"))
-
-
-@dataclass
-class Settings:
-    api_key: str = field(default_factory=lambda: os.getenv("EXMO_API_KEY", ""))
-    api_secret: str = field(default_factory=lambda: os.getenv("EXMO_API_SECRET", ""))
-    storage_path: str = field(default_factory=lambda: os.getenv("STORAGE_PATH", "data/"))
-    default_pair: str = field(default_factory=lambda: os.getenv("DEFAULT_PAIR", "DOGE_EUR"))# -*- coding: utf-8 -*-
-"""
-Унифицированные настройки проекта:
-- читаем переменные окружения;
-- опционально читаем .env (если найден) без внешних зависимостей;
-- опционально читаем YAML-файл (если задан путь через TRADING_BOT_CONFIG=...).
-
-Есть минимальная валидация и удобные свойства.
-"""
-
+# src/config/settings.py
 from __future__ import annotations
 
 import os
-import re
-import json
-from dataclasses import dataclass, field
+from decimal import getcontext
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Final
 
+# ---------- numeric / decimal ----------
+# чуть повышаем точность финансовых расчётов
+getcontext().prec = int(os.environ.get("DECIMAL_PRECISION", "28"))
 
-_ENV_BOOL_TRUE = {"1", "true", "yes", "on", "y", "t"}
-_ENV_BOOL_FALSE = {"0", "false", "no", "off", "n", "f"}
+# ---------- paths ----------
+# путь до корня репозитория (src/.. -> корень)
+PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
+DATA_DIR: Final[Path] = Path(os.environ.get("BOT_DATA_DIR", PROJECT_ROOT / "data"))
+CACHE_DIR: Final[Path] = Path(os.environ.get("BOT_CACHE_DIR", DATA_DIR / "cache"))
+LOG_DIR: Final[Path] = Path(os.environ.get("BOT_LOG_DIR", PROJECT_ROOT / "logs"))
 
+# гарантируем наличие директорий
+for _p in (DATA_DIR, CACHE_DIR, LOG_DIR):
+    _p.mkdir(parents=True, exist_ok=True)
 
-def _str2bool(v: Optional[str], default: bool = False) -> bool:
+# ---------- env helpers ----------
+def env_bool(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name)
     if v is None:
         return default
-    s = str(v).strip().lower()
-    if s in _ENV_BOOL_TRUE:
-        return True
-    if s in _ENV_BOOL_FALSE:
-        return False
-    return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
-
-def _parse_env_file(path: Path) -> Dict[str, str]:
-    """
-    Простейший парсер .env без зависимостей (ключ=значение, без кавычек).
-    Игнорирует комментарии и пустые строки.
-    """
-    out: Dict[str, str] = {}
-    if not path.exists():
-        return out
-
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        # допускаем KEY="value" и KEY='value' и KEY=value
-        m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$', line)
-        if not m:
-            continue
-        k, v = m.group(1), m.group(2)
-        if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
-            v = v[1:-1]
-        out[k] = v
-    return out
-
-
-def _parse_yaml(path: Path) -> Dict[str, Any]:
-    """
-    Мини-парсер YAML: пытается загрузить .yml/.yaml как JSON-подобный словарь.
-    Если PyYAML не установлен — мягкий фолбэк: пытаемся прочитать как JSON.
-    """
-    if not path.exists():
-        return {}
+def env_int(name: str, default: int) -> int:
     try:
-        import yaml  # type: ignore
-        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        # Фолбэк на JSON (разрешает простые словари)
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+        return int(os.environ.get(name, default))
+    except Exception:  # noqa: BLE001
+        return default
 
+def env_str(name: str, default: str = "") -> str:
+    return str(os.environ.get(name, default))
 
-@dataclass
-class Settings:
-    # --- EXMO/API ---
-    exmo_api_key: Optional[str] = None
-    exmo_api_secret: Optional[str] = None
-    exmo_base_url: str = "https://api.exmo.com/v1.1"
-    exmo_timeout: int = 20
+# ---------- logging ----------
+LOG_LEVEL: Final[str] = env_str("LOG_LEVEL", "INFO")
 
-    # --- торговля/риск ---
-    default_pair: Optional[str] = None
-    max_notional_eur: float = 100.0
-    maker_by_default: bool = True
+# ---------- timezone ----------
+TIMEZONE: Final[str] = env_str("TZ", "UTC")
 
-    # --- пути/файлы ---
-    data_dir: Path = field(default_factory=lambda: Path("data"))
-    nonce_file: Path = field(default_factory=lambda: Path("data/.exmo_nonce"))
+# ---------- exchange creds / files ----------
+EXMO_KEY: Final[str] = (
+    os.environ.get("EXMO_API_KEY")
+    or os.environ.get("EXMO_KEY")
+    or ""
+)
+EXMO_SECRET: Final[str] = (
+    os.environ.get("EXMO_API_SECRET")
+    or os.environ.get("EXMO_SECRET")
+    or ""
+)
 
-    # --- логирование ---
-    log_level: str = "INFO"
-    mask_api_keys_in_logs: bool = True
+# файл монотонного nonce для EXMO
+EXMO_NONCE_FILE: Final[str] = env_str("EXMO_NONCE_FILE", str(DATA_DIR / ".exmo_nonce"))
 
-    # --- внутренняя отладка ---
-    debug: bool = False
+# resample по умолчанию
+DEFAULT_RESAMPLE: Final[str] = env_str("DEFAULT_RESAMPLE", "5m")
 
-    def validate(self) -> None:
-        if not self.exmo_api_key or not self.exmo_api_secret:
-            # Не роняем процесс: возможно бэктест/оптимизация без API.
-            # Но для live trading это критично — там будет отдельная проверка.
-            pass
+# безопасные дефолты для торговли (при необходимости их переопределяют cli-параметры)
+MAX_DAILY_LOSS_BPS: Final[int] = env_int("MAX_DAILY_LOSS_BPS", 0)
+FEE_BPS: Final[int] = env_int("FEE_BPS", 10)
+SLIP_BPS: Final[int] = env_int("SLIP_BPS", 2)
 
-        if self.max_notional_eur <= 0:
-            raise ValueError("max_notional_eur должен быть > 0")
-
-        ll = str(self.log_level).upper().strip()
-        if ll not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
-            raise ValueError(f"Некорректный log_level: {self.log_level}")
-        self.log_level = ll
-
-    # Удобство: int лог-уровень
-    @property
-    def log_level_int(self) -> int:
-        import logging
-        return getattr(logging, self.log_level, logging.INFO)
-
-
-def load_settings() -> Settings:
-    """
-    Загрузка настроек в порядке приоритета:
-      1) ENV (включая те, что подгружены из .env/YAML)
-      2) .env в корне проекта (если есть)
-      3) YAML/JSON файл по пути TRADING_BOT_CONFIG (если указан)
-
-    Примечание: если и .env, и YAML заданы — значения ENV имеют приоритет.
-    """
-    # 1) Начинаем с текущего окружения
-    env_map: Dict[str, str] = dict(os.environ)
-
-    # 2) .env (не обязателен)
-    env_file = Path(".env")
-    env_map.update(_parse_env_file(env_file))
-
-    # 3) YAML/JSON конфиг (опционально)
-    cfg_path = os.getenv("TRADING_BOT_CONFIG")
-    yaml_map: Dict[str, Any] = {}
-    if cfg_path:
-        yaml_map = _parse_yaml(Path(cfg_path)) or {}
-
-    def g(name: str, default: Optional[str] = None) -> Optional[str]:
-        if name in env_map:
-            return env_map[name]
-        v = yaml_map.get(name)
-        return str(v) if v is not None else default
-
-    s = Settings(
-        # API
-        exmo_api_key=g("EXMO_API_KEY"),
-        exmo_api_secret=g("EXMO_API_SECRET"),
-        exmo_base_url=g("EXMO_BASE_URL", "https://api.exmo.com/v1.1") or "https://api.exmo.com/v1.1",
-        exmo_timeout=int(g("EXMO_TIMEOUT", "20") or "20"),
-
-        # торговля
-        default_pair=g("DEFAULT_PAIR"),
-        max_notional_eur=float(g("MAX_NOTIONAL_EUR", "100") or "100"),
-        maker_by_default=_str2bool(g("MAKER_BY_DEFAULT", "true"), True),
-
-        # пути
-        data_dir=Path(g("DATA_DIR", "data") or "data"),
-        nonce_file=Path(g("EXMO_NONCE_FILE", "data/.exmo_nonce") or "data/.exmo_nonce"),
-
-        # логи
-        log_level=g("LOG_LEVEL", "INFO") or "INFO",
-        mask_api_keys_in_logs=_str2bool(g("MASK_API_KEYS_IN_LOGS", "true"), True),
-
-        # debug
-        debug=_str2bool(g("DEBUG", "false"), False),
-    )
-    s.validate()
-    return s
-
-    risk: RiskCfg = field(default_factory=RiskCfg)
-
-
-def get_settings() -> Settings:
-    global SETTINGS_SINGLETON
-    if SETTINGS_SINGLETON is not None:
-        return SETTINGS_SINGLETON
-    load_env()
-    s = Settings()
-    # normalize env strings
-    s.api_key = s.api_key or env_str("EXMO_API_KEY", "")
-    s.api_secret = s.api_secret or env_str("EXMO_API_SECRET", "")
-    SETTINGS_SINGLETON = s
-    return s
+__all__ = [
+    "PROJECT_ROOT", "DATA_DIR", "CACHE_DIR", "LOG_DIR",
+    "LOG_LEVEL", "TIMEZONE",
+    "EXMO_KEY", "EXMO_SECRET", "EXMO_NONCE_FILE",
+    "DEFAULT_RESAMPLE", "MAX_DAILY_LOSS_BPS", "FEE_BPS", "SLIP_BPS",
+    "env_bool", "env_int", "env_str",
+]
