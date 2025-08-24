@@ -4,15 +4,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Tuple, Any
 
-SignalFn = Callable[[List[float]], List[int]]
-StatusFn = Callable[[List[float]], Tuple[str, int]]
-
 @dataclass(frozen=True)
 class StrategyDef:
     name: str
-    generate_signals: Callable[..., List[int]]  # (prices, **params) -> signals
-    status: Callable[..., Tuple[str, int]]      # (prices, **params) -> (text, state)
-    defaults: Dict[str, Any]                    # дефолтные параметры
+    generate_signals: Callable[..., List[int]]  # (close/ohlc, **params) -> signals
+    status: Callable[..., Tuple[str, int]]      # (close/ohlc, **params) -> (text, state)
+    defaults: Dict[str, Any]
 
 _REGISTRY: Dict[str, StrategyDef] = {}
 
@@ -36,3 +33,8 @@ from . import ema_crossover      # noqa: E402,F401
 from . import macd_cross         # noqa: E402,F401
 from . import bbands_meanrev     # noqa: E402,F401
 from . import roc_momentum       # noqa: E402,F401
+from . import supertrend         # noqa: E402,F401
+from . import keltner_channel    # noqa: E402,F401
+from . import adx_trend          # noqa: E402,F401
+from . import sma_atr            # noqa: E402,F401
+from . import ema_adx            # ✅ новый модуль
