@@ -1,29 +1,15 @@
-# src/backtest/walkforward.py
 from __future__ import annotations
 
 import argparse
 import json
-import math
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 
 import numpy as np
 import pandas as pd
 
-# Берём готовые хелперы и сигналы из векторного бэктеста
-from .vectorized_bt import (
-    BtConfig,
-    _fetch_exmo_candles,
-    _resample_ohlcv,
-    _make_signals_sma_hysteresis,
-    _max_drawdown,
-    _normalize_resample_rule,
-    _rule_to_seconds,
-)
-
-BPS = 1e-4
-_SECONDS_IN_YEAR = 365.25 * 24 * 3600
+from .metrics import compute_equity_metrics, estimate_bars_per_year
 
 
 @dataclass
@@ -31,211 +17,268 @@ class WFConfig:
     pair: str
     span: str
     resample: Optional[str]
-    # стратегия
     fast: int
     slow: int
-    hysteresis_bps: int = 0
-    cooldown_bars: int = 0
+    hysteresis_bps: int
+    cooldown_bars: int
     enter_on_start: bool = False
-    # издержки/размер
     fee_bps: int = 10
     slip_bps: int = 0
     qty_eur: float = 50.0
-    # риск
     max_daily_loss_bps: int = 0
-    # walk-forward
+
     folds: int = 4
     min_train_bars: int = 150
     min_valid_bars: int = 100
-    # выводы
-    out_dir: Path = Path("data/walkforward")
+
+    out_dir: Optional[Path] = None
     out_json: Optional[Path] = None
     out_csv: Optional[Path] = None
 
 
-def _infer_bars_per_year(index: pd.DatetimeIndex, rule: Optional[str]) -> float:
-    if rule:
-        rn = _normalize_resample_rule(rule)
-        sec = _rule_to_seconds(rn)
-        if sec:
-            return _SECONDS_IN_YEAR / sec
-    if len(index) >= 3:
-        deltas = (index[1:] - index[:-1]).to_series(index=index[1:])
-        med = deltas.median().total_seconds()
-        if med > 0:
-            return _SECONDS_IN_YEAR / med
-    return _SECONDS_IN_YEAR / 3600.0
+# ===================== хелперы симуляции =====================
+
+def _compute_signals(
+    close: pd.Series,
+    fast: int,
+    slow: int,
+    hysteresis_bps: int,
+    cooldown_bars: int,
+) -> pd.Series:
+    """
+    Простейшая SMA-логика с гистерезисом (в bps) и cooldown.
+    Возвращает target position: 0 или 1 (long/flat).
+    """
+    fma = close.rolling(fast, min_periods=fast).mean()
+    sma = close.rolling(slow, min_periods=slow).mean()
+
+    # разница в bps относительно медленной
+    diff_bps = (fma - sma) / sma.replace(0, np.nan) * 1e4
+    diff_bps = diff_bps.fillna(0.0)
+
+    pos = np.zeros(len(close), dtype=np.int8)
+    cd = 0  # cooldown счётчик
+    state = 0
+    for i in range(len(close)):
+        if cd > 0:
+            pos[i] = state
+            cd -= 1
+            continue
+        if state == 0 and diff_bps.iat[i] > hysteresis_bps:
+            state = 1
+            cd = max(cooldown_bars, 0)
+        elif state == 1 and diff_bps.iat[i] < -hysteresis_bps:
+            state = 0
+            cd = max(cooldown_bars, 0)
+        pos[i] = state
+    return pd.Series(pos, index=close.index, name="position")
 
 
-def _simulate_on_df(df: pd.DataFrame, cfg: WFConfig) -> Dict[str, Any]:
-    """Полная симуляция на уже подготовленном OHLVC DataFrame."""
-    close = df["close"]
+def _simulate_on_df(
+    df: pd.DataFrame,
+    fast: int,
+    slow: int,
+    hysteresis_bps: int,
+    cooldown_bars: int,
+    fee_bps: int,
+    slip_bps: int,
+    qty_eur: float,
+    enter_on_start: bool = False,
+) -> Dict[str, Any]:
+    """
+    Простая векторизованная симуляция long/flat.
+    - сделки по цене close, со слиппейджем и комиссией в bps на вход/выход
+    - позиция 0/1; размер в EUR фиксированный (qty_eur)
+    - equity — mark-to-market
+    """
+    close = df["close"].astype(float).copy()
+    idx = close.index
 
-    trig = _make_signals_sma_hysteresis(close, cfg.fast, cfg.slow, cfg.hysteresis_bps)
-    idx = df.index.to_list()
-    pxs = close.to_numpy()
+    pos_target = _compute_signals(close, fast, slow, hysteresis_bps, cooldown_bars).astype(int)
 
-    cash_eur = 1000.0
-    pos_qty = 0.0
-    cooldown_left = 0
+    # точки смены позиции
+    pos_prev = pos_target.shift(1).fillna(1 if enter_on_start and pos_target.iat[0] == 1 else 0).astype(int)
+    entries = (pos_prev == 0) & (pos_target == 1)
+    exits = (pos_prev == 1) & (pos_target == 0)
 
-    fee_mult = cfg.fee_bps * BPS
-    slip_mult = cfg.slip_bps * BPS
+    fee = fee_bps / 1e4
+    slip = slip_bps / 1e4
 
-    eq = np.zeros(len(pxs), dtype=np.float64)
-    eq_day_start = cash_eur
-    entry_cost_eur = 0.0
-    closed_pnls: List[float] = []
-    in_pos_bars = 0
+    eq = np.zeros(len(close), dtype=np.float64)
+    cash = 1000.0
+    qty_coin = 0.0
+    in_pos = False
 
-    last_day = None
+    trade_pnls: List[float] = []
+    wins = 0
 
-    for i in range(len(pxs)):
-        px = float(pxs[i])
-        ts = idx[i]
+    # для экспозиции — доля баров в позиции
+    pos_mask = pos_target.values.astype(bool)
 
-        day = ts.date()
-        if last_day is None:
-            last_day = day
-            eq_day_start = cash_eur + pos_qty * px
-        elif day != last_day:
-            eq_day_start = cash_eur + pos_qty * px
-            last_day = day
+    # для отслеживания входной цены/количества
+    entry_price = None
+    for i, px in enumerate(close.values):
+        # вход
+        if entries.iat[i] and not in_pos:
+            buy_px = px * (1.0 + slip)
+            qty_coin = qty_eur / buy_px if buy_px > 0 else 0.0
+            fee_cost = qty_eur * fee
+            cash -= (qty_eur + fee_cost)
+            entry_price = buy_px
+            in_pos = True
 
-        eq_i = cash_eur + pos_qty * px
-        eq[i] = eq_i
-        daily_bps = ((eq_i - eq_day_start) / max(1e-12, eq_day_start)) * 1e4
+        # выход
+        if exits.iat[i] and in_pos:
+            sell_px = px * (1.0 - slip)
+            gross = qty_coin * sell_px
+            fee_cost = gross * fee
+            cash += (gross - fee_cost)
 
-        if cooldown_left > 0 and pos_qty == 0.0:
-            cooldown_left -= 1
+            pnl = (sell_px - float(entry_price or sell_px)) * qty_coin - (qty_eur * fee + gross * fee)
+            trade_pnls.append(pnl)
+            if pnl > 0:
+                wins += 1
+            qty_coin = 0.0
+            entry_price = None
+            in_pos = False
 
-        # сигналы
-        do_entry = trig.iat[i] == 1
-        do_exit = trig.iat[i] == -1
+        # mark-to-market
+        pos_val = qty_coin * px
+        eq[i] = cash + pos_val
 
-        if do_entry:
-            if cooldown_left > 0:
-                do_entry = False
-            if cfg.max_daily_loss_bps and daily_bps <= -abs(float(cfg.max_daily_loss_bps)):
-                do_entry = False
-            if not cfg.enter_on_start and i < max(cfg.fast, cfg.slow):
-                do_entry = False
+    # если позиция осталась открыта — считаем её mark-to-market, но без фиксации трейда (консервативно)
+    equity = pd.Series(eq, index=idx, name="equity")
 
-        # исполнение: long/flat
-        if do_entry and pos_qty <= 1e-12:
-            buy_px = px * (1.0 + slip_mult)
-            qty = cfg.qty_eur / max(1e-12, buy_px)
-            notional = qty * buy_px
-            fee_eur = notional * fee_mult
-
-            cash_eur -= (notional + fee_eur)
-            pos_qty += qty
-            entry_cost_eur = notional + fee_eur
-
-        elif do_exit and pos_qty > 1e-12:
-            sell_px = px * (1.0 - slip_mult)
-            notional = pos_qty * sell_px
-            fee_eur = notional * fee_mult
-
-            cash_eur += (notional - fee_eur)
-            closed = (notional - fee_eur) - entry_cost_eur
-            closed_pnls.append(closed)
-
-            pos_qty = 0.0
-            entry_cost_eur = 0.0
-            cooldown_left = max(cooldown_left, cfg.cooldown_bars)
-
-        if pos_qty > 0:
-            in_pos_bars += 1
-
-    eq0 = eq[0] if len(eq) > 0 else 1.0
-    eqN = eq[-1] if len(eq) > 0 else eq0
-    total_return_pct = (eqN / max(1e-12, eq0) - 1.0) * 100.0
-    max_dd_pct = _max_drawdown(eq)
-
-    wins = sum(1 for x in closed_pnls if x > 0)
-    losses = sum(1 for x in closed_pnls if x <= 0)
-    winrate = (wins / max(1, wins + losses)) * 100.0
-    profit_sum = float(sum(x for x in closed_pnls if x > 0))
-    loss_sum = float(sum(-x for x in closed_pnls if x < 0))
-    profit_factor = (profit_sum / loss_sum) if loss_sum > 0 else float("inf")
-    avg_trade_eur = (profit_sum - loss_sum) / max(1, (wins + losses))
-    exposure_pct = in_pos_bars / max(1, len(eq)) * 100.0
-
-    bars_per_year = _infer_bars_per_year(df.index, cfg.resample)
-    rets = pd.Series(eq, index=df.index).pct_change().fillna(0.0).to_numpy()
-    ret_mean = float(np.mean(rets))
-    ret_std = float(np.std(rets, ddof=1)) if len(rets) > 1 else 0.0
-    sharpe = (ret_mean / ret_std * math.sqrt(bars_per_year)) if ret_std > 0 else 0.0
-
-    if len(df.index) >= 2:
-        days = (df.index[-1] - df.index[0]).total_seconds() / 86400.0
-        years = max(1e-9, days / 365.25)
-        cagr = (eqN / max(1e-12, eq0)) ** (1.0 / years) - 1.0
-    else:
-        cagr = 0.0
-    calmar = (cagr / abs(max_dd_pct / 100.0)) if abs(max_dd_pct) > 1e-12 else float("inf")
+    exposure_pct = 100.0 * (pos_mask.sum() / max(len(pos_mask), 1))
+    metrics = compute_equity_metrics(
+        equity=equity,
+        trade_pnls=trade_pnls,
+        n_wins=wins,
+        n_trades=len(trade_pnls),
+        exposure_pct=exposure_pct,
+        start_equity=1000.0,
+        risk_free=0.0,
+        bars_per_year_hint=estimate_bars_per_year(idx),
+    )
 
     return {
-        "bars": int(len(df)),
-        "trades": int(wins + losses),
-        "winrate_pct": winrate,
-        "total_return_pct": total_return_pct,
-        "max_drawdown_pct": max_dd_pct,
-        "final_equity_eur": float(eqN),
-        "start_equity_eur": float(eq0),
-        "profit_factor": profit_factor,
-        "avg_trade_eur": avg_trade_eur,
-        "exposure_pct": exposure_pct,
-        "sharpe": sharpe,
-        "cagr_pct": cagr * 100.0,
-        "calmar": calmar,
+        "equity": equity,
+        "trades": pd.DataFrame({
+            "pnl_eur": trade_pnls
+        }),
+        "metrics": metrics,
+        "position": pd.Series(pos_mask.astype(int), index=idx, name="position"),
     }
 
 
-def _make_folds(df: pd.DataFrame, folds: int, min_train: int, min_valid: int) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
-    """Rolling-origin: train = [0:i), valid = [i:i+len_fold)."""
+# ===================== walk-forward =====================
+
+def _split_walkforward(df: pd.DataFrame, folds: int, min_train: int, min_valid: int) -> List[Tuple[slice, slice]]:
+    """
+    Возвращает список (train_slice, valid_slice) по индексам.
+    Схема: последовательные не-перекрывающиеся валидации.
+    """
     n = len(df)
-    if n < min_train + min_valid:
-        raise RuntimeError("Dataset too short for requested train/valid sizes.")
-    fold_len = max(min_valid, (n - min_train) // folds)
-    splits: List[Tuple[pd.DataFrame, pd.DataFrame]] = []
-    start_valid = min_train
-    for _ in range(folds):
-        end_valid = min(n, start_valid + fold_len)
-        train = df.iloc[:start_valid].copy()
-        valid = df.iloc[start_valid:end_valid].copy()
-        if len(valid) < min_valid:  # последний короткий — пропускаем
+    if n < (min_train + min_valid):
+        return []
+
+    # Делим равномерно хвост на 'folds' валидаций, тренируя перед каждой валидацией
+    valid_len = max(min_valid, int((n - min_train) / max(folds, 1)))
+    splits: List[Tuple[slice, slice]] = []
+    start = 0
+    while True:
+        train_end = start + min_train
+        valid_end = train_end + valid_len
+        if valid_end > n:
             break
-        splits.append((train, valid))
-        start_valid = end_valid
-        if end_valid >= n:
+        splits.append((slice(start, train_end), slice(train_end, valid_end)))
+        start += valid_len
+        if len(splits) >= folds:
             break
     return splits
 
 
-def run_walkforward(cfg: WFConfig) -> Dict[str, Any]:
-    # 1) Данные
-    full = _fetch_exmo_candles(cfg.pair, cfg.span)
-    if cfg.resample:
-        full = _resample_ohlcv(full, cfg.resample)
+def run_walkforward(cfg: WFConfig, df_override: Optional[pd.DataFrame] = None, print_json: bool = True) -> Dict[str, Any]:
+    """
+    Запускает WF по df_override (желательно уже после единичного resample).
+    Возвращает сводные средние OOS-метрики.
+    """
+    if df_override is None:
+        raise RuntimeError("run_walkforward: df_override требуется (чтобы исключить повторные загрузки/ресэмплы).")
 
-    # 2) Разбиение
-    folds = _make_folds(full, cfg.folds, cfg.min_train_bars, cfg.min_valid_bars)
+    df = df_override.copy()
+    if "close" not in df.columns:
+        raise RuntimeError("run_walkforward: в DataFrame должен быть столбец 'close'.")
 
-    # 3) Прогоны: метрики на valid (out-of-sample)
-    per_fold: List[Dict[str, Any]] = []
-    for i, (train_df, valid_df) in enumerate(folds, 1):
-        m_valid = _simulate_on_df(valid_df, cfg)
-        m_valid["fold"] = i
-        m_valid["valid_start"] = valid_df.index[0].isoformat()
-        m_valid["valid_end"] = valid_df.index[-1].isoformat()
-        m_valid["valid_bars"] = int(len(valid_df))
-        per_fold.append(m_valid)
+    splits = _split_walkforward(df, cfg.folds, cfg.min_train_bars, cfg.min_valid_bars)
+    if not splits:
+        out = {
+            "pair": cfg.pair,
+            "resample": cfg.resample,
+            "fast": cfg.fast,
+            "slow": cfg.slow,
+            "hysteresis_bps": cfg.hysteresis_bps,
+            "cooldown_bars": cfg.cooldown_bars,
+            "fee_bps": cfg.fee_bps,
+            "slip_bps": cfg.slip_bps,
+            "qty_eur": cfg.qty_eur,
+            "max_daily_loss_bps": cfg.max_daily_loss_bps,
+            "folds": 0,
+            "oos_total_return_pct_mean": 0.0,
+            "oos_total_return_pct_std": 0.0,
+            "oos_max_drawdown_pct_mean": 0.0,
+            "oos_winrate_pct_mean": 0.0,
+            "oos_profit_factor_mean": 0.0,
+            "oos_sharpe_mean": 0.0,
+            "oos_cagr_pct_mean": 0.0,
+            "oos_calmar_mean": 0.0,
+            "oos_trades_mean": 0.0,
+            "oos_exposure_pct_mean": 0.0,
+            "oos_avg_trade_eur_mean": 0.0,
+        }
+        if print_json:
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
 
-    # 4) Агрегация
-    agg = pd.DataFrame(per_fold)
-    summary = {
+    # собираем метрики по валидациям
+    agg: Dict[str, List[float]] = {
+        "ret": [], "dd": [], "wr": [], "pf": [], "sharpe": [], "cagr": [], "calmar": [],
+        "trades": [], "exposure": [], "avg_trade": [],
+    }
+
+    for tr_slice, va_slice in splits:
+        valid = df.iloc[va_slice]
+
+        sim = _simulate_on_df(
+            df=valid,
+            fast=cfg.fast,
+            slow=cfg.slow,
+            hysteresis_bps=cfg.hysteresis_bps,
+            cooldown_bars=cfg.cooldown_bars,
+            fee_bps=cfg.fee_bps,
+            slip_bps=cfg.slip_bps,
+            qty_eur=cfg.qty_eur,
+            enter_on_start=cfg.enter_on_start,
+        )
+        m = sim["metrics"]
+        agg["ret"].append(m.total_return_pct)
+        agg["dd"].append(m.max_drawdown_pct)
+        agg["wr"].append(m.winrate_pct)
+        agg["pf"].append(m.profit_factor)
+        agg["sharpe"].append(m.sharpe)
+        agg["cagr"].append(m.cagr_pct)
+        agg["calmar"].append(m.calmar)
+        agg["trades"].append(m.trades)
+        agg["exposure"].append(m.exposure_pct)
+        agg["avg_trade"].append(m.avg_trade_eur)
+
+    def _mean(xs: List[float]) -> float:
+        return float(np.mean(xs)) if xs else 0.0
+
+    def _std(xs: List[float]) -> float:
+        return float(np.std(xs, ddof=1)) if len(xs) > 1 else 0.0
+
+    out = {
         "pair": cfg.pair,
         "resample": cfg.resample,
         "fast": cfg.fast,
@@ -246,84 +289,57 @@ def run_walkforward(cfg: WFConfig) -> Dict[str, Any]:
         "slip_bps": cfg.slip_bps,
         "qty_eur": cfg.qty_eur,
         "max_daily_loss_bps": cfg.max_daily_loss_bps,
-        "folds": len(per_fold),
-        "oos_total_return_pct_mean": float(agg["total_return_pct"].mean()),
-        "oos_total_return_pct_std": float(agg["total_return_pct"].std(ddof=1)) if len(agg) > 1 else 0.0,
-        "oos_max_drawdown_pct_mean": float(agg["max_drawdown_pct"].mean()),
-        "oos_winrate_pct_mean": float(agg["winrate_pct"].mean()),
-        "oos_profit_factor_mean": float(agg["profit_factor"].replace(np.inf, np.nan).mean(skipna=True)),
-        "oos_sharpe_mean": float(agg["sharpe"].mean()),
-        "oos_cagr_pct_mean": float(agg["cagr_pct"].mean()),
-        "oos_calmar_mean": float(agg["calmar"].replace(np.inf, np.nan).mean(skipna=True)),
+        "folds": len(splits),
+        "oos_total_return_pct_mean": _mean(agg["ret"]),
+        "oos_total_return_pct_std": _std(agg["ret"]),
+        "oos_max_drawdown_pct_mean": _mean(agg["dd"]),
+        "oos_winrate_pct_mean": _mean(agg["wr"]),
+        "oos_profit_factor_mean": _mean(agg["pf"]),
+        "oos_sharpe_mean": _mean(agg["sharpe"]),
+        "oos_cagr_pct_mean": _mean(agg["cagr"]),
+        "oos_calmar_mean": _mean(agg["calmar"]),
+        "oos_trades_mean": _mean(agg["trades"]),
+        "oos_exposure_pct_mean": _mean(agg["exposure"]),
+        "oos_avg_trade_eur_mean": _mean(agg["avg_trade"]),
     }
 
-    # 5) Выгрузки
-    cfg.out_dir.mkdir(parents=True, exist_ok=True)
-    out_csv = cfg.out_csv or (cfg.out_dir / f"wf_{cfg.pair.replace('/','_')}_{cfg.fast}-{cfg.slow}_h{cfg.hysteresis_bps}_cd{cfg.cooldown_bars}.csv")
-    pd.DataFrame(per_fold).to_csv(out_csv, index=False)
+    if cfg.out_dir:
+        Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
+    if cfg.out_csv:
+        pd.DataFrame([out]).to_csv(cfg.out_csv, index=False)
+    if cfg.out_json:
+        with open(cfg.out_json, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
 
-    out_json = cfg.out_json or (cfg.out_dir / f"wf_summary_{cfg.pair.replace('/','_')}_{cfg.fast}-{cfg.slow}_h{cfg.hysteresis_bps}_cd{cfg.cooldown_bars}.json")
-    # <-- фикс: PosixPath -> str с default=str
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump({"config": asdict(cfg), "summary": summary}, f, ensure_ascii=False, indent=2, default=str)
+    if print_json:
+        print(json.dumps(out, ensure_ascii=False, indent=2))
 
-    # принт короткой сводки
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return {"per_fold": per_fold, "summary": summary, "out_csv": str(out_csv), "out_json": str(out_json)}
-
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser("walkforward", description="Walk-forward evaluation on EXMO candles")
-    # data
-    p.add_argument("--exmo-pair", required=True)
-    p.add_argument("--exmo-candles", required=True)
-    p.add_argument("--resample", default=None)
-    # strategy
-    p.add_argument("--fast", required=True, type=int)
-    p.add_argument("--slow", required=True, type=int)
-    p.add_argument("--hysteresis-bps", default=0, type=int)
-    p.add_argument("--cooldown-bars", default=0, type=int)
-    p.add_argument("--enter-on-start", action="store_true")
-    # frictions/sizing
-    p.add_argument("--fee-bps", default=10, type=int)
-    p.add_argument("--slip-bps", default=0, type=int)
-    p.add_argument("--qty-eur", default=50.0, type=float)
-    # risk
-    p.add_argument("--max-daily-loss-bps", default=0, type=int)
-    # wf
-    p.add_argument("--folds", default=4, type=int)
-    p.add_argument("--min-train-bars", default=150, type=int)
-    p.add_argument("--min-valid-bars", default=100, type=int)
-    # outputs
-    p.add_argument("--out-dir", default="data/walkforward")
-    p.add_argument("--out-json", default=None)
-    p.add_argument("--out-csv", default=None)
-    return p
+    return out
 
 
-def main(argv: Optional[list] = None) -> None:
-    args = build_parser().parse_args(argv)
-    cfg = WFConfig(
-        pair=args.exmo_pair,
-        span=args.exmo_candles,
-        resample=args.resample,
-        fast=int(args.fast),
-        slow=int(args.slow),
-        hysteresis_bps=int(args.hysteresis_bps),
-        cooldown_bars=int(args.cooldown_bars),
-        enter_on_start=bool(args.enter_on_start),
-        fee_bps=int(args.fee_bps),
-        slip_bps=int(args.slip_bps),
-        qty_eur=float(args.qty_eur),
-        max_daily_loss_bps=int(args.max_daily_loss_bps),
-        folds=int(args.folds),
-        min_train_bars=int(args.min_train_bars),
-        min_valid_bars=int(args.min_valid_bars),
-        out_dir=Path(args.out_dir),
-        out_json=Path(args.out_json) if args.out_json else None,
-        out_csv=Path(args.out_csv) if args.out_csv else None,
-    )
-    run_walkforward(cfg)
+def main():
+    ap = argparse.ArgumentParser("walkforward")
+    ap.add_argument("--exmo-pair", type=str, required=True)
+    ap.add_argument("--exmo-candles", type=str, required=True)
+    ap.add_argument("--resample", type=str, default=None)
+    ap.add_argument("--fast", type=int, required=True)
+    ap.add_argument("--slow", type=int, required=True)
+    ap.add_argument("--hysteresis-bps", type=int, default=0)
+    ap.add_argument("--cooldown-bars", type=int, default=0)
+    ap.add_argument("--enter-on-start", action="store_true")
+    ap.add_argument("--fee-bps", type=int, default=10)
+    ap.add_argument("--slip-bps", type=int, default=0)
+    ap.add_argument("--qty-eur", type=float, default=50.0)
+    ap.add_argument("--max-daily-loss-bps", type=int, default=0)
+    ap.add_argument("--folds", type=int, default=4)
+    ap.add_argument("--min-train-bars", type=int, default=150)
+    ap.add_argument("--min-valid-bars", type=int, default=100)
+    ap.add_argument("--out-dir", type=str, default=None)
+    args = ap.parse_args()
+
+    # CLI-режим модуля ожидает, что загрузка и ресэмпл сделаны снаружи (этап В у нас уже), поэтому здесь
+    # просто иллюстрация: в проде вызываем через main.py
+    raise SystemExit("Use via main.py walk-forward (этот модуль вызывается из CLI оболочки приложения).")
 
 
 if __name__ == "__main__":

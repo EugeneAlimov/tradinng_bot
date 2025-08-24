@@ -1,19 +1,17 @@
-# src/backtest/optimize.py
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import json
-
 import numpy as np
 import pandas as pd
 
-from .vectorized_bt import _fetch_exmo_candles, _resample_ohlcv
-from .sweep import run_sweep, SweepCfg, _parse_int_list, _parse_float_list
+from .vectorized_bt import _fetch_exmo_candles, _resample_ohlcv, BtConfig, run_backtest_vectorized
+from .sweep import run_sweep, SweepCfg
 from .robustness import compute_stability
-from .walkforward import WFConfig, _simulate_on_df
+from .walkforward import WFConfig, run_walkforward
 
 
 @dataclass
@@ -29,87 +27,83 @@ class OptimizeConfig:
     fee_bps: int
     slip_bps: int
     max_daily_loss_bps: int
+
     robust_metric: str = "calmar"
     min_trades: int = 4
     d_fast: int = 2
     d_slow: int = 5
     d_hyst: int = 5
     d_cd: int = 2
+
     wf_top_n: int = 5
     folds: int = 4
     min_train_bars: int = 150
     min_valid_bars: int = 100
+
+    # WF-фильтры
+    wf_min_pf: Optional[float] = None
+    wf_min_return_pct: Optional[float] = None
+    wf_max_dd_pct: Optional[float] = None
+    wf_min_winrate_pct: Optional[float] = None
+    wf_min_sharpe: Optional[float] = None
+    wf_min_cagr_pct: Optional[float] = None
+    wf_min_calmar: Optional[float] = None
+    wf_min_folds: Optional[int] = None
+
+    # Новые, «на будущее»
+    wf_min_trades: Optional[float] = None               # среднее число сделок по фолдам
+    wf_max_exposure: Optional[float] = None             # средняя экспозиция (%)
+
+    rank_by: str = "oos_profit_factor_mean"
+    final_backtest: bool = False
+
     out_dir: Path = Path("data/optimize")
     verbose: bool = False
 
 
-def _wf_on_df(df: pd.DataFrame, base_cfg: WFConfig) -> Dict[str, Any]:
-    """
-    Walk-forward по уже загруженному df (без сетевых запросов).
-    Используем фиксированные параметры стратегии; "обучения" нет,
-    поэтому считаем метрики на валид. окнах при нарастающем train.
-    """
-    n = len(df)
-    folds = int(base_cfg.folds)
-    min_train = int(base_cfg.min_train_bars)
-    min_valid = int(base_cfg.min_valid_bars)
+WF_RANK_CHOICES = {
+    "oos_profit_factor_mean",
+    "oos_total_return_pct_mean",
+    "oos_calmar_mean",
+    "oos_sharpe_mean",
+    "oos_cagr_pct_mean",
+}
 
-    # считаем реальное число фолдов, которое помещается
-    real_folds = 0
-    for k in range(folds):
-        train_end = min_train + k * min_valid
-        valid_end = train_end + min_valid
-        if valid_end <= n:
-            real_folds += 1
-        else:
-            break
 
-    if real_folds == 0:
-        raise RuntimeError("Not enough bars for walk-forward.")
+def _apply_wf_filters(df: pd.DataFrame, cfg: OptimizeConfig) -> pd.DataFrame:
+    out = df.copy()
 
-    # собираем метрики по каждому фолду
-    fold_metrics: List[Dict[str, float]] = []
-    for k in range(real_folds):
-        train_end = min_train + k * min_valid
-        valid_end = train_end + min_valid
-        valid_df = df.iloc[train_end:valid_end]
+    # folds
+    if cfg.wf_min_folds is not None and "folds" in out.columns:
+        out = out[out["folds"] >= int(cfg.wf_min_folds)]
 
-        wfc = WFConfig(
-            pair=base_cfg.pair, span=base_cfg.span, resample=base_cfg.resample,
-            fast=base_cfg.fast, slow=base_cfg.slow,
-            hysteresis_bps=base_cfg.hysteresis_bps, cooldown_bars=base_cfg.cooldown_bars,
-            enter_on_start=base_cfg.enter_on_start,
-            fee_bps=base_cfg.fee_bps, slip_bps=base_cfg.slip_bps, qty_eur=base_cfg.qty_eur,
-            max_daily_loss_bps=base_cfg.max_daily_loss_bps,
-        )
-        m = _simulate_on_df(valid_df, wfc)
-        fold_metrics.append(m)
+    def col(name: str) -> str:
+        return name if name in out.columns else ""
 
-    # усредняем
-    def _mean(key: str) -> float:
-        vals = [float(x.get(key, 0.0)) for x in fold_metrics if key in x]
-        return float(np.mean(vals)) if vals else 0.0
+    filters = [
+        ("oos_profit_factor_mean", cfg.wf_min_pf, "min"),
+        ("oos_total_return_pct_mean", cfg.wf_min_return_pct, "min"),
+        ("oos_sharpe_mean", cfg.wf_min_sharpe, "min"),
+        ("oos_cagr_pct_mean", cfg.wf_min_cagr_pct, "min"),
+        ("oos_calmar_mean", cfg.wf_min_calmar, "min"),
+        ("oos_winrate_pct_mean", cfg.wf_min_winrate_pct, "min"),
+        ("oos_trades_mean", cfg.wf_min_trades, "min"),
+    ]
+    for cname, thr, mode in filters:
+        if thr is None or col(cname) == "":
+            continue
+        if mode == "min":
+            out = out[out[cname].fillna(-np.inf) >= float(thr)]
 
-    summary = {
-        "pair": base_cfg.pair,
-        "resample": base_cfg.resample,
-        "fast": base_cfg.fast, "slow": base_cfg.slow,
-        "hysteresis_bps": base_cfg.hysteresis_bps,
-        "cooldown_bars": base_cfg.cooldown_bars,
-        "fee_bps": base_cfg.fee_bps, "slip_bps": base_cfg.slip_bps,
-        "qty_eur": base_cfg.qty_eur,
-        "max_daily_loss_bps": base_cfg.max_daily_loss_bps,
-        "folds": real_folds,
-        "oos_total_return_pct_mean": _mean("total_return_pct"),
-        "oos_total_return_pct_std": float(np.std([x.get("total_return_pct", 0.0) for x in fold_metrics], ddof=1)) if real_folds > 1 else 0.0,
-        "oos_max_drawdown_pct_mean": _mean("max_drawdown_pct"),
-        "oos_winrate_pct_mean": _mean("winrate_pct"),
-        "oos_profit_factor_mean": _mean("profit_factor"),
-        "oos_sharpe_mean": _mean("sharpe"),
-        "oos_cagr_pct_mean": _mean("cagr_pct"),
-        "oos_calmar_mean": _mean("calmar"),
-    }
-    return summary
+    # max DD — по модулю
+    if cfg.wf_max_dd_pct is not None and col("oos_max_drawdown_pct_mean"):
+        out = out[out["oos_max_drawdown_pct_mean"].abs().fillna(np.inf) <= abs(float(cfg.wf_max_dd_pct))]
+
+    # max exposure
+    if cfg.wf_max_exposure is not None and col("oos_exposure_pct_mean"):
+        out = out[out["oos_exposure_pct_mean"].fillna(np.inf) <= float(cfg.wf_max_exposure)]
+
+    return out
 
 
 def run_optimize(
@@ -131,11 +125,25 @@ def run_optimize(
     folds: int, min_train_bars: int, min_valid_bars: int,
     out_dir: Path,
     verbose: bool = False,
+    # WF фильтры
+    wf_min_pf: Optional[float] = None,
+    wf_min_return_pct: Optional[float] = None,
+    wf_max_dd_pct: Optional[float] = None,
+    wf_min_winrate_pct: Optional[float] = None,
+    wf_min_sharpe: Optional[float] = None,
+    wf_min_cagr_pct: Optional[float] = None,
+    wf_min_calmar: Optional[float] = None,
+    wf_min_folds: Optional[int] = None,
+    wf_min_trades: Optional[float] = None,
+    wf_max_exposure: Optional[float] = None,
+    rank_by: str = "oos_profit_factor_mean",
+    final_backtest: bool = False,
 ) -> Dict[str, Any]:
+
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    # 1) Sweep (без артефактов, одноразовая загрузка свечей)
+    # 1) Sweep
     sweep_csv = run_sweep(SweepCfg(
         pair=pair, span=span, resample=resample,
         fast_list=fast_list, slow_list=slow_list, hyst_list=hyst_list,
@@ -146,7 +154,7 @@ def run_optimize(
         quiet_runs=(not verbose), refetch_per_config=False,
     ))
 
-    # 2) Robustness ranking
+    # 2) Robustness
     ranked = compute_stability(
         csv_path=Path(sweep_csv),
         min_trades=min_trades, metric=robust_metric,
@@ -156,11 +164,11 @@ def run_optimize(
     ranked.to_csv(ranked_csv, index=False)
     ranked_top = ranked.head(wf_top_n).copy()
 
-    # 3) Загружаем свечи один раз для WF
+    # 3) История один раз для WF
     base = _fetch_exmo_candles(pair, span)
     df = _resample_ohlcv(base, resample) if resample else base
 
-    # 4) Walk-forward на топ-N конфигурациях (без сетевых запросов)
+    # 4) WF по топ-N
     wf_rows: List[Dict[str, Any]] = []
     for _, row in ranked_top.iterrows():
         wfc = WFConfig(
@@ -174,34 +182,109 @@ def run_optimize(
             qty_eur=float(row.get("qty_eur", qty_list[0] if qty_list else 50.0)),
             max_daily_loss_bps=int(row.get("max_daily_loss_bps", max_daily_loss_bps)),
             folds=int(folds), min_train_bars=int(min_train_bars), min_valid_bars=int(min_valid_bars),
-            out_dir=out_dir,
-            out_json=None, out_csv=None,
+            out_dir=out_dir, out_json=None, out_csv=None,
         )
-        summary = _wf_on_df(df, wfc)
+        summ = run_walkforward(wfc, df_override=df, print_json=False)
         wf_rows.append({
-            **{k: row[k] for k in ["fast", "slow", "hysteresis_bps", "cooldown_bars", "qty_eur"] if k in row},
-            **summary,
+            "fast": int(row["fast"]),
+            "slow": int(row["slow"]),
+            "hysteresis_bps": int(row["hysteresis_bps"]),
+            "cooldown_bars": int(row["cooldown_bars"]),
+            "qty_eur": float(row.get("qty_eur", np.nan)),
+            **summ,
         })
 
     wf_df = pd.DataFrame(wf_rows)
     wf_csv = out_dir / f"wf_{pair.replace('/','_')}_{(resample or 'raw')}_{ts}.csv"
     wf_df.to_csv(wf_csv, index=False)
 
-    # 5) Report JSON (минимум ссылок на файлы и сводки)
+    # 5) Фильтры WF
+    filt_cfg = OptimizeConfig(
+        pair=pair, span=span, resample=resample,
+        fast_list=fast_list, slow_list=slow_list, hyst_list=hyst_list, cooldown_list=cooldown_list,
+        qty_list=qty_list, fee_bps=fee_bps, slip_bps=slip_bps, max_daily_loss_bps=max_daily_loss_bps,
+        robust_metric=robust_metric, min_trades=min_trades, d_fast=d_fast, d_slow=d_slow, d_hyst=d_hyst, d_cd=d_cd,
+        wf_top_n=wf_top_n, folds=folds, min_train_bars=min_train_bars, min_valid_bars=min_valid_bars,
+        wf_min_pf=wf_min_pf, wf_min_return_pct=wf_min_return_pct, wf_max_dd_pct=wf_max_dd_pct,
+        wf_min_winrate_pct=wf_min_winrate_pct, wf_min_sharpe=wf_min_sharpe,
+        wf_min_cagr_pct=wf_min_cagr_pct, wf_min_calmar=wf_min_calmar,
+        wf_min_folds=wf_min_folds, rank_by=rank_by, final_backtest=final_backtest,
+        wf_min_trades=wf_min_trades, wf_max_exposure=wf_max_exposure,
+        out_dir=out_dir, verbose=verbose,
+    )
+
+    wf_filtered = _apply_wf_filters(wf_df, filt_cfg)
+
+    # 6) Ранжирование
+    if rank_by not in WF_RANK_CHOICES:
+        rank_by = "oos_profit_factor_mean"
+
+    selected_source = "filtered"
+    df_for_rank = wf_filtered.copy()
+    if df_for_rank.empty:
+        df_for_rank = wf_df.copy()
+        selected_source = "unfiltered"
+
+    df_for_rank = df_for_rank.sort_values(rank_by, ascending=False, na_position="last")
+    best_row = df_for_rank.head(1).to_dict(orient="records")[0] if not df_for_rank.empty else None
+
+    # 7) Финальный бэктест (опционально)
+    final_bt_artifacts: Dict[str, Any] = {}
+    if final_backtest and best_row is not None:
+        bt = BtConfig(
+            pair=pair, span=span, resample_rule=resample,
+            fast=int(best_row["fast"]), slow=int(best_row["slow"]),
+            hysteresis_bps=int(best_row["hysteresis_bps"]),
+            cooldown_bars=int(best_row["cooldown_bars"]),
+            fee_bps=fee_bps, slip_bps=slip_bps,
+            qty_eur=float(best_row["qty_eur"]),
+            max_daily_loss_bps=max_daily_loss_bps,
+            print_summary=False,
+        )
+        base_name = f"final_{pair.replace('/','_')}_{(resample or 'raw')}_{bt.fast}-{bt.slow}_h{bt.hysteresis_bps}_cd{bt.cooldown_bars}_q{int(bt.qty_eur)}"
+        bt.out_trades_csv = out_dir / f"{base_name}_trades.csv"
+        bt.out_equity_csv = out_dir / f"{base_name}_equity.csv"
+        bt.out_metrics_json = out_dir / f"{base_name}_metrics.json"
+
+        res = run_backtest_vectorized(bt)
+        final_bt_artifacts = {
+            "final_backtest": {
+                "config": {
+                    "fast": bt.fast, "slow": bt.slow, "hysteresis_bps": bt.hysteresis_bps,
+                    "cooldown_bars": bt.cooldown_bars, "qty_eur": bt.qty_eur,
+                },
+                "metrics": res.get("metrics", {}),
+                "trades_csv": str(bt.out_trades_csv),
+                "equity_csv": str(bt.out_equity_csv),
+                "metrics_json": str(bt.out_metrics_json),
+            }
+        }
+
+    # 8) Отчёт
     report = {
         "config": {
             "pair": pair, "span": span, "resample": resample,
             "fee_bps": fee_bps, "slip_bps": slip_bps, "max_daily_loss_bps": max_daily_loss_bps,
             "grid": {
                 "fast_list": fast_list, "slow_list": slow_list,
-                "hyst_list": hyst_list, "cooldown_list": cooldown_list,
-                "qty_list": qty_list,
+                "hyst_list": hyst_list, "cooldown_list": cooldown_list, "qty_list": qty_list,
             },
             "robustness": {
                 "metric": robust_metric, "min_trades": min_trades,
                 "d_fast": d_fast, "d_slow": d_slow, "d_hyst": d_hyst, "d_cd": d_cd,
             },
-            "wf": {"wf_top_n": wf_top_n, "folds": folds, "min_train_bars": min_train_bars, "min_valid_bars": min_valid_bars},
+            "wf": {
+                "wf_top_n": wf_top_n, "folds": folds,
+                "min_train_bars": min_train_bars, "min_valid_bars": min_valid_bars,
+                "filters": {
+                    "wf_min_pf": wf_min_pf, "wf_min_return_pct": wf_min_return_pct,
+                    "wf_max_dd_pct": wf_max_dd_pct, "wf_min_winrate_pct": wf_min_winrate_pct,
+                    "wf_min_sharpe": wf_min_sharpe, "wf_min_cagr_pct": wf_min_cagr_pct,
+                    "wf_min_calmar": wf_min_calmar, "wf_min_folds": wf_min_folds,
+                    "wf_min_trades": wf_min_trades, "wf_max_exposure": wf_max_exposure,
+                },
+                "rank_by": rank_by,
+            },
         },
         "artifacts": {
             "sweep_csv": str(sweep_csv),
@@ -209,18 +292,27 @@ def run_optimize(
             "wf_csv": str(wf_csv),
         },
         "tops_preview": ranked_top.head(wf_top_n).to_dict(orient="records"),
-        "wf_preview": wf_df.sort_values("oos_profit_factor_mean", ascending=False).head(wf_top_n).to_dict(orient="records"),
+        "wf_preview": wf_df.sort_values(rank_by, ascending=False).head(wf_top_n).to_dict(orient="records"),
+        "wf_filtered_count": int(len(wf_filtered)),
+        "wf_total_count": int(len(wf_df)),
+        "selected_from": selected_source,
+        "selected_best": best_row,
     }
+    report.update(final_bt_artifacts)
+
     report_json = out_dir / f"report_{pair.replace('/','_')}_{(resample or 'raw')}_{ts}.json"
     with open(report_json, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
-    # Объект для вывода в консоль вызывающей командой
     return {
         "sweep_csv": str(sweep_csv),
         "ranked_csv": str(ranked_csv),
         "wf_csv": str(wf_csv),
         "report_json": str(report_json),
         "ranked_head": ranked_top,
-        "wf_head": wf_df.sort_values("oos_profit_factor_mean", ascending=False).head(wf_top_n),
+        "wf_head": wf_df.sort_values(rank_by, ascending=False).head(wf_top_n),
+        "wf_filtered": wf_filtered,
+        "selected_best": best_row,
+        "selected_from": selected_source,
+        **final_bt_artifacts,
     }

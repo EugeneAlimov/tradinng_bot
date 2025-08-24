@@ -11,21 +11,25 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-# Для единожды загружаемых данных
+# Единожды загружаем данные и ресемплим
 from .vectorized_bt import (
     _fetch_exmo_candles,
     _resample_ohlcv,
+    _make_signals_sma_hysteresis,
+    _infer_bars_per_year,
+    BPS,
 )
-# Быстрая симуляция на уже готовом DataFrame
-from .walkforward import WFConfig, _simulate_on_df
-# Полный бэктест (нужен только если просим сохранять артефакты по каждой конфигурации)
+# Полный бэктест (если нужно писать артефакты по каждой конфигурации)
 from .vectorized_bt import BtConfig, run_backtest_vectorized
 
 
+# ------------------------ utils: парсеры списков ------------------------
+
 def _parse_int_list(s: str) -> List[int]:
     """
-    Парсит '6,8,10' -> [6,8,10] или '5:25:5' -> [5,10,15,20,25]
-    Формат диапазона: start:stop:step (включительно, если попадает по шагу)
+    '6,8,10' -> [6,8,10]
+    '5:25:5' -> [5,10,15,20,25]
+    Формат диапазона: start:stop:step (включительно, если попадает по шагу).
     """
     s = (s or "").strip()
     if not s:
@@ -38,7 +42,7 @@ def _parse_int_list(s: str) -> List[int]:
         if step == 0:
             raise ValueError("Step cannot be 0")
         out = list(range(start, stop + (1 if (stop - start) % step == 0 else 0), step))
-        if out and (step > 0 and out[-1] > stop) or (step < 0 and out[-1] < stop):
+        if out and ((step > 0 and out[-1] > stop) or (step < 0 and out[-1] < stop)):
             out.pop()
         return out
     return [int(x) for x in s.split(",") if x.strip()]
@@ -50,6 +54,166 @@ def _parse_float_list(s: str) -> List[float]:
         return []
     return [float(x) for x in s.split(",") if x.strip()]
 
+
+# ------------------------ быстрый симулятор для свипа ------------------------
+
+def _simulate_full_series(
+    df: pd.DataFrame,
+    *,
+    resample_rule: Optional[str],
+    fast: int,
+    slow: int,
+    hysteresis_bps: int,
+    cooldown_bars: int,
+    fee_bps: int,
+    slip_bps: int,
+    qty_eur: float,
+    enter_on_start: bool = False,
+    max_daily_loss_bps: int = 0,
+) -> Dict[str, float]:
+    """
+    Однопроходная симуляция на всей серии (без WF и без записи файлов).
+    df: OHLCV с DatetimeIndex(UTC), колонки: open,high,low,close,volume
+    Возвращает метрики как в run_backtest_vectorized.
+    """
+    n = len(df)
+    if n < max(fast, slow) + 5:
+        return {
+            "bars": n, "trades": 0, "winrate_pct": 0.0, "total_return_pct": 0.0,
+            "max_drawdown_pct": 0.0, "final_equity_eur": 1000.0, "start_equity_eur": 1000.0,
+            "profit_factor": 0.0, "avg_trade_eur": 0.0, "exposure_pct": 0.0,
+            "sharpe": 0.0, "cagr_pct": 0.0, "calmar": 0.0,
+        }
+
+    trig = _make_signals_sma_hysteresis(df["close"], fast, slow, hysteresis_bps)
+
+    idx = df.index.to_list()
+    close = df["close"].to_numpy(dtype=np.float64)
+
+    fee_mult = fee_bps * BPS
+    slip_mult = slip_bps * BPS
+
+    cash_eur = 1000.0
+    pos_qty = 0.0
+    cooldown_left = 0
+    entry_cost_eur = 0.0
+    in_pos_bars = 0
+
+    eq = np.zeros(n, dtype=np.float64)
+    closed_pnls: List[float] = []
+
+    # для дневного лимита
+    eq_day_start = cash_eur
+    last_day = None
+
+    for i in range(n):
+        px = float(close[i])
+        ts = idx[i]
+
+        # дневной PnL
+        day = ts.date()
+        if last_day is None:
+            last_day = day
+            eq_day_start = cash_eur + pos_qty * px
+        elif day != last_day:
+            eq_day_start = cash_eur + pos_qty * px
+            last_day = day
+
+        eq_i = cash_eur + pos_qty * px
+        eq[i] = eq_i
+        daily_bps = ((eq_i - eq_day_start) / max(1e-12, eq_day_start)) * 1e4
+
+        if cooldown_left > 0 and pos_qty == 0.0:
+            cooldown_left -= 1
+
+        do_entry = (trig.iat[i] == 1)
+        do_exit = (trig.iat[i] == -1)
+
+        # запреты на вход
+        if do_entry:
+            if cooldown_left > 0:
+                do_entry = False
+            if max_daily_loss_bps and daily_bps <= -abs(float(max_daily_loss_bps)):
+                do_entry = False
+            if not enter_on_start and i < max(fast, slow):
+                do_entry = False
+
+        if do_entry and pos_qty <= 1e-12:
+            buy_px = px * (1.0 + slip_mult)
+            qty = qty_eur / max(1e-12, buy_px)
+            notional = qty * buy_px
+            fee_eur = notional * fee_mult
+            cash_eur -= (notional + fee_eur)
+            pos_qty += qty
+            entry_cost_eur = notional + fee_eur
+
+        elif do_exit and pos_qty > 1e-12:
+            sell_px = px * (1.0 - slip_mult)
+            notional = pos_qty * sell_px
+            fee_eur = notional * fee_mult
+            cash_eur += (notional - fee_eur)
+            closed = (notional - fee_eur) - entry_cost_eur
+            closed_pnls.append(closed)
+            pos_qty = 0.0
+            entry_cost_eur = 0.0
+            cooldown_left = max(cooldown_left, cooldown_bars)
+
+        if pos_qty > 0:
+            in_pos_bars += 1
+
+    # метрики по всей серии
+    eq0 = eq[0] if n else 1.0
+    eqN = eq[-1] if n else eq0
+    total_return_pct = (eqN / max(1e-12, eq0) - 1.0) * 100.0
+
+    peak = -np.inf
+    max_dd_pct = 0.0
+    for x in eq:
+        peak = max(peak, x)
+        dd = (x / peak - 1.0) * 100.0
+        max_dd_pct = min(max_dd_pct, dd)
+
+    wins = sum(1 for x in closed_pnls if x > 0)
+    losses = sum(1 for x in closed_pnls if x <= 0)
+    winrate = (wins / max(1, wins + losses)) * 100.0
+    profit_sum = float(sum(x for x in closed_pnls if x > 0))
+    loss_sum = float(sum(-x for x in closed_pnls if x < 0))
+    profit_factor = (profit_sum / loss_sum) if loss_sum > 0 else (float("inf") if profit_sum > 0 else 0.0)
+    avg_trade_eur = (profit_sum - loss_sum) / max(1, (wins + losses))
+    exposure_pct = in_pos_bars / max(1, n) * 100.0
+
+    bars_per_year = _infer_bars_per_year(df.index, resample_rule)
+    rets = (pd.Series(eq, index=df.index).pct_change().fillna(0.0)).to_numpy()
+    ret_mean = float(np.mean(rets))
+    ret_std = float(np.std(rets, ddof=1)) if len(rets) > 1 else 0.0
+    sharpe = (ret_mean / ret_std * np.sqrt(bars_per_year)) if ret_std > 0 else 0.0
+
+    if n >= 2:
+        days = (df.index[-1] - df.index[0]).total_seconds() / 86400.0
+        years = max(1e-9, days / 365.25)
+        cagr = (eqN / max(1e-12, eq0)) ** (1.0 / years) - 1.0
+    else:
+        cagr = 0.0
+    calmar = (cagr / abs(max_dd_pct / 100.0)) if abs(max_dd_pct) > 1e-12 else float("inf")
+
+    return {
+        "bars": int(n),
+        "trades": int(wins + losses),
+        "winrate_pct": winrate,
+        "total_return_pct": total_return_pct,
+        "max_drawdown_pct": max_dd_pct,
+        "final_equity_eur": float(eqN),
+        "start_equity_eur": float(eq0),
+        "profit_factor": profit_factor,
+        "avg_trade_eur": avg_trade_eur,
+        "exposure_pct": exposure_pct,
+        "sharpe": sharpe,
+        "cagr_pct": cagr * 100.0,
+        "calmar": calmar,
+    }
+
+
+# ------------------------ конфиг и основной раннер свипа ------------------------
 
 @dataclass
 class SweepCfg:
@@ -75,8 +239,8 @@ class SweepCfg:
     refetch_per_config: bool = False          # False = качаем свечи один раз и переиспользуем
 
 
-def _row_from_wf_metrics(m: Dict[str, Any], cfg_row: Dict[str, Any]) -> Dict[str, Any]:
-    """Собираем строку свип-таблицы из метрик симуляции и параметров."""
+def _row_from_metrics(m: Dict[str, Any], cfg_row: Dict[str, Any]) -> Dict[str, Any]:
+    """Собираем строку свип-таблицы из метрик и параметров."""
     return {
         "pair": cfg_row["pair"],
         "bars": m.get("bars"),
@@ -92,7 +256,7 @@ def _row_from_wf_metrics(m: Dict[str, Any], cfg_row: Dict[str, Any]) -> Dict[str
         "sharpe": m.get("sharpe"),
         "cagr_pct": m.get("cagr_pct"),
         "calmar": m.get("calmar"),
-        "bars_per_year": None,  # не считаем отдельно — не критично для ранжирования
+        "bars_per_year": None,
         # конфиг
         "fast": cfg_row["fast"],
         "slow": cfg_row["slow"],
@@ -117,7 +281,7 @@ def run_sweep(cfg: SweepCfg) -> Path:
     if not cfg.refetch_per_config:
         base = _fetch_exmo_candles(cfg.pair, cfg.span)
         shared_df = _resample_ohlcv(base, cfg.resample) if cfg.resample else base
-        if len(shared_df) < 5:
+        if len(shared_df) < max(3, (max(cfg.fast_list or [1], default=1), max(cfg.slow_list or [1], default=1))[1]):
             raise RuntimeError("Too few candles received for sweep.")
 
     rows: List[Dict[str, Any]] = []
@@ -134,18 +298,20 @@ def run_sweep(cfg: SweepCfg) -> Path:
         if slow <= fast:
             continue
 
-        # Ветка 1: быстрый режим без артефактов — используем одну и ту же историю
+        # БЫСТРЫЙ РЕЖИМ (по умолчанию): одна история, без файлов на конфигурацию
         if not cfg.refetch_per_config and not cfg.save_per_config_csv and not cfg.save_per_config_metrics:
             try:
-                wfc = WFConfig(
-                    pair=cfg.pair, span=cfg.span, resample=cfg.resample,
+                m = _simulate_full_series(
+                    shared_df,
+                    resample_rule=cfg.resample,
                     fast=int(fast), slow=int(slow),
                     hysteresis_bps=int(hyst), cooldown_bars=int(cooldown),
-                    fee_bps=int(cfg.fee_bps), slip_bps=int(cfg.slip_bps), qty_eur=float(qty),
+                    fee_bps=int(cfg.fee_bps), slip_bps=int(cfg.slip_bps),
+                    qty_eur=float(qty),
+                    enter_on_start=False,
                     max_daily_loss_bps=int(cfg.max_daily_loss_bps),
                 )
-                m = _simulate_on_df(shared_df, wfc)  # метрики одной прогонки
-                row = _row_from_wf_metrics(m, {
+                row = _row_from_metrics(m, {
                     "pair": cfg.pair,
                     "fast": fast, "slow": slow,
                     "hysteresis_bps": hyst, "cooldown_bars": cooldown,
@@ -162,7 +328,7 @@ def run_sweep(cfg: SweepCfg) -> Path:
                 })
             continue
 
-        # Ветка 2: нужно сохранять CSV/metrics ИЛИ запрошен refetch — полный бэктест с возможной записью
+        # МЕДЛЕННЫЙ РЕЖИМ: нужен рефетч или артефакты — используем полноценный бэктест
         bt = BtConfig(
             pair=cfg.pair, span=cfg.span, resample_rule=cfg.resample,
             fast=int(fast), slow=int(slow),
@@ -219,7 +385,7 @@ def run_sweep(cfg: SweepCfg) -> Path:
 
     df = pd.DataFrame(rows)
 
-    # чистим бесконечности (на всякий случай)
+    # Чистим бесконечности (на всякий случай)
     for col in ("profit_factor", "calmar"):
         if col in df.columns:
             df[col] = df[col].replace([np.inf, -np.inf], np.nan)
@@ -230,6 +396,8 @@ def run_sweep(cfg: SweepCfg) -> Path:
     df.to_csv(out_csv, index=False)
     return out_csv
 
+
+# ------------------------ CLI ------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("sweep", description="Grid search for vectorized backtest params")
