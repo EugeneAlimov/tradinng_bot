@@ -11,9 +11,7 @@ from __future__ import annotations
   - normalize_resample_rule
   - build_bt_config
   - SimConfig
-
-Реализацию базовых операций делегируем в приватные хелперы из sweep.py,
-чтобы не дублировать логику.
+  - normalize_metrics
 """
 
 from dataclasses import dataclass, asdict
@@ -24,6 +22,14 @@ def _sweep() -> Any:
     # ленивый импорт во избежание циклических зависимостей
     from . import sweep  # type: ignore
     return sweep
+
+
+def _metrics_mod() -> Any:
+    try:
+        from . import metrics  # type: ignore
+        return metrics
+    except Exception:
+        return None
 
 
 # ---------- Публичные фасады к хелперам из sweep.py ----------
@@ -111,6 +117,76 @@ def build_bt_config(
     return bt_cfg
 
 
+# ---------- Нормализация метрик ----------
+
+def _to_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _to_int(x: Any) -> Optional[int]:
+    try:
+        if x is None:
+            return None
+        return int(x)
+    except Exception:
+        return None
+
+
+def normalize_metrics(metrics: Any, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """
+    Унифицированная нормализация метрик.
+
+    Поведение:
+      - если есть src.backtest.metrics.normalize_metrics — делегируем туда (с теми же аргументами);
+      - иначе используем безопасный fallback, который:
+          * принимает dict (или объект с .get);
+          * приводит известные числовые поля к float/int;
+          * не падает при отсутствии полей;
+          * возвращает новый dict (исходный не мутируется).
+
+    Сигнатура поддерживает *args/**kwargs для совместимости с разными вызовами.
+    """
+    mmod = _metrics_mod()
+    if mmod and hasattr(mmod, "normalize_metrics"):
+        # отдадим управление «настоящей» реализации, если она есть
+        return mmod.normalize_metrics(metrics, *args, **kwargs)  # type: ignore
+
+    # --- fallback: мягкая нормализация словаря метрик ---
+    src = dict(metrics or {}) if isinstance(metrics, dict) else {}
+
+    out: Dict[str, Any] = dict(src)  # скопируем всё как есть и поправим известные поля
+
+    # список ожидаемых полей и конвертеров
+    float_fields = [
+        "winrate_pct", "total_return_pct", "max_drawdown_pct",
+        "final_equity_eur", "start_equity_eur",
+        "profit_factor", "avg_trade_eur", "exposure_pct",
+        "sharpe", "cagr_pct", "calmar",
+    ]
+    int_fields = ["bars", "trades", "bars_per_year"]
+
+    for f in float_fields:
+        if f in src:
+            out[f] = _to_float(src.get(f))
+
+    for f in int_fields:
+        if f in src:
+            out[f] = _to_int(src.get(f))
+
+    # гарантия наличия пары/ресемплинга — если известны
+    if "pair" in src:
+        out["pair"] = str(src.get("pair"))
+    if "resample" in src:
+        out["resample"] = str(src.get("resample"))
+
+    return out
+
+
 __all__ = [
     "fetch_exmo_candles_cached",
     "resample_ohlc",
@@ -118,4 +194,5 @@ __all__ = [
     "normalize_resample_rule",
     "build_bt_config",
     "SimConfig",
+    "normalize_metrics",
 ]
