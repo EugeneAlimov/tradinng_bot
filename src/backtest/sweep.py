@@ -1,198 +1,189 @@
-# src/backtest/sweep.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import itertools
-import json
+import csv
+import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-import numpy as np
-import pandas as pd
+import math
 
 from .compat import (
-    fetch_exmo_candles_cached,
+    build_bt_config,
+    normalize_metrics,
     normalize_resample_rule,
-    resample_ohlc,
-    SimConfig,
-    simulate_on_df,
+    run_backtest_compat,
 )
 
-
-# ------------------------ parsing helpers ------------------------
-
-def _parse_range_token(tok: str) -> Iterable[int]:
-    """
-    Parse 'start:end:step' (inclusive of start, exclusive of end) into ints.
-    Example: '5:20:5' -> [5,10,15]
-    """
-    parts = tok.split(":")
-    if len(parts) != 3:
-        raise ValueError(f"Bad range token '{tok}', expected start:end:step")
-    s, e, st = (int(parts[0]), int(parts[1]), int(parts[2]))
-    if st == 0:
-        raise ValueError("step must be non-zero")
-    # как в Python range: end не включаем
-    return range(s, e, st)
+log = logging.getLogger(__name__)
 
 
-def parse_int_list(spec: str) -> List[int]:
+def parse_int_list(spec: Union[str, Sequence[int]]) -> List[int]:
     """
-    Accepts comma-separated ints OR range tokens 'a:b:c'.
-    Examples:
-      '5,10,15' -> [5,10,15]
-      '5:20:5'  -> [5,10,15]
-      '5:20:5,25' -> [5,10,15,25]
+    "5:20:5" -> [5,10,15,20]
+    "0,3,5,8" -> [0,3,5,8]
+    [1,2] -> [1,2]
     """
-    out: List[int] = []
-    for tok in [t.strip() for t in spec.split(",") if t.strip()]:
-        if ":" in tok:
-            out.extend(list(_parse_range_token(tok)))
+    if isinstance(spec, (list, tuple)):
+        return [int(x) for x in spec]
+    s = str(spec).strip()
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) == 2:
+            start, stop = int(parts[0]), int(parts[1])
+            step = 1
         else:
-            out.append(int(tok))
-    # dedup but keep order
-    seen = set()
-    uniq: List[int] = []
-    for v in out:
-        if v not in seen:
-            uniq.append(v)
-            seen.add(v)
-    return uniq
+            start, stop, step = int(parts[0]), int(parts[1]), int(parts[2])
+        if step == 0:
+            raise ValueError("step cannot be 0")
+        if (stop - start) * step < 0:
+            step = -abs(step) if stop < start else abs(step)
+        out = list(range(start, stop + (1 if step > 0 else -1), step))
+        return out
+    if s == "":
+        return []
+    return [int(x.strip()) for x in s.split(",") if x.strip() != ""]
 
 
-def parse_float_list(spec: str) -> List[float]:
-    out: List[float] = []
-    for tok in [t.strip() for t in spec.split(",") if t.strip()]:
-        if ":" in tok:
-            rng = list(_parse_range_token(tok))
-            out.extend([float(x) for x in rng])
+def parse_float_list(spec: Union[str, Sequence[float]]) -> List[float]:
+    if isinstance(spec, (list, tuple)):
+        return [float(x) for x in spec]
+    s = str(spec).strip()
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) == 2:
+            start, stop = float(parts[0]), float(parts[1])
+            step = 1.0
         else:
-            out.append(float(tok))
-    # dedup keep order
-    seen = set()
-    uniq: List[float] = []
-    for v in out:
-        if v not in seen:
-            uniq.append(v)
-            seen.add(v)
-    return uniq
+            start, stop, step = float(parts[0]), float(parts[1]), float(parts[2])
+        if step == 0:
+            raise ValueError("step cannot be 0")
+        out: List[float] = []
+        x = start
+        if step > 0:
+            while x <= stop + 1e-12:
+                out.append(round(x, 10))
+                x += step
+        else:
+            while x >= stop - 1e-12:
+                out.append(round(x, 10))
+                x += step
+        return out
+    if s == "":
+        return []
+    return [float(x.strip()) for x in s.split(",") if x.strip() != ""]
 
-
-# ------------------------ config ------------------------
 
 @dataclass
 class SweepCfg:
     pair: str
-    span: str                 # ex: "1m:5000"
-    resample: str = "5m"      # "5m" | "5T" | "1H" ...
-    fast_list: Sequence[int] = (10,)
-    slow_list: Sequence[int] = (20,)
-    hyst_list: Sequence[int] = (0,)
-    cooldown_list: Sequence[int] = (0, 3, 5)
-    qty_list: Sequence[float] = (100.0,)
-    fee_bps: int = 10
-    slip_bps: int = 2
-    max_daily_loss_bps: int = 0
-    out_dir: Path | str = Path("data/sweep")
+    span: str  # e.g. "1m:5000"
+    resample: Optional[str]  # e.g. "5m"
+    fast_list: List[int]
+    slow_list: List[int]
+    hyst_list: List[int]
+    cooldown_list: List[int]
+    qty_list: List[float]
+    fee_bps: int
+    slip_bps: int
+    max_daily_loss_bps: int
+    out_dir: Path
 
 
-# ------------------------ core ------------------------
+_HEADERS = [
+    "pair", "bars", "trades", "winrate_pct", "total_return_pct", "max_drawdown_pct",
+    "final_equity_eur", "start_equity_eur", "profit_factor", "avg_trade_eur",
+    "exposure_pct", "sharpe", "cagr_pct", "calmar", "bars_per_year",
+    "fast", "slow", "hysteresis_bps", "cooldown_bars", "qty_eur", "fee_bps", "slip_bps",
+    "max_daily_loss_bps", "trades_csv", "equity_csv", "error"
+]
+
+
+def _safe_get(m: Dict[str, Any], *keys: str, default: Any = None) -> Any:
+    for k in keys:
+        if k in m:
+            return m[k]
+    return default
+
 
 def run_sweep(cfg: SweepCfg) -> str:
     """
-    Выполняет свип всех комбинаций и пишет один CSV.
-    Возвращает путь к CSV (str).
+    Build grid and run vectorized bt for each point.
+    Writes CSV and returns its path (string for historical compatibility).
     """
-    rr_user = cfg.resample
-    rr = normalize_resample_rule(rr_user)
+    out_dir: Path = cfg.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    res = normalize_resample_rule(cfg.resample) or "raw"
+    sweep_path = out_dir / f"sweep_{cfg.pair}_{res}_{stamp}.csv"
 
-    out_root = Path(cfg.out_dir)
-    out_root.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    # в имени файла придерживаемся твоей схемы: 5T для минут
-    file_resample = rr.replace("T", "m") if rr.endswith("T") else rr
-    # но в успешных логах у тебя встречались и 5m и 5T — оставим 5m для читаемости
-    file_resample = "5m" if rr in ("5T", "5m") else rr
-    out_csv = out_root / f"sweep_{cfg.pair}_{file_resample}_{timestamp}.csv"
+    combos: List[Tuple[int, int, int, int, float]] = []
+    for f in cfg.fast_list:
+        for s in cfg.slow_list:
+            if f >= s:
+                continue  # common-sense constraint for MA-like setups
+            for h in cfg.hyst_list:
+                for cd in cfg.cooldown_list:
+                    for qty in cfg.qty_list:
+                        combos.append((f, s, h, cd, qty))
 
-    rows: List[dict] = []
+    with open(sweep_path, "w", newline="") as f:
+        wr = csv.writer(f)
+        wr.writerow(_HEADERS)
 
-    # 1) fetch & resample один раз
-    try:
-        raw = fetch_exmo_candles_cached(cfg.pair, cfg.span)
-        df = resample_ohlc(raw, rr)
-        if df.empty:
-            raise RuntimeError(f"Empty resampled candles for {cfg.pair} {cfg.span} -> {rr}")
-    except Exception as e:
-        # записываем компактный CSV с ошибкой
-        pd.DataFrame(
-            [{"pair": cfg.pair, "error": f"fetch_or_resample_failed: {e}"}]
-        ).to_csv(out_csv, index=False)
-        return str(out_csv)
+        for (fast, slow, hyst, cd, qty) in combos:
+            error_txt = ""
+            try:
+                bt_cfg = build_bt_config(
+                    pair=cfg.pair,
+                    span=cfg.span,
+                    resample=normalize_resample_rule(cfg.resample),
+                    fast=int(fast),
+                    slow=int(slow),
+                    hysteresis_bps=int(hyst),
+                    cooldown_bars=int(cd),
+                    qty_eur=float(qty),
+                    fee_bps=int(cfg.fee_bps),
+                    slip_bps=int(cfg.slip_bps),
+                    max_daily_loss_bps=int(cfg.max_daily_loss_bps),
+                )
 
-    # 2) перебор комбинаций
-    combos = list(itertools.product(
-        list(cfg.fast_list),
-        list(cfg.slow_list),
-        list(cfg.hyst_list),
-        list(cfg.cooldown_list),
-        list(cfg.qty_list),
-    ))
+                bt_out = run_backtest_compat(bt_cfg, write_csv=False)
+                norm = normalize_metrics(bt_out)
+                m = norm["metrics"]
 
-    for fast, slow, hyst, cd, qty in combos:
-        row_base = {
-            "pair": cfg.pair,
-            # метрики заполним после
-            "bars_per_year": np.nan,  # заполним из метрик симулятора
-            "fast": int(fast),
-            "slow": int(slow),
-            "hysteresis_bps": int(hyst),
-            "cooldown_bars": int(cd),
-            "qty_eur": float(qty),
-            "fee_bps": int(cfg.fee_bps),
-            "slip_bps": int(cfg.slip_bps),
-            "max_daily_loss_bps": int(cfg.max_daily_loss_bps),
-            "trades_csv": None,
-            "equity_csv": None,
-        }
-        try:
-            scfg = SimConfig(
-                fast=int(fast),
-                slow=int(slow),
-                hysteresis_bps=int(hyst),
-                cooldown_bars=int(cd),
-                fee_bps=int(cfg.fee_bps),
-                slip_bps=int(cfg.slip_bps),
-                qty_eur=float(qty),
-                max_daily_loss_bps=int(cfg.max_daily_loss_bps),
-                resample=rr,
-            )
-            trades_df, equity_df, metrics = simulate_on_df(df, scfg)
+                row = [
+                    cfg.pair,
+                    _safe_get(m, "bars"),
+                    _safe_get(m, "trades"),
+                    round(float(_safe_get(m, "winrate_pct", default=0) or 0), 12),
+                    round(float(_safe_get(m, "total_return_pct", default=0) or 0), 12),
+                    float(_safe_get(m, "max_drawdown_pct", default=0) or 0),
+                    float(_safe_get(m, "final_equity_eur", default=0) or 0),
+                    float(_safe_get(m, "start_equity_eur", default=0) or 0),
+                    float(_safe_get(m, "profit_factor", default=0) or 0),
+                    float(_safe_get(m, "avg_trade_eur", default=0) or 0),
+                    float(_safe_get(m, "exposure_pct", default=0) or 0),
+                    float(_safe_get(m, "sharpe", default=0) or 0),
+                    float(_safe_get(m, "cagr_pct", default=0) or 0),
+                    float(_safe_get(m, "calmar", default=0) or 0),
+                    _safe_get(m, "bars_per_year"),
+                    fast, slow, hyst, cd, qty, cfg.fee_bps, cfg.slip_bps, cfg.max_daily_loss_bps,
+                    norm.get("trades_csv"),
+                    norm.get("equity_csv"),
+                    "",  # error
+                ]
+            except Exception as e:
+                log.warning("sweep point failed f=%s s=%s h=%s cd=%s qty=%s: %s",
+                            fast, slow, hyst, cd, qty, e)
+                error_txt = str(e)
+                row = [
+                    cfg.pair, "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+                    fast, slow, hyst, cd, qty, cfg.fee_bps, cfg.slip_bps, cfg.max_daily_loss_bps,
+                    "", "", error_txt
+                ]
+            wr.writerow(row)
 
-            row = {
-                **row_base,
-                "bars": int(metrics["bars"]),
-                "trades": int(metrics["trades"]),
-                "winrate_pct": float(metrics["winrate_pct"]),
-                "total_return_pct": float(metrics["total_return_pct"]),
-                "max_drawdown_pct": float(metrics["max_drawdown_pct"]),
-                "final_equity_eur": float(metrics["final_equity_eur"]),
-                "start_equity_eur": float(metrics["start_equity_eur"]),
-                "profit_factor": float(metrics["profit_factor"]),
-                "avg_trade_eur": float(metrics["avg_trade_eur"]),
-                "exposure_pct": float(metrics["exposure_pct"]),
-                "sharpe": float(metrics["sharpe"]),
-                "cagr_pct": float(metrics["cagr_pct"]),
-                "calmar": float(metrics["calmar"]),
-                "bars_per_year": float(metrics["bars_per_year"]),
-                "trades_csv": None,
-                "equity_csv": None,
-            }
-        except Exception as e:
-            row = {**row_base, "error": str(e)}
-
-        rows.append(row)
-
-    pd.DataFrame(rows).to_csv(out_csv, index=False)
-    return str(out_csv)
+    return str(sweep_path)
