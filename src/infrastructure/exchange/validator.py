@@ -1,16 +1,13 @@
-# -*- coding: utf-8 -*-
-"""
-Validation for balances, tickers, orders, candles.
-All numeric data is converted to Decimal; invalid records are skipped with logging.
-"""
+# src/infrastructure/exchange/validator.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, getcontext
 from typing import Any, Dict, List, Optional
 import logging
 
 logger = logging.getLogger(__name__)
+getcontext().prec = 28
 
 
 class ValidationError(Exception):
@@ -59,98 +56,96 @@ class ExchangeDataValidator:
             s = str(value).strip()
             if not s or s.lower() == "null":
                 raise ValidationError(f"{field_name} is empty/null")
-            if s.lower() in ("inf", "-inf", "infinity", "-infinity", "nan"):
-                raise ValidationError(f"{field_name} invalid: {s}")
+            low = s.lower()
+            if low in ("inf", "+inf", "-inf", "infinity", "-infinity", "nan"):
+                raise ValidationError(f"{field_name} invalid literal: {s}")
             d = Decimal(s)
             if field_name in ("quantity", "volume", "fee") and d < 0:
-                raise ValidationError(f"{field_name} cannot be negative: {d}")
+                raise ValidationError(f"{field_name} negative: {d}")
             return d
         except (InvalidOperation, ValueError) as e:
-            raise ValidationError(f"Cannot convert {field_name}='{value}' to Decimal: {e}")
+            raise ValidationError(f"{field_name} parse error: {e}")
 
     @classmethod
-    def validate_balance(cls, balance_data: Dict[str, Any]) -> Dict[str, ValidatedBalance]:
-        if not isinstance(balance_data, dict):
-            raise ValidationError(f"Balance data must be dict, got {type(balance_data)}")
-
+    def validate_balance(cls, balance: Dict[str, Any]) -> Dict[str, ValidatedBalance]:
+        if not isinstance(balance, dict):
+            raise ValidationError(f"balance must be dict, got {type(balance)}")
         out: Dict[str, ValidatedBalance] = {}
-        for ccy, amount in balance_data.items():
+        for cur, data in balance.items():
             try:
-                if not isinstance(ccy, str) or not ccy:
-                    logger.warning("Invalid currency key: %r", ccy)
+                if not isinstance(cur, str) or not cur:
+                    logger.warning("invalid currency key: %r", cur)
                     continue
-                ccy = ccy.upper().strip()
-                if isinstance(amount, dict):
-                    free = cls.to_decimal(amount.get("free", 0), f"{ccy}.free")
-                    used = cls.to_decimal(amount.get("used", 0), f"{ccy}.used")
-                    total = cls.to_decimal(amount.get("total", free + used), f"{ccy}.total")
+                cur_u = cur.upper().strip()
+                if isinstance(data, dict):
+                    free = cls.to_decimal(data.get("free", 0), f"{cur_u}.free")
+                    used = cls.to_decimal(data.get("used", 0), f"{cur_u}.used")
+                    total = cls.to_decimal(data.get("total", free + used), f"{cur_u}.total")
                 else:
-                    free = cls.to_decimal(amount, f"{ccy}.free")
+                    free = cls.to_decimal(data, f"{cur_u}.free")
                     used = Decimal("0")
                     total = free
                 if abs(total - (free + used)) > Decimal("0.00000001"):
-                    logger.warning("Balance inconsistency %s: total=%s free=%s used=%s", ccy, total, free, used)
-                out[ccy] = ValidatedBalance(currency=ccy, free=free, used=used, total=total)
+                    logger.warning("balance inconsistency %s: total=%s vs free+used=%s", cur_u, total, free + used)
+                out[cur_u] = ValidatedBalance(cur_u, free, used, total)
             except ValidationError as e:
-                logger.error("Balance validation failed for %s: %s", ccy, e)
-                continue
+                logger.error("balance[%s] invalid: %s", cur, e)
         return out
 
     @classmethod
-    def validate_order(cls, order_data: Dict[str, Any]) -> ValidatedOrder:
-        if not isinstance(order_data, dict):
-            raise ValidationError(f"Order data must be dict, got {type(order_data)}")
-        oid = str(order_data.get("order_id", "") or "")
+    def validate_order(cls, od: Dict[str, Any]) -> ValidatedOrder:
+        if not isinstance(od, dict):
+            raise ValidationError("order must be dict")
+        oid = str(od.get("order_id", "")).strip()
         if not oid:
-            raise ValidationError("Order ID missing")
-        pair = str(order_data.get("pair", order_data.get("symbol", ""))).upper()
+            raise ValidationError("order_id missing")
+        pair = str(od.get("pair", od.get("symbol", ""))).upper()
         if "_" not in pair:
-            raise ValidationError(f"Invalid pair: {pair}")
-        side = str(order_data.get("type", order_data.get("side", ""))).lower()
+            raise ValidationError(f"pair invalid: {pair}")
+        side = str(od.get("type", od.get("side", ""))).lower()
         if side not in ("buy", "sell"):
-            raise ValidationError(f"Invalid side: {side}")
-        price = cls.to_decimal(order_data.get("price"), "price")
-        qty = cls.to_decimal(order_data.get("quantity", order_data.get("amount")), "quantity")
-        filled = cls.to_decimal(order_data.get("filled", order_data.get("executed_quantity", 0)), "filled")
-        status = str(order_data.get("status", "open")).lower()
-        ts = int(order_data.get("created", order_data.get("timestamp", 0)) or 0)
+            raise ValidationError(f"side invalid: {side}")
+        price = cls.to_decimal(od.get("price"), "price")
+        qty = cls.to_decimal(od.get("quantity", od.get("amount")), "quantity")
+        filled = cls.to_decimal(od.get("filled", od.get("executed_quantity", 0)), "filled")
+        status = str(od.get("status", "open")).lower()
+        ts = int(od.get("created", od.get("timestamp", 0)))
         if filled > qty:
-            raise ValidationError(f"Filled {filled} > qty {qty}")
+            raise ValidationError(f"filled {filled} > qty {qty}")
         if price <= 0:
-            raise ValidationError(f"Invalid price: {price}")
-        return ValidatedOrder(
-            order_id=oid, pair=pair, side=side, price=price,
-            quantity=qty, filled=filled, status=status, timestamp=ts
-        )
+            raise ValidationError(f"price <= 0: {price}")
+        return ValidatedOrder(oid, pair, side, price, qty, filled, status, ts)
 
     @classmethod
-    def validate_ticker(cls, ticker: Dict[str, Any]) -> ValidatedTicker:
-        if not isinstance(ticker, dict):
-            raise ValidationError(f"Ticker data must be dict, got {type(ticker)}")
-        bid = cls.to_decimal(ticker.get("buy_price", ticker.get("bid")), "bid")
-        ask = cls.to_decimal(ticker.get("sell_price", ticker.get("ask")), "ask")
-        last = cls.to_decimal(ticker.get("last_trade", ticker.get("last")), "last")
-        vol = cls.to_decimal(ticker.get("vol", ticker.get("volume", 0)), "volume")
-        high = cls.to_decimal(ticker.get("high", last), "high")
-        low = cls.to_decimal(ticker.get("low", last), "low")
-        if bid >= ask:
-            raise ValidationError(f"Invalid spread: bid={bid} >= ask={ask}")
+    def validate_ticker(cls, tk: Dict[str, Any]) -> ValidatedTicker:
+        if not isinstance(tk, dict):
+            raise ValidationError("ticker must be dict")
+        bid = cls.to_decimal(tk.get("buy_price", tk.get("bid")), "bid")
+        ask = cls.to_decimal(tk.get("sell_price", tk.get("ask")), "ask")
+        last = cls.to_decimal(tk.get("last_trade", tk.get("last")), "last")
+        vol = cls.to_decimal(tk.get("vol", tk.get("volume", 0)), "volume")
+        high = cls.to_decimal(tk.get("high", last), "high")
+        low = cls.to_decimal(tk.get("low", last), "low")
+        eps = Decimal("0.00000001")
+        if bid > ask + eps:
+            raise ValidationError(f"spread invalid: bid {bid} > ask {ask}")
         if high < low:
-            raise ValidationError(f"Invalid high/low: {high} < {low}")
-        return ValidatedTicker(
-            pair=str(ticker.get("pair", "")),
-            bid=bid, ask=ask, last=last, volume_24h=vol, high_24h=high, low_24h=low
-        )
+            raise ValidationError(f"high < low: {high} < {low}")
+        if last > high or last < low:
+            logger.warning("last %s outside [%s, %s]", last, low, high)
+        return ValidatedTicker(pair=str(tk.get("pair", "")), bid=bid, ask=ask, last=last,
+                               volume_24h=vol, high_24h=high, low_24h=low)
 
     @classmethod
     def validate_candles(cls, candles: List[Dict[str, Any]]) -> List[Dict[str, Decimal]]:
         if not isinstance(candles, list):
-            raise ValidationError(f"Candles data must be list, got {type(candles)}")
+            raise ValidationError("candles must be list")
         out: List[Dict[str, Decimal]] = []
         for i, c in enumerate(candles):
             try:
                 if not isinstance(c, dict):
-                    raise ValidationError(f"Candle[{i}] must be dict")
+                    raise ValidationError("candle not dict")
+                ts = int(c.get("t", c.get("timestamp", 0)))
                 o = cls.to_decimal(c.get("o", c.get("open")), f"candle[{i}].open")
                 h = cls.to_decimal(c.get("h", c.get("high")), f"candle[{i}].high")
                 l = cls.to_decimal(c.get("l", c.get("low")), f"candle[{i}].low")
@@ -162,40 +157,37 @@ class ExchangeDataValidator:
                     raise ValidationError("open outside range")
                 if not (l <= cl <= h):
                     raise ValidationError("close outside range")
-                out.append({
-                    "timestamp": int(c.get("t", c.get("timestamp", 0)) or 0),
-                    "open": o, "high": h, "low": l, "close": cl, "volume": v
-                })
+                out.append({"timestamp": Decimal(ts), "open": o, "high": h, "low": l, "close": cl, "volume": v})
             except ValidationError as e:
-                logger.error("Candle[%s] invalid: %s", i, e)
-                continue
+                logger.error("candle %d invalid: %s", i, e)
         return out
 
 
 class SafeExmoWrapper:
-    """Adapter over EXMO private/public API client that validates data."""
-    def __init__(self, exmo_api: Any):
+    """
+    Обёртка над EXMO API с валидацией данных. Методы возвращают уже проверенные
+    структуры либо пустые/None при ошибке (с логированием).
+    """
+    def __init__(self, exmo_api):
         self.api = exmo_api
-        self.validator = ExchangeDataValidator()
+        self.v = ExchangeDataValidator
 
     def get_validated_balances(self) -> Dict[str, ValidatedBalance]:
         try:
             raw = self.api.user_info()
-            balances = raw.get("balances") or raw.get("balance") or {}
-            return self.validator.validate_balance(balances)
+            bal = raw.get("balances", raw.get("balance", {}))
+            return self.v.validate_balance(bal)
         except Exception as e:
-            logger.error("get_validated_balances failed: %s", e)
+            logger.error("balances fetch failed: %s", e)
             return {}
 
     def get_validated_ticker(self, pair: str) -> Optional[ValidatedTicker]:
         try:
-            t = self.api.ticker_pair(pair)
-            if not t:
-                return None
-            t["pair"] = pair
-            return self.validator.validate_ticker(t)
+            data = self.api.ticker_pair(pair) or {}
+            data["pair"] = pair
+            return self.v.validate_ticker(data)
         except Exception as e:
-            logger.error("get_validated_ticker(%s) failed: %s", pair, e)
+            logger.error("ticker %s failed: %s", pair, e)
             return None
 
     def get_validated_open_orders(self, pair: Optional[str] = None) -> List[ValidatedOrder]:
@@ -203,15 +195,14 @@ class SafeExmoWrapper:
             raw = self.api.user_open_orders(pair)
             out: List[ValidatedOrder] = []
             if isinstance(raw, dict):
-                for p, arr in raw.items():
-                    if isinstance(arr, list):
-                        for o in arr:
-                            try:
-                                o["pair"] = p
-                                out.append(self.validator.validate_order(o))
-                            except ValidationError as e:
-                                logger.warning("Skip invalid open order: %s", e)
+                for p, lst in raw.items():
+                    for od in lst or []:
+                        try:
+                            od["pair"] = p
+                            out.append(self.v.validate_order(od))
+                        except ValidationError as ve:
+                            logger.warning("skip invalid order: %s", ve)
             return out
         except Exception as e:
-            logger.error("get_validated_open_orders failed: %s", e)
+            logger.error("open orders failed: %s", e)
             return []
