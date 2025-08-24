@@ -5,12 +5,21 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Optional
 
-# Раньше тут был невалидный импорт:
-#   from src.strategies.sma import Bar   <-- его нет
-# Берём доменную модель бара из доменного слоя:
-from src.core.domain.models import Bar  # noqa: F401 (часто используется тип как аннотация)
-
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Bar:
+    """
+    Локальная минимальная модель бара, чтобы не тянуть несуществующие импорты.
+    Этого достаточно для типизации базового движка.
+    """
+    ts: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
 
 
 @dataclass
@@ -20,15 +29,15 @@ class EngineConfig:
 
 
 class Engine:
-    """Минимальный движок-обёртка, чтобы не ломались импорты в модулях."""
+    """Простая обёртка-движок, чтобы не ломались импорты и базовые сценарии."""
 
     def __init__(self, cfg: Optional[EngineConfig] = None) -> None:
         self.cfg = cfg or EngineConfig()
         logger.debug("Engine(%s) init, dry_run=%s", self.cfg.name, self.cfg.dry_run)
 
     def on_bar(self, bar: Bar) -> None:
-        """Хэндлер нового бара. В базовой реализации ничего не делает."""
-        logger.trace("on_bar: %s", bar) if hasattr(logger, "trace") else logger.debug("on_bar: %s", bar)
+        # У большинства логгеров нет .trace — страхуемся
+        (getattr(logger, "trace", logger.debug))("on_bar: %s", bar)
 
     def start(self) -> None:
         logger.info("Engine '%s' started (dry_run=%s)", self.cfg.name, self.cfg.dry_run)
