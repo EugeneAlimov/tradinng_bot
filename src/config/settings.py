@@ -15,7 +15,7 @@ def _get_env_bool(name: str, default: bool = False) -> bool:
 @dataclass
 class Settings:
     """
-    Базовые настройки проекта. Источник — переменные окружения / .env.
+    Единый конфиг проекта (ENV/.env).
     """
 
     # --- Risk / Reconcile / Alerts
@@ -27,9 +27,16 @@ class Settings:
     tg_token: str = os.getenv("TG_TOKEN", "")
     tg_chat: str = os.getenv("TG_CHAT", "")
 
+    # EXMO creds (опционально; можно держать в keyring)
+    exmo_key: str = os.getenv("EXMO_KEY", "")
+    exmo_secret: str = os.getenv("EXMO_SECRET", "")
+
     # Прочее
     debug: bool = _get_env_bool("DEBUG", False)
     exmo_debug: bool = _get_env_bool("EXMO_DEBUG", False)
+    http_timeout_sec: float = float(os.getenv("HTTP_TIMEOUT_SEC", "10"))
+    http_retries: int = int(os.getenv("HTTP_RETRIES", "3"))
+    http_backoff_factor: float = float(os.getenv("HTTP_BACKOFF_FACTOR", "0.3"))
 
 
 def get_settings() -> Settings:
