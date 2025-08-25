@@ -16,7 +16,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
-
 # --- Импорты наших компонентов (могут отсутствовать в старых ветках — тесты пропускаются) ---
 om_mod = None
 nonce_mod = None
@@ -49,7 +48,8 @@ class _FakeExmoApi:
         self._open: Dict[str, Dict[str, Any]] = {}
 
     # Интерфейс order_create, который ожидает ImprovedOrderManager
-    def order_create(self, pair: str, quantity: str, price: str, side: str, client_id: Optional[int] = None) -> Dict[str, Any]:
+    def order_create(self, pair: str, quantity: str, price: str, side: str, client_id: Optional[int] = None) -> Dict[
+        str, Any]:
         oid = str(self._next_id)
         self._next_id += 1
         # Сохраним "открытый ордер"
@@ -173,9 +173,11 @@ def test_circuit_breaker_with_retry(monkeypatch):
     # через cb + retry
     result = retry.execute(lambda: cb.call(flaky))
     assert result == 42
+
     # если теперь наломаем подряд 3 ошибки — откроется
     def always_bad():
         raise RuntimeError("boom")
+
     with pytest.raises(Exception):
         # 3 ошибки подряд внутри окна откроют брейкер и в итоге упадём
         retry.execute(lambda: cb.call(always_bad))

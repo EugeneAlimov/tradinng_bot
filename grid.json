@@ -1,0 +1,14 @@
+{
+  "ema_adx": {
+    "fast": [9, 12],
+    "slow": [21, 26],
+    "adx_len": [14],
+    "on": [20, 22, 25],
+    "off": [16, 18, 20],
+    "require_di": [true]
+  },
+  "supertrend": [
+    { "atr_len": 10, "mult": 2.5 },
+    { "atr_len": 10, "mult": 3.0 }
+  ]
+}

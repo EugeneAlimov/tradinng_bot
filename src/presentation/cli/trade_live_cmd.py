@@ -53,9 +53,9 @@ def _unix_seconds(ts_like: Any) -> Optional[int]:
         ts = float(ts_like)
     except Exception:
         return None
-    if ts > 1e15:       # µs
+    if ts > 1e15:  # µs
         ts /= 1_000_000.0
-    elif ts > 1e12:     # ms
+    elif ts > 1e12:  # ms
         ts /= 1_000.0
     return int(ts)
 

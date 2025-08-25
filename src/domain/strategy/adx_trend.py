@@ -60,17 +60,18 @@ def _adx(high: List[float], low: List[float], close: List[float], length: int):
 
     plus_di = [0.0 if tr_rma[i] == 0 else 100.0 * plus_rma[i] / tr_rma[i] for i in range(len(close))]
     minus_di = [0.0 if tr_rma[i] == 0 else 100.0 * minus_rma[i] / tr_rma[i] for i in range(len(close))]
-    dx = [0.0 if (plus_di[i] + minus_di[i]) == 0 else 100.0 * abs(plus_di[i] - minus_di[i]) / (plus_di[i] + minus_di[i]) for i in range(len(close))]
+    dx = [0.0 if (plus_di[i] + minus_di[i]) == 0 else 100.0 * abs(plus_di[i] - minus_di[i]) / (plus_di[i] + minus_di[i])
+          for i in range(len(close))]
     adx = _rma_float(dx, n)
     return plus_di, minus_di, adx
 
 
 def generate_signals(
-    close: List[float],
-    high: List[float],
-    low: List[float],
-    adx_len: int = 14,
-    min_adx: float = 20.0,
+        close: List[float],
+        high: List[float],
+        low: List[float],
+        adx_len: int = 14,
+        min_adx: float = 20.0,
 ) -> List[int]:
     """
     +1 — пересечение DI+ вверх DI− при ADX>=min_adx
@@ -91,11 +92,11 @@ def generate_signals(
 
 
 def status(
-    close: List[float],
-    high: List[float],
-    low: List[float],
-    adx_len: int = 14,
-    min_adx: float = 20.0,
+        close: List[float],
+        high: List[float],
+        low: List[float],
+        adx_len: int = 14,
+        min_adx: float = 20.0,
 ) -> Tuple[str, int]:
     pdi, mdi, adx = _adx(high, low, close, adx_len)
     i = len(close) - 1

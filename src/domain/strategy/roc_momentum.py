@@ -35,7 +35,7 @@ def status(prices: List[float], length: int = 12) -> Tuple[str, int]:
         return f"ROC(len={length}) val=?", 0
     roc = (prices[i] / prices[i - n]) - 1.0 if prices[i - n] != 0 else 0.0
     state = 1 if roc > 0 else (-1 if roc < 0 else 0)
-    return f"ROC(len={length}) {roc*100:.2f}%", state
+    return f"ROC(len={length}) {roc * 100:.2f}%", state
 
 
 register(StrategyDef(

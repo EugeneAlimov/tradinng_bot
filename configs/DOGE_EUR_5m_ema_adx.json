@@ -1,0 +1,7 @@
+{
+  "strategy": "ema_adx",
+  "pair": "DOGE_EUR",
+  "timeframe": "5m",
+  "params": { "fast": 12, "slow": 21, "adx_len": 14, "on": 25, "off": 16, "require_di": true },
+  "poll_sec": 10, "heartbeat_sec": 60
+}

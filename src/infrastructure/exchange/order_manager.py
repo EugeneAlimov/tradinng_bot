@@ -63,12 +63,12 @@ class ImprovedOrderManager:
         self._lock = threading.Lock()
 
     def place_order_with_retry(
-        self,
-        pair: str,
-        side: str,
-        price: float,
-        quantity: float,
-        max_retries: int = 3
+            self,
+            pair: str,
+            side: str,
+            price: float,
+            quantity: float,
+            max_retries: int = 3
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Размещает ордер с retry. Возвращает (success, order_id, error_message).

@@ -60,14 +60,14 @@ def _atr(high: List[float], low: List[float], close: List[float], length: int) -
 
 
 def generate_signals(
-    close: List[float],
-    high: List[float],
-    low: List[float],
-    fast: int = 6,
-    slow: int = 25,
-    atr_len: int = 14,
-    atr_mult: float = 3.0,
-    chandelier_len: int = 22,
+        close: List[float],
+        high: List[float],
+        low: List[float],
+        fast: int = 6,
+        slow: int = 25,
+        atr_len: int = 14,
+        atr_mult: float = 3.0,
+        chandelier_len: int = 22,
 ) -> List[int]:
     """
     Вход: кросс SMA(fast) вверх SMA(slow).
@@ -112,14 +112,14 @@ def generate_signals(
 
 
 def status(
-    close: List[float],
-    high: List[float],
-    low: List[float],
-    fast: int = 6,
-    slow: int = 25,
-    atr_len: int = 14,
-    atr_mult: float = 3.0,
-    chandelier_len: int = 22,
+        close: List[float],
+        high: List[float],
+        low: List[float],
+        fast: int = 6,
+        slow: int = 25,
+        atr_len: int = 14,
+        atr_mult: float = 3.0,
+        chandelier_len: int = 22,
 ) -> Tuple[str, int]:
     sma_f = _sma(close, max(2, fast))
     sma_s = _sma(close, max(max(2, fast) + 1, slow))
@@ -133,7 +133,9 @@ def status(
         return "SMA+ATR: SMAf=?, SMAs=?, CE=?", 0
     hh = max(high[i - ce_n + 1:i + 1])
     ce = hh - float(atr_mult) * float(atr[i])
-    f = float(sma_f[i]); s = float(sma_s[i]); c = float(close[i])
+    f = float(sma_f[i]);
+    s = float(sma_s[i]);
+    c = float(close[i])
     state = 1 if f > s else (-1 if (c < ce or f < s) else 0)
     return f"SMAf={f:.6f} SMAs={s:.6f} CE={ce:.6f}", state
 

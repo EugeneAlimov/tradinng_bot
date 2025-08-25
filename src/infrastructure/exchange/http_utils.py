@@ -43,7 +43,8 @@ class HttpClient:
         self.session = _make_session(retries=retries, backoff_factor=backoff_factor)
         self.session.headers["User-Agent"] = user_agent
 
-    def _log_req(self, method: str, path: str, params: Optional[Dict[str, Any]], data: Optional[Dict[str, Any]]) -> None:
+    def _log_req(self, method: str, path: str, params: Optional[Dict[str, Any]],
+                 data: Optional[Dict[str, Any]]) -> None:
         if not self.debug:
             return
         LOG.debug("[HTTP] %s %s params=%s data=%s", method, path, params, data)

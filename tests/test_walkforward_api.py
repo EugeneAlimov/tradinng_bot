@@ -26,8 +26,8 @@ def test_wf_contract():
     )
     out = run_walkforward(cfg, df_override=df, print_json=False)
     for k in [
-        "oos_total_return_pct_mean","oos_max_drawdown_pct_mean","oos_profit_factor_mean",
-        "oos_sharpe_mean","oos_cagr_pct_mean","oos_calmar_mean",
-        "oos_trades_mean","oos_exposure_pct_mean","oos_avg_trade_eur_mean"
+        "oos_total_return_pct_mean", "oos_max_drawdown_pct_mean", "oos_profit_factor_mean",
+        "oos_sharpe_mean", "oos_cagr_pct_mean", "oos_calmar_mean",
+        "oos_trades_mean", "oos_exposure_pct_mean", "oos_avg_trade_eur_mean"
     ]:
         assert k in out

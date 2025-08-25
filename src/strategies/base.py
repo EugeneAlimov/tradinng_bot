@@ -12,6 +12,7 @@ class Strategy(Protocol):
     Контракт любой стратегии:
     на вход close (Series), на выход позиция по барам (Series из {0,1} или {-1,0,1}).
     """
+
     def generate_position(self, close: pd.Series) -> pd.Series:
         ...
 

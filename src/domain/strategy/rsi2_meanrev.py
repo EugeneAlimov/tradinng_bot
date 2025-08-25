@@ -53,10 +53,10 @@ def _rsi(prices: List[float], length: int = 2) -> List[Optional[float]]:
 
 
 def generate_signals(
-    prices: List[float],
-    rsi_len: int = 2,
-    low: float = 10.0,
-    high: float = 90.0,
+        prices: List[float],
+        rsi_len: int = 2,
+        low: float = 10.0,
+        high: float = 90.0,
 ) -> List[int]:
     """
     Mean Reversion (RSI-2): +1 при пересечении RSI ниже low, -1 при пересечении выше high.

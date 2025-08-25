@@ -54,11 +54,11 @@ def _atr(high: List[float], low: List[float], close: List[float], length: int) -
 
 
 def generate_signals(
-    close: List[float],
-    high: List[float],
-    low: List[float],
-    atr_len: int = 10,
-    mult: float = 3.0,
+        close: List[float],
+        high: List[float],
+        low: List[float],
+        atr_len: int = 10,
+        mult: float = 3.0,
 ) -> List[int]:
     """
     Supertrend: сигналы по развороту направления (dir -1→+1 => +1; +1→-1 => -1).
@@ -110,11 +110,11 @@ def generate_signals(
 
 
 def status(
-    close: List[float],
-    high: List[float],
-    low: List[float],
-    atr_len: int = 10,
-    mult: float = 3.0,
+        close: List[float],
+        high: List[float],
+        low: List[float],
+        atr_len: int = 10,
+        mult: float = 3.0,
 ) -> Tuple[str, int]:
     n = max(1, int(atr_len))
     m = float(mult)

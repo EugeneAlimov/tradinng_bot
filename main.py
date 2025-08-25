@@ -1,515 +1,503 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
+Unified entrypoint for running and supervising the EXMO trading bot in Docker/servers.
 
+Subcommands:
+  - serve            : run long-lived supervised 'trade-live --mode observe' from a JSON config
+  - exmo -- <args>   : proxy into 'python -m src.presentation.cli.app <args...>'
+  - healthcheck      : quick EXMO availability check (exit 0 = healthy)
+  - generate-config  : emit a config template to a path
+  - print-config     : parse & pretty-print an effective config (with env overrides)
+  - version          : show versions
+
+Signals (serve):
+  - SIGTERM/CTRL+C   : graceful stop (forwards to child, waits)
+  - SIGHUP           : reload config, restart child
+
+Environment (serve & healthcheck helpful vars):
+  CONFIG_PATH=/config/config.json      # default path to JSON config
+  CANDLES_COUNT=2500                   # default history depth for timeframe
+  HTTP_RETRIES=5                       # default http retries if not passed by CLI
+  HTTP_BACKOFF=0.6                     # default http backoff seconds if not passed by CLI
+  DEBUG=1                              # enable debug logging
+  SUMMARY_ALERT=1                      # add --summary-alert when running trade-live
+"""
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import logging
+import os
+import signal
 import sys
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple, List
+import subprocess
 
-# Настройки (ENV/.env/YAML) — безопасны, если файл отсутствует
-try:
-    from src.config.settings import load_settings
-except Exception:
-    def load_settings():
-        class _S:
-            exmo_api_key = None
-            exmo_api_secret = None
-            exmo_base_url = "https://api.exmo.com/v1.1"
-            exmo_timeout = 20
-            default_pair = None
-            max_notional_eur = 100.0
-            maker_by_default = True
-            data_dir = Path("data")
-            nonce_file = Path("data/.exmo_nonce")
-            log_level = "INFO"
-            mask_api_keys_in_logs = True
-            debug = False
-            @property
-            def log_level_int(self) -> int:
-                return logging.INFO
-        return _S()
+# ---- logging ----
 
-# Новая подкоманда live-trade (из нашего модуля)
-try:
-    from src.presentation.cli.trade_live_cmd import register_trade_live
-except Exception:
-    def register_trade_live(_):  # мягкий фолбэк
-        pass
+LOG = logging.getLogger("entry")
 
 
-# -----------------------------
-# Утилиты CLI/парсинга списков
-# -----------------------------
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in {"1", "true", "yes", "on"}
 
-def _normalize_resample(s: str) -> str:
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        return int(v) if v is not None else default
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        return float(v) if v is not None else default
+    except Exception:
+        return default
+
+
+def _configure_logging(debug_flag: bool) -> None:
+    level = logging.DEBUG if (debug_flag or _env_bool("DEBUG")) else logging.INFO
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    LOG.debug("Logging configured. Level=%s", logging.getLevelName(level))
+
+
+# ---- config model ----
+
+@dataclass
+class LiveConfig:
+    strategy: str
+    pair: str
+    timeframe: str  # e.g. "5m"
+    params: Dict[str, Any]
+    poll_sec: int = 10
+    heartbeat_sec: int = 60
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "LiveConfig":
+        required = ["strategy", "pair", "timeframe", "params"]
+        for k in required:
+            if k not in d:
+                raise ValueError(f"config missing key: {k}")
+        if not isinstance(d["params"], dict):
+            raise ValueError("config.params must be an object")
+        return LiveConfig(
+            strategy=str(d["strategy"]),
+            pair=str(d["pair"]),
+            timeframe=str(d["timeframe"]),
+            params=dict(d["params"]),
+            poll_sec=int(d.get("poll_sec", 10)),
+            heartbeat_sec=int(d.get("heartbeat_sec", 60)),
+        )
+
+
+def _timeframe_to_exmo_candles(tf: str, count: Optional[int]) -> str:
     """
-    В проекте встречались '5m' и '5T'. Оставим как есть — Pandas поймёт оба.
-    Чуть нормализуем пробелы/регистр.
+    '5m' -> '5m:COUNT', '1h' -> '60m:COUNT', '1d' -> '1440m:COUNT'
     """
-    return str(s or "").strip()
+    tf = str(tf).strip().lower()
+    if not tf:
+        raise ValueError("timeframe is empty")
+    num, unit = "", ""
+    for ch in tf:
+        if ch.isdigit():
+            num += ch
+        else:
+            unit += ch
+    if not num or unit not in {"m", "h", "d"}:
+        raise ValueError(f"bad timeframe: {tf!r}")
+    mult = {"m": 1, "h": 60, "d": 1440}[unit]
+    mins = int(num) * mult
+    cnt = int(count) if count is not None else _env_int("CANDLES_COUNT", 2500)
+    return f"{mins}m:{cnt}"
 
 
-def _parse_range_spec(spec: str) -> List[float]:
+def _read_config(path: str) -> LiveConfig:
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    return LiveConfig.from_dict(obj)
+
+
+def _effective_config(path: Optional[str], overrides: Dict[str, Any]) -> Tuple[str, LiveConfig]:
+    conf_path = path or os.getenv("CONFIG_PATH", "/config/config.json")
+    cfg = _read_config(conf_path)
+    # apply simple env/CLI overrides if provided (minimal set)
+    if "pair" in overrides and overrides["pair"]:
+        cfg.pair = overrides["pair"]
+    if "timeframe" in overrides and overrides["timeframe"]:
+        cfg.timeframe = overrides["timeframe"]
+    if "strategy" in overrides and overrides["strategy"]:
+        cfg.strategy = overrides["strategy"]
+    if "poll_sec" in overrides and overrides["poll_sec"] is not None:
+        cfg.poll_sec = int(overrides["poll_sec"])
+    if "heartbeat_sec" in overrides and overrides["heartbeat_sec"] is not None:
+        cfg.heartbeat_sec = int(overrides["heartbeat_sec"])
+    # params override (only keys present in overrides.params)
+    if "params" in overrides and isinstance(overrides["params"], dict):
+        for k, v in overrides["params"].items():
+            if v is not None:
+                cfg.params[k] = v
+    return conf_path, cfg
+
+
+# ---- exmo proxy ----
+
+def _run_exmo_passthrough(rest_argv: List[str]) -> int:
     """
-    Разбор формата "start:end:step" (включительно), поддерживает float.
-    Примеры:
-      "5:20:5" -> [5, 10, 15, 20]
-      "0.1:0.5:0.1" -> [0.1, 0.2, 0.3, 0.4, 0.5]
+    Proxy to src.presentation.cli.app main()
     """
-    parts = [p.strip() for p in str(spec).split(":")]
-    if len(parts) != 3:
-        raise ValueError(f"Bad range spec: {spec!r}. Expected 'start:end:step'.")
-    start, end, step = map(float, parts)
-    if step == 0:
-        raise ValueError("step must be non-zero")
-    out: List[float] = []
-    x = start
-    # учитываем направление шага
-    if step > 0:
-        while x <= end + 1e-12:
-            out.append(round(x, 12))
-            x += step
-    else:
-        while x >= end - 1e-12:
-            out.append(round(x, 12))
-            x += step
-    return out
+    try:
+        from src.presentation.cli import app as exmo_app
+    except Exception as e:
+        LOG.error("Failed to import src.presentation.cli.app: %s", e)
+        return 2
+    LOG.debug("exmo passthrough: %s", rest_argv)
+    rc = exmo_app.main(rest_argv)
+    return int(rc) if isinstance(rc, int) else 0
 
 
-def _parse_num_list(spec: Optional[str], as_int: bool = True) -> Optional[List[Union[int, float]]]:
-    """
-    Разбирает либо CSV ('1,2,3'), либо 'start:end:step'. Возвращает None, если spec пуст.
-    """
-    if not spec:
-        return None
-    s = str(spec).strip()
-    if ":" in s:
-        vals = _parse_range_spec(s)
-    else:
-        vals = [float(x.strip()) for x in s.split(",") if x.strip()]
+# ---- healthcheck ----
 
-    if as_int:
-        return [int(round(v)) for v in vals]
-    return vals
+def _healthcheck(pair: str, timeframe: str, count: Optional[int]) -> int:
+    try:
+        from src.infrastructure.exchange.exmo_api import build_exmo_from_settings
+    except Exception as e:
+        LOG.error("Import error: %s", e)
+        return 2
+
+    res = 1
+    try:
+        exmo = build_exmo_from_settings()
+        spec = _timeframe_to_exmo_candles(timeframe, count)
+        # parse like "5m:2500"
+        res_min = int(spec.split(":")[0][:-1])  # drop 'm'
+        now = int(time.time())
+        since = now - res_min * 60 * 10  # only 10 bars for health
+        data = exmo.candles_history(pair, res_min, since, now)
+        # basic validation
+        candles = data["candles"] if isinstance(data, dict) and "candles" in data else data
+        ok = isinstance(candles, list) and len(candles) > 0
+        if ok:
+            LOG.info("healthcheck ok: pair=%s tf=%s got=%d", pair, timeframe, len(candles))
+            res = 0
+        else:
+            LOG.error("healthcheck failed: empty candles")
+            res = 1
+    except Exception as e:
+        LOG.error("healthcheck exception: %s", e)
+        res = 1
+    return res
 
 
-def _span_string(pair_span: str) -> str:
-    """
-    Оставляем '1m:5000' как есть (функции проекта сами парсят span).
-    """
-    return str(pair_span).strip()
+# ---- serve supervisor ----
 
+class _Supervisor:
+    def __init__(self, config_path: Optional[str], http_retries: Optional[int], http_backoff: Optional[float],
+                 summary_alert: bool, debug: bool):
+        self.config_path = config_path
+        self.http_retries = http_retries
+        self.http_backoff = http_backoff
+        self.summary_alert = summary_alert
+        self.debug = debug
 
-def _json_dumps(obj: Any) -> str:
-    def _default(o: Any):
-        if isinstance(o, Path):
-            return str(o)
+        self._stop = False
+        self._need_reload = False
+        self._child: Optional[subprocess.Popen] = None
+
+    def _install_signals(self):
+        def _sigterm(_sig, _frm):
+            LOG.info("SIGTERM received, stopping...")
+            self._stop = True
+            self._terminate_child()
+
+        def _sighup(_sig, _frm):
+            LOG.info("SIGHUP received, will reload config")
+            self._need_reload = True
+            self._terminate_child()
+
+        signal.signal(signal.SIGTERM, _sigterm)
+        signal.signal(signal.SIGHUP, _sighup)
+        signal.signal(signalSIGINT := signal.SIGINT, _sigterm)  # treat Ctrl+C as SIGTERM
+
+    def _terminate_child(self):
+        p = self._child
+        if not p or p.poll() is not None:
+            return
         try:
-            import pandas as pd  # noqa
-            import numpy as np   # noqa
-            # лёгкая попытка конвертации популярных объектов
-            if hasattr(o, "to_dict"):
-                return o.to_dict()  # type: ignore
-        except Exception:
-            pass
-        return repr(o)
-    return json.dumps(obj, ensure_ascii=False, indent=2, default=_default)
+            LOG.info("sending SIGTERM to child pid=%s", p.pid)
+            p.terminate()
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                LOG.warning("child did not exit in 10s, killing...")
+                p.kill()
+        except Exception as e:
+            LOG.error("error terminating child: %s", e)
+
+    def _build_child_cmd(self, cfg: LiveConfig) -> List[str]:
+        exmo_candles = _timeframe_to_exmo_candles(cfg.timeframe, None)  # count from env
+        cmd = [
+            sys.executable, "-m", "src.presentation.cli.app", "trade-live",
+            "--mode", "observe",
+            "--strategy", cfg.strategy,
+            "--exmo-pair", cfg.pair,
+            "--exmo-candles", exmo_candles,
+            "--poll-sec", str(cfg.poll_sec),
+            "--heartbeat-sec", str(cfg.heartbeat_sec),
+        ]
+        # map params -> CLI
+        # supported keys in our app: fast/slow/adx_len/on/off/require_di/atr_len/atr_mult and others if present
+        mapping = {
+            "fast": "--ema-fast",
+            "slow": "--ema-slow",
+            "adx_len": "--adx-len",
+            "on": "--adx-on",
+            "off": "--adx-off",
+            "require_di": "--require-di",
+            "atr_len": "--atr-len",
+            "atr_mult": "--atr-mult",
+            "rsi_len": "--rsi-len",
+            "low": "--rsi-low",
+            "high": "--rsi-high",
+            "kc_len": "--kc-len",
+            "kc_mult": "--kc-mult",
+            "length": "--bb-len",  # for bbands/roc etc (best-effort)
+            "mult": "--bb-mult",
+        }
+        for k, v in cfg.params.items():
+            flag = mapping.get(k)
+            if not flag or v is None:
+                continue
+            if isinstance(v, bool):
+                if v:
+                    cmd.append(flag)
+            else:
+                cmd.extend([flag, str(v)])
+
+        # summary alert
+        if self.summary_alert or _env_bool("SUMMARY_ALERT"):
+            cmd.append("--summary-alert")
+
+        # retries/backoff
+        if self.http_retries is not None:
+            cmd.extend(["--http-retries", str(self.http_retries)])
+        if self.http_backoff is not None:
+            cmd.extend(["--http-backoff", str(self.http_backoff)])
+
+        if self.debug or _env_bool("DEBUG"):
+            cmd.append("--debug")
+
+        return cmd
+
+    def run(self, overrides: Dict[str, Any]) -> int:
+        self._install_signals()
+        backoff = 1.5
+        attempt = 0
+        while not self._stop:
+            try:
+                conf_path, cfg = _effective_config(self.config_path, overrides)
+            except Exception as e:
+                LOG.error("config load/validate failed: %s", e)
+                time.sleep(min(60, 2 + attempt * backoff))
+                attempt += 1
+                continue
+
+            cmd = self._build_child_cmd(cfg)
+            LOG.info("starting child: %s", " ".join(cmd))
+            env = os.environ.copy()
+            # ensure retries/backoff propagate even if not via CLI (our app also reads ENV)
+            if self.http_retries is not None:
+                env["HTTP_RETRIES"] = str(self.http_retries)
+            if self.http_backoff is not None:
+                env["HTTP_BACKOFF"] = str(self.http_backoff)
+
+            self._need_reload = False
+            self._child = subprocess.Popen(cmd, env=env)
+            rc = None
+            try:
+                rc = self._child.wait()
+            except Exception as e:
+                LOG.error("child wait error: %s", e)
+
+            if self._stop:
+                LOG.info("stopped. child rc=%s", rc)
+                return 0
+
+            if self._need_reload:
+                LOG.info("reloading config and restarting child...")
+                attempt = 0
+                continue
+
+            # unexpected exit — backoff and restart
+            LOG.warning("child exited with rc=%s; restarting...", rc)
+            sleep = min(60.0, 2.0 + attempt * backoff)
+            time.sleep(sleep)
+            attempt += 1
+        return 0
 
 
-def _call_with_filtered_kwargs(func, **kwargs):
-    sig = inspect.signature(func)
-    filt = {k: v for k, v in kwargs.items() if k in sig.parameters}
-    return func(**filt)
-
-
-# -----------------------------
-# Построение парсера
-# -----------------------------
+# ---- CLI ----
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="tradinng-bot",
-        description="Trading research & live-trade CLI",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    subparsers = parser.add_subparsers(dest="command")
+    p = argparse.ArgumentParser(prog="exmo-bot", description="Supervisor & UX entrypoint for EXMO bot")
+    sub = p.add_subparsers(dest="command", metavar="{serve,exmo,healthcheck,generate-config,print-config,version}")
 
-    # --- backtest (минимальный passthrough) ---
-    p_bt = subparsers.add_parser("backtest", help="Single run backtest")
-    p_bt.add_argument("--exmo-pair", required=True, type=str)
-    p_bt.add_argument("--exmo-candles", required=True, type=str, help="e.g. 1m:5000")
-    p_bt.add_argument("--resample", default="5m", type=str)
-    p_bt.add_argument("--fast", type=int, required=True)
-    p_bt.add_argument("--slow", type=int, required=True)
-    p_bt.add_argument("--hysteresis-bps", dest="hysteresis_bps", type=int, default=0)
-    p_bt.add_argument("--cooldown-bars", dest="cooldown_bars", type=int, default=0)
-    p_bt.add_argument("--fee-bps", dest="fee_bps", type=int, default=10)
-    p_bt.add_argument("--slip-bps", dest="slip_bps", type=int, default=2)
-    p_bt.add_argument("--qty-eur", dest="qty_eur", type=float, default=100.0)
-    p_bt.add_argument("--max-daily-loss-bps", dest="max_daily_loss_bps", type=int, default=0)
-    p_bt.add_argument("--json-metrics", dest="json_metrics", type=str, default=None)
-    p_bt.set_defaults(func=cmd_backtest)
+    # serve
+    ps = sub.add_parser("serve", help="Run supervised live observe from a config")
+    ps.add_argument("--config", type=str, default=None, help="Path to JSON config (default: $CONFIG_PATH or /config/config.json)")
+    ps.add_argument("--pair", type=str, default=None, help="Override pair from config")
+    ps.add_argument("--timeframe", type=str, default=None, help="Override timeframe (e.g. 5m)")
+    ps.add_argument("--poll-sec", type=int, default=None, help="Override poll interval")
+    ps.add_argument("--heartbeat-sec", type=int, default=None, help="Override heartbeat interval")
+    # small param overrides (optional)
+    ps.add_argument("--ema-fast", type=int, default=None)
+    ps.add_argument("--ema-slow", type=int, default=None)
+    ps.add_argument("--adx-len", type=int, default=None)
+    ps.add_argument("--adx-on", type=float, default=None)
+    ps.add_argument("--adx-off", type=float, default=None)
+    ps.add_argument("--require-di", action="store_true")
+    ps.add_argument("--no-require-di", action="store_true")
+    ps.add_argument("--atr-len", type=int, default=None)
+    ps.add_argument("--atr-mult", type=float, default=None)
+    # network hardening
+    ps.add_argument("--http-retries", type=int, default=None, help="Override HTTP_RETRIES")
+    ps.add_argument("--http-backoff", type=float, default=None, help="Override HTTP_BACKOFF (sec)")
+    ps.add_argument("--summary-alert", action="store_true", help="Force summary-alert on child")
+    ps.add_argument("--debug", action="store_true")
 
-    # --- sweep (grid) ---
-    p_sw = subparsers.add_parser("sweep", help="Parameter sweep")
-    p_sw.add_argument("--exmo-pair", required=True, type=str)
-    p_sw.add_argument("--exmo-candles", required=True, type=str)
-    p_sw.add_argument("--resample", default="5m", type=str)
-    p_sw.add_argument("--fast-list", type=str, required=True, help="CSV or start:end:step")
-    p_sw.add_argument("--slow-list", type=str, required=True, help="CSV or start:end:step")
-    p_sw.add_argument("--hyst-list", dest="hyst_list", type=str, default="0")
-    p_sw.add_argument("--cooldown-list", dest="cooldown_list", type=str, default="0")
-    p_sw.add_argument("--qty-list", dest="qty_list", type=str, default="100")
-    p_sw.add_argument("--fee-bps", dest="fee_bps", type=int, default=10)
-    p_sw.add_argument("--slip-bps", dest="slip_bps", type=int, default=2)
-    p_sw.add_argument("--max-daily-loss-bps", dest="max_daily_loss_bps", type=int, default=0)
-    p_sw.add_argument("--sort-by", type=str, default="calmar")
-    p_sw.add_argument("--top-n", type=int, default=20)
-    p_sw.add_argument("--verbose", action="store_true")
-    p_sw.add_argument("--out-dir", dest="out_dir", type=str, default="data/optimize")
-    p_sw.set_defaults(func=cmd_sweep)
+    # exmo passthrough
+    px = sub.add_parser("exmo", help="Proxy to src.presentation.cli.app")
+    px.add_argument("rest", nargs=argparse.REMAINDER, help="Arguments after '--' are passed to exmo CLI")
+    # usage: python main.py exmo -- backtest --strategy sma ...
 
-    # --- walk-forward ---
-    p_wf = subparsers.add_parser("walk-forward", help="Walk-forward validation")
-    p_wf.add_argument("--exmo-pair", required=True, type=str)
-    p_wf.add_argument("--exmo-candles", required=True, type=str)
-    p_wf.add_argument("--resample", default="5m", type=str)
-    p_wf.add_argument("--fast", type=int, required=True)
-    p_wf.add_argument("--slow", type=int, required=True)
-    p_wf.add_argument("--hysteresis-bps", dest="hysteresis_bps", type=int, default=0)
-    p_wf.add_argument("--cooldown-bars", dest="cooldown_bars", type=int, default=0)
-    p_wf.add_argument("--qty-eur", dest="qty_eur", type=float, default=100.0)
-    p_wf.add_argument("--fee-bps", dest="fee_bps", type=int, default=10)
-    p_wf.add_argument("--slip-bps", dest="slip_bps", type=int, default=2)
-    p_wf.add_argument("--max-daily-loss-bps", dest="max_daily_loss_bps", type=int, default=0)
-    p_wf.add_argument("--folds", type=int, default=4)
-    p_wf.add_argument("--min-train-bars", dest="min_train_bars", type=int, default=150)
-    p_wf.add_argument("--min-valid-bars", dest="min_valid_bars", type=int, default=100)
-    p_wf.add_argument("--out-dir", dest="out_dir", type=str, default="data/optimize")
-    p_wf.set_defaults(func=cmd_walkforward)
+    # healthcheck
+    ph = sub.add_parser("healthcheck", help="Basic EXMO connectivity check")
+    ph.add_argument("--pair", type=str, default=os.getenv("PAIR", "DOGE_EUR"))
+    ph.add_argument("--timeframe", type=str, default=os.getenv("TIMEFRAME", "5m"))
+    ph.add_argument("--count", type=int, default=_env_int("CANDLES_COUNT", 2500))
 
-    # --- robustness (rank stability) ---
-    p_rb = subparsers.add_parser("robustness", help="Compute stability ranking from sweep CSV")
-    p_rb.add_argument("--sweep-csv", required=True, type=str)
-    p_rb.add_argument("--min-trades", type=int, default=0)
-    p_rb.add_argument("--metric", type=str, default="calmar")
-    p_rb.add_argument("--d-fast", dest="d_fast", type=int, default=2)
-    p_rb.add_argument("--d-slow", dest="d_slow", type=int, default=5)
-    p_rb.add_argument("--d-hyst", dest="d_hyst", type=int, default=5)
-    p_rb.add_argument("--d-cd", dest="d_cd", type=int, default=2)
-    p_rb.add_argument("--ranked-csv", dest="ranked_csv", type=str, default=None)
-    p_rb.set_defaults(func=cmd_robustness)
+    # generate-config
+    pg = sub.add_parser("generate-config", help="Generate a config template")
+    pg.add_argument("--out", type=str, required=True)
 
-    # --- optimize (комбайн) ---
-    p_opt = subparsers.add_parser("optimize", help="Full pipeline: sweep -> rank -> WF -> (final backtest)")
-    p_opt.add_argument("--exmo-pair", required=True, type=str)
-    p_opt.add_argument("--exmo-candles", required=True, type=str, help="e.g. 1m:5000")
-    p_opt.add_argument("--resample", default="5m", type=str)
+    # print-config
+    pp = sub.add_parser("print-config", help="Load and print effective config")
+    pp.add_argument("--config", type=str, default=None)
 
-    p_opt.add_argument("--fast-list", type=str, required=True, help="CSV or start:end:step")
-    p_opt.add_argument("--slow-list", type=str, required=True, help="CSV or start:end:step")
-    p_opt.add_argument("--hyst-list", dest="hyst_list", type=str, default="0")
-    p_opt.add_argument("--cooldown-list", dest="cooldown_list", type=str, default="0")
-    p_opt.add_argument("--qty-list", dest="qty_list", type=str, default="100")
+    # version
+    sub.add_parser("version", help="Show versions")
 
-    p_opt.add_argument("--fee-bps", dest="fee_bps", type=int, default=10)
-    p_opt.add_argument("--slip-bps", dest="slip_bps", type=int, default=2)
-    p_opt.add_argument("--max-daily-loss-bps", dest="max_daily_loss_bps", type=int, default=0)
-
-    p_opt.add_argument("--metric", type=str, default="calmar")
-    p_opt.add_argument("--min-trades", dest="min_trades", type=int, default=0)
-    p_opt.add_argument("--d-fast", dest="d_fast", type=int, default=2)
-    p_opt.add_argument("--d-slow", dest="d_slow", type=int, default=5)
-    p_opt.add_argument("--d-hyst", dest="d_hyst", type=int, default=5)
-    p_opt.add_argument("--d-cd", dest="d_cd", type=int, default=2)
-
-    p_opt.add_argument("--wf-top-n", dest="wf_top_n", type=int, default=10)
-    p_opt.add_argument("--folds", type=int, default=4)
-    p_opt.add_argument("--min-train-bars", dest="min_train_bars", type=int, default=150)
-    p_opt.add_argument("--min-valid-bars", dest="min_valid_bars", type=int, default=100)
-
-    # WF фильтры (всё опционально — будем передавать только если функция их принимает)
-    p_opt.add_argument("--wf-min-pf", dest="wf_min_pf", type=float, default=None)
-    p_opt.add_argument("--wf-min-return", dest="wf_min_return", type=float, default=None)
-    p_opt.add_argument("--wf-max-dd", dest="wf_max_dd", type=float, default=None)
-    p_opt.add_argument("--wf-min-winrate", dest="wf_min_winrate", type=float, default=None)
-    p_opt.add_argument("--wf-min-sharpe", dest="wf_min_sharpe", type=float, default=None)
-    p_opt.add_argument("--wf-min-cagr", dest="wf_min_cagr", type=float, default=None)
-    p_opt.add_argument("--wf-min-calmar", dest="wf_min_calmar", type=float, default=None)
-    p_opt.add_argument("--wf-min-folds", dest="wf_min_folds", type=int, default=None)
-    p_opt.add_argument("--wf-min-trades", dest="wf_min_trades", type=int, default=None)
-    p_opt.add_argument("--wf-max-exposure", dest="wf_max_exposure", type=float, default=None)
-
-    p_opt.add_argument("--rank-by",
-                       choices=["oos_profit_factor_mean", "oos_total_return_pct_mean",
-                                "oos_calmar_mean", "oos_sharpe_mean", "oos_cagr_pct_mean"],
-                       default="oos_total_return_pct_mean")
-
-    p_opt.add_argument("--final-backtest", dest="final_backtest", action="store_true", default=False)
-    p_opt.add_argument("--report-html", dest="report_html", type=str, default=None)
-    p_opt.add_argument("--out-dir", dest="out_dir", type=str, default="data/optimize")
-    p_opt.set_defaults(func=cmd_optimize)
-
-    # --- подключаем новую подкоманду trade-live ---
-    register_trade_live(subparsers)
-
-    return parser
+    p.add_argument("--debug", action="store_true", help="Debug logs for this entrypoint")
+    return p
 
 
-# -----------------------------
-# Хэндлеры команд
-# -----------------------------
-
-def cmd_backtest(args: argparse.Namespace) -> None:
-    settings = load_settings()
-    _setup_logging(settings)
-
-    try:
-        # ленивый импорт, чтобы не падать если команда не используется
-        from src.backtest.vectorized_bt import BtConfig, run_backtest  # type: ignore
-    except Exception as e:
-        _fatal(f"Модуль backtest недоступен: {e}")
-
-    bt_kwargs = dict(
-        pair=str(args.exmo_pair),
-        span=_span_string(args.exmo_candles),
-        resample=_normalize_resample(args.resample),
-        fast=int(args.fast),
-        slow=int(args.slow),
-        hysteresis_bps=int(args.hysteresis_bps),
-        cooldown_bars=int(args.cooldown_bars),
-        fee_bps=int(args.fee_bps),
-        slip_bps=int(args.slip_bps),
-        qty_eur=float(args.qty_eur),
-        max_daily_loss_bps=int(args.max_daily_loss_bps),
-    )
-
-    # Создаём BtConfig только из тех полей, что он принимает
-    bt = _instantiate_filtered(BtConfig, **bt_kwargs)
-
-    # Запускаем бэктест
-    result = _call_with_filtered_kwargs(run_backtest, cfg=bt)
-
-    # Аккуратно печатаем JSON метрик
-    print(_json_dumps(result))
-
-    # при необходимости — сохранить json метрик
-    if getattr(args, "json_metrics", None):
-        p = Path(args.json_metrics)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(_json_dumps(result), encoding="utf-8")
+def _overrides_from_args(args: argparse.Namespace) -> Dict[str, Any]:
+    params = {
+        "fast": args.ema_fast,
+        "slow": args.ema_slow,
+        "adx_len": args.adx_len,
+        "on": args.adx_on,
+        "off": args.adx_off,
+        "require_di": (False if getattr(args, "no_require_di", False) else (True if getattr(args, "require_di", False) else None)),
+        "atr_len": args.atr_len,
+        "atr_mult": args.atr_mult,
+    }
+    # remove None
+    params = {k: v for k, v in params.items() if v is not None}
+    return {
+        "pair": getattr(args, "pair", None),
+        "timeframe": getattr(args, "timeframe", None),
+        "poll_sec": getattr(args, "poll_sec", None),
+        "heartbeat_sec": getattr(args, "heartbeat_sec", None),
+        "params": params,
+    }
 
 
-def cmd_sweep(args: argparse.Namespace) -> None:
-    settings = load_settings()
-    _setup_logging(settings)
-
-    try:
-        from src.backtest.sweep import run_sweep, SweepCfg  # type: ignore
-    except Exception as e:
-        _fatal(f"Модуль sweep недоступен: {e}")
-
-    cfg_kwargs = dict(
-        pair=str(args.exmo_pair),
-        span=_span_string(args.exmo_candles),
-        resample=_normalize_resample(args.resample),
-        fast_list=_parse_num_list(args.fast_list, as_int=True),
-        slow_list=_parse_num_list(args.slow_list, as_int=True),
-        hyst_list=_parse_num_list(args.hyst_list, as_int=True),
-        cooldown_list=_parse_num_list(args.cooldown_list, as_int=True),
-        qty_list=_parse_num_list(args.qty_list, as_int=False),
-        fee_bps=int(args.fee_bps),
-        slip_bps=int(args.slip_bps),
-        max_daily_loss_bps=int(args.max_daily_loss_bps),
-        sort_by=str(args.sort_by or "calmar"),
-        top_n=int(args.top_n or 20),
-        verbose=bool(args.verbose),
-        out_dir=Path(args.out_dir),
-    )
-
-    scfg = _instantiate_filtered(SweepCfg, **cfg_kwargs)
-    out_csv = _call_with_filtered_kwargs(run_sweep, cfg=scfg)
-    print(_json_dumps({"sweep_csv": str(out_csv)}))
-
-
-def cmd_walkforward(args: argparse.Namespace) -> None:
-    settings = load_settings()
-    _setup_logging(settings)
-
-    try:
-        from src.backtest.walkforward import WFConfig, run_walkforward  # type: ignore
-    except Exception as e:
-        _fatal(f"Модуль walk-forward недоступен: {e}")
-
-    cfg_kwargs = dict(
-        pair=str(args.exmo_pair),
-        span=_span_string(args.exmo_candles),
-        resample=_normalize_resample(args.resample),
-        fast=int(args.fast),
-        slow=int(args.slow),
-        hysteresis_bps=int(args.hysteresis_bps),
-        cooldown_bars=int(args.cooldown_bars),
-        qty_eur=float(args.qty_eur),
-        fee_bps=int(args.fee_bps),
-        slip_bps=int(args.slip_bps),
-        max_daily_loss_bps=int(args.max_daily_loss_bps),
-        folds=int(args.folds),
-        min_train_bars=int(args.min_train_bars),
-        min_valid_bars=int(args.min_valid_bars),
-        out_dir=Path(args.out_dir),
-    )
-
-    wfc = _instantiate_filtered(WFConfig, **cfg_kwargs)
-    out_csv = _call_with_filtered_kwargs(run_walkforward, cfg=wfc)
-    print(_json_dumps({"wf_csv": str(out_csv)}))
-
-
-def cmd_robustness(args: argparse.Namespace) -> None:
-    settings = load_settings()
-    _setup_logging(settings)
-
-    try:
-        from src.backtest.robustness import compute_stability  # type: ignore
-    except Exception as e:
-        _fatal(f"Модуль robustness недоступен: {e}")
-
-    ranked_csv = _call_with_filtered_kwargs(
-        compute_stability,
-        csv_path=Path(args.sweep_csv),
-        min_trades=int(args.min_trades),
-        metric=str(args.metric or "calmar"),
-        d_fast=int(args.d_fast),
-        d_slow=int(args.d_slow),
-        d_hyst=int(args.d_hyst),
-        d_cd=int(args.d_cd),
-        out_csv=(Path(args.ranked_csv) if args.ranked_csv else None),
-    )
-    print(_json_dumps({"ranked_csv": str(ranked_csv)}))
-
-
-def cmd_optimize(args: argparse.Namespace) -> None:
-    settings = load_settings()
-    _setup_logging(settings)
-
-    try:
-        from src.backtest.optimize import run_optimize  # type: ignore
-    except Exception as e:
-        _fatal(f"Модуль optimize недоступен: {e}")
-
-    inp_kwargs = dict(
-        pair=str(args.exmo_pair),
-        span=_span_string(args.exmo_candles),
-        resample=_normalize_resample(args.resample),
-
-        fast_list=_parse_num_list(args.fast_list, as_int=True),
-        slow_list=_parse_num_list(args.slow_list, as_int=True),
-        hyst_list=_parse_num_list(args.hyst_list, as_int=True),
-        cooldown_list=_parse_num_list(args.cooldown_list, as_int=True),
-        qty_list=_parse_num_list(args.qty_list, as_int=False),
-
-        fee_bps=int(args.fee_bps),
-        slip_bps=int(args.slip_bps),
-        max_daily_loss_bps=int(args.max_daily_loss_bps),
-
-        metric=str(args.metric or "calmar"),
-        min_trades=int(args.min_trades),
-        d_fast=int(args.d_fast),
-        d_slow=int(args.d_slow),
-        d_hyst=int(args.d_hyst),
-        d_cd=int(args.d_cd),
-
-        wf_top_n=int(args.wf_top_n),
-        folds=int(args.folds),
-        min_train_bars=int(args.min_train_bars),
-        min_valid_bars=int(args.min_valid_bars),
-
-        wf_min_pf=args.wf_min_pf,
-        wf_min_return=args.wf_min_return,
-        wf_max_dd=args.wf_max_dd,
-        wf_min_winrate=args.wf_min_winrate,
-        wf_min_sharpe=args.wf_min_sharpe,
-        wf_min_cagr=args.wf_min_cagr,
-        wf_min_calmar=args.wf_min_calmar,
-        wf_min_folds=args.wf_min_folds,
-        wf_min_trades=args.wf_min_trades,
-        wf_max_exposure=args.wf_max_exposure,
-
-        rank_by=str(args.rank_by),
-        final_backtest=bool(args.final_backtest),
-
-        out_dir=Path(args.out_dir),
-        report_html=(Path(args.report_html) if args.report_html else None),
-    )
-
-    # Фильтруем по сигнатуре run_optimize
-    result = _call_with_filtered_kwargs(run_optimize, **inp_kwargs)
-    print(_json_dumps(result))
-
-
-# -----------------------------
-# Вспомогательные штуки
-# -----------------------------
-
-def _instantiate_filtered(cls, **kwargs):
-    sig = inspect.signature(cls)
-    filt = {k: v for k, v in kwargs.items() if k in sig.parameters}
-    return cls(**filt)
-
-
-def _setup_logging(settings) -> None:
-    logging.basicConfig(
-        level=settings.log_level_int,
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    # Безопасность: не печатаем ключи
-    if settings.mask_api_keys_in_logs:
-        for k in ("EXMO_API_KEY", "EXMO_API_SECRET"):
-            if k in os.environ:
-                os.environ[k] = _mask(os.environ[k])
-
-
-def _mask(s: str, keep_last: int = 0) -> str:
-    s = str(s or "")
-    if not s:
-        return ""
-    if keep_last <= 0:
-        return "*" * min(6, len(s))
-    n = max(0, len(s) - keep_last)
-    return "*" * n + s[-keep_last:]
-
-
-def _fatal(msg: str) -> None:
-    print(_json_dumps({"error": msg}), file=sys.stderr)
-    sys.exit(2)
-
-
-# -----------------------------
-# Точка входа
-# -----------------------------
-
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    if len(sys.argv) == 1:
+    args = parser.parse_args(argv)
+    _configure_logging(args.debug)
+
+    cmd = args.command
+    if not cmd:
         parser.print_help()
-        sys.exit(0)
-    args = parser.parse_args()
-    if not hasattr(args, "func"):
-        parser.print_help()
-        sys.exit(1)
-    try:
-        args.func(args)
-    except SystemExit:
-        raise
-    except Exception as e:
-        _fatal(f"Unhandled error: {e}")
+        return 0
+
+    if cmd == "exmo":
+        # strip leading '--' if present
+        rest = args.rest
+        if rest and rest[0] == "--":
+            rest = rest[1:]
+        return _run_exmo_passthrough(rest)
+
+    if cmd == "healthcheck":
+        return _healthcheck(args.pair, args.timeframe, args.count)
+
+    if cmd == "generate-config":
+        template = {
+            "strategy": "ema_adx",
+            "pair": "DOGE_EUR",
+            "timeframe": "5m",
+            "params": { "fast": 12, "slow": 21, "adx_len": 14, "on": 25, "off": 16, "require_di": True },
+            "poll_sec": 10,
+            "heartbeat_sec": 60
+        }
+        out = args.out
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(template, f, ensure_ascii=False, indent=2)
+        LOG.info("config template written -> %s", out)
+        return 0
+
+    if cmd == "print-config":
+        path, cfg = _effective_config(args.config, {})
+        LOG.info("config path: %s", path)
+        print(json.dumps({
+            "strategy": cfg.strategy,
+            "pair": cfg.pair,
+            "timeframe": cfg.timeframe,
+            "params": cfg.params,
+            "poll_sec": cfg.poll_sec,
+            "heartbeat_sec": cfg.heartbeat_sec
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    if cmd == "version":
+        import platform
+        try:
+            import src  # type: ignore
+            pkg = getattr(src, "__version__", "unknown")
+        except Exception:
+            pkg = "unknown"
+        print(json.dumps({
+            "python": sys.version.split()[0],
+            "platform": platform.platform(),
+            "package_version": pkg
+        }, indent=2))
+        return 0
+
+    if cmd == "serve":
+        overrides = _overrides_from_args(args)
+        sup = _Supervisor(
+            config_path=args.config,
+            http_retries=args.http_retries if args.http_retries is not None else _env_int("HTTP_RETRIES", 5),
+            http_backoff=args.http_backoff if args.http_backoff is not None else _env_float("HTTP_BACKOFF", 0.6),
+            summary_alert=bool(args.summary_alert),
+            debug=bool(args.debug),
+        )
+        return sup.run(overrides)
+
+    parser.error(f"unknown command: {cmd}")
+    return 2
 
 
 if __name__ == "__main__":
-    import os
-    main()
+    sys.exit(main())

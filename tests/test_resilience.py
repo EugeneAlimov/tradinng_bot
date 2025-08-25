@@ -15,6 +15,7 @@ def test_circuit_breaker_basic():
 
     # function that fails twice, then succeeds
     calls = {"i": 0}
+
     def fn():
         calls["i"] += 1
         if calls["i"] <= 2:
@@ -44,11 +45,13 @@ def test_circuit_breaker_basic():
 def test_retry_with_backoff():
     r = RetryWithBackoff()
     cnt = {"i": 0}
+
     def fn():
         cnt["i"] += 1
         if cnt["i"] < 3:
             raise ValueError("nope")
         return "ok"
+
     assert r.execute(fn) == "ok"
 
 
@@ -68,4 +71,4 @@ def test_nonce_manager_concurrent(tmp_path):
 
     assert len(out) == 800
     assert len(out) == len(set(out))  # all unique
-    assert out == sorted(out)         # monotonic (not strictly necessary, but expected)
+    assert out == sorted(out)  # monotonic (not strictly necessary, but expected)

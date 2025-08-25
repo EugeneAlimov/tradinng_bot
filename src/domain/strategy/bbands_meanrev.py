@@ -16,7 +16,7 @@ def _rolling_mean_std(series: List[float], window: int) -> Tuple[List[Optional[f
     for i in range(len(series)):
         if i < n - 1:
             continue
-        win = series[i - n + 1 : i + 1]
+        win = series[i - n + 1: i + 1]
         mu = sum(win) / n
         var = sum((x - mu) ** 2 for x in win) / n
         means[i] = mu
@@ -25,10 +25,10 @@ def _rolling_mean_std(series: List[float], window: int) -> Tuple[List[Optional[f
 
 
 def generate_signals(
-    prices: List[float],
-    length: int = 20,
-    mult: float = 2.0,
-    exit_rule: str = "mid",  # 'mid' или 'upper'
+        prices: List[float],
+        length: int = 20,
+        mult: float = 2.0,
+        exit_rule: str = "mid",  # 'mid' или 'upper'
 ) -> List[int]:
     """
     Bollinger Bands mean-reversion (по Close):

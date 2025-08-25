@@ -62,12 +62,12 @@ class HealthCheck:
 
 class MonitoringSystem:
     def __init__(
-        self,
-        bot_name: str = "tradinng_bot",
-        alert_email: Optional[str] = None,
-        telegram_token: Optional[str] = None,
-        telegram_chat_id: Optional[str] = None,
-        metrics_http_bind: Optional[str] = None,  # "127.0.0.1:9103"
+            self,
+            bot_name: str = "tradinng_bot",
+            alert_email: Optional[str] = None,
+            telegram_token: Optional[str] = None,
+            telegram_chat_id: Optional[str] = None,
+            metrics_http_bind: Optional[str] = None,  # "127.0.0.1:9103"
     ):
         self.bot_name = bot_name
         self.alert_email = alert_email
@@ -188,6 +188,7 @@ class MonitoringSystem:
                 except Exception as e:
                     logger.error("monitor loop error: %s", e)
                     time.sleep(30)
+
         t = threading.Thread(target=loop, daemon=True)
         t.start()
 

@@ -42,6 +42,7 @@ try:
 except Exception as e:
     logger.warning("secure.credentials not available, will fallback to ENV: %s", e)
 
+
     def load_secure_credentials() -> tuple[str, str]:
         key = os.environ.get("EXMO_KEY") or os.environ.get("EXMO_API_KEY") or ""
         secret = os.environ.get("EXMO_SECRET") or os.environ.get("EXMO_API_SECRET") or ""
@@ -53,10 +54,12 @@ except Exception as e:
 _exmo_cls = None
 try:
     from src.integrations.exmo_private import ImprovedExmoPrivate as _ExmoClient
+
     _exmo_cls = _ExmoClient
 except Exception:
     try:
         from src.integrations.exmo_private import ExmoPrivate as _ExmoClient
+
         _exmo_cls = _ExmoClient
     except Exception as e:
         logger.error("Cannot import EXMO client class: %s", e)

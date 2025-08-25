@@ -61,13 +61,13 @@ def _atr(high: List[float], low: List[float], close: List[float], length: int) -
 
 
 def generate_signals(
-    close: List[float],
-    high: List[float],
-    low: List[float],
-    kc_len: int = 20,
-    kc_mult: float = 2.0,
-    mode: str = "breakout",    # 'breakout' | 'meanrev'
-    exit_rule: str = "mid",    # для meanrev: 'mid'|'upper'
+        close: List[float],
+        high: List[float],
+        low: List[float],
+        kc_len: int = 20,
+        kc_mult: float = 2.0,
+        mode: str = "breakout",  # 'breakout' | 'meanrev'
+        exit_rule: str = "mid",  # для meanrev: 'mid'|'upper'
 ) -> List[int]:
     """
     Keltner Channels:
@@ -113,13 +113,13 @@ def generate_signals(
 
 
 def status(
-    close: List[float],
-    high: List[float],
-    low: List[float],
-    kc_len: int = 20,
-    kc_mult: float = 2.0,
-    mode: str = "breakout",
-    exit_rule: str = "mid",
+        close: List[float],
+        high: List[float],
+        low: List[float],
+        kc_len: int = 20,
+        kc_mult: float = 2.0,
+        mode: str = "breakout",
+        exit_rule: str = "mid",
 ) -> Tuple[str, int]:
     m = _ema(close, kc_len)
     a = _atr(high, low, close, kc_len)

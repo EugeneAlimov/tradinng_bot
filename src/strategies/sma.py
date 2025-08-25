@@ -22,6 +22,7 @@ class SMACrossStrategy(Strategy):
     - позиция 0, если (fast - slow)/slow < -hysteresis_bps
     - иначе удерживаем предыдущее состояние
     """
+
     def __init__(self, params: SMACrossParams):
         self.p = params
 

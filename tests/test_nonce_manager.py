@@ -2,6 +2,7 @@
 import concurrent.futures
 from src.infrastructure.exchange.nonce_manager import ThreadSafeNonceManager
 
+
 def test_nonce_monotonic_and_unique(tmp_path):
     f = tmp_path / ".nonce"
     nm = ThreadSafeNonceManager(str(f))

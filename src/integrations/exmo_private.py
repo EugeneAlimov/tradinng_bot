@@ -26,6 +26,7 @@ class ExmoPrivate:
       - безопасной генерацией client_id (через OrderIDGenerator)
     Совместим по интерфейсу с существующим кодом.
     """
+
     def __init__(self,
                  api_key: Optional[str] = None,
                  api_secret: Optional[str] = None,
@@ -92,7 +93,8 @@ class ExmoPrivate:
         return {}
 
     # ---------- Trading ----------
-    def order_create(self, pair: str, quantity: str, price: str, side: str, client_id: Optional[object] = None) -> Dict[str, Any]:
+    def order_create(self, pair: str, quantity: str, price: str, side: str, client_id: Optional[object] = None) -> Dict[
+        str, Any]:
         """
         EXMO docs: client_id должен быть уникальным (int). Мы гарантируем уникальность.
         """

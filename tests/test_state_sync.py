@@ -15,6 +15,7 @@ class _FakeExchange:
     Минимальный фейк EXMO API для теста синхронизации состояний.
     Возвращает user_info() и user_open_orders() в формате, совместимом с нашим валидатором/синхронизатором.
     """
+
     def __init__(self, base="DOGE", quote="EUR", base_free="123.456789", quote_free="987.65"):
         self._base = base
         self._quote = quote
@@ -43,7 +44,7 @@ class TestStateSync(unittest.TestCase):
 
             # Начальное локальное состояние "рассинхронено"
             st = {
-                "pos_qty": "0",        # локально пусто
+                "pos_qty": "0",  # локально пусто
                 "cash_eur": "0",
                 "avg_price": "0",
                 "pnl_sum_pos": "0",

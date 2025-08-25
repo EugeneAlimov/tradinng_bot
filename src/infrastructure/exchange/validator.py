@@ -168,6 +168,7 @@ class SafeExmoWrapper:
     Обёртка над EXMO API с валидацией данных. Методы возвращают уже проверенные
     структуры либо пустые/None при ошибке (с логированием).
     """
+
     def __init__(self, exmo_api):
         self.api = exmo_api
         self.v = ExchangeDataValidator
