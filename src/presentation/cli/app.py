@@ -22,7 +22,6 @@ from src.domain.strategy import registry as strat_registry
 from src.application.research import selector as sel
 from src.application.live.paper import PaperEngine, PaperConfig
 
-
 LOG = logging.getLogger("cli")
 
 
@@ -971,6 +970,7 @@ def _run_live_observe(args: argparse.Namespace, s, notifier: TelegramNotifier, i
     return _observe_inline(args, args.strategy, _strategy_params_from_args(args.strategy, args), s, notifier,
                            integration)
 
+
 def _run_live_paper(args: argparse.Namespace, s, notifier: TelegramNotifier, integration: EngineIntegration) -> int:
     pair: str = args.exmo_pair
     res_min, count = _parse_exmo_candles(args.exmo_candles)
@@ -989,8 +989,10 @@ def _run_live_paper(args: argparse.Namespace, s, notifier: TelegramNotifier, int
         initial_balance=float(getattr(args, "initial_balance", 1000.0)),
         fee_bps=int(getattr(args, "fee_bps", 10)),
         slip_bps=int(getattr(args, "slip_bps", 2)),
-        max_position_pct=float(getattr(args, "max_position_pct", 0.25)) if getattr(args, "max_position_pct", None) is not None else 0.25,
-        stop_loss_bps=int(getattr(args, "stop_loss_bps", 300)) if getattr(args, "stop_loss_bps", None) is not None else 300,
+        max_position_pct=float(getattr(args, "max_position_pct", 0.25)) if getattr(args, "max_position_pct",
+                                                                                   None) is not None else 0.25,
+        stop_loss_bps=int(getattr(args, "stop_loss_bps", 300)) if getattr(args, "stop_loss_bps",
+                                                                          None) is not None else 300,
         max_daily_loss_bps=int(getattr(args, "max_daily_loss_bps", 0)) or None,
     )
     engine = PaperEngine(cfg, integration.risk)
