@@ -13,11 +13,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # ---- Strategies registry ----
-# основной путь
 try:
     from src.domain.strategy import registry as strat_registry  # type: ignore
 except Exception:
-    # совместимость со старым путём (если жив)
     try:
         from src.application.research.strategies import strat_registry  # type: ignore
     except Exception as e:
@@ -29,7 +27,7 @@ except Exception:
 try:
     from src.application.research import selector as sel  # type: ignore
 except Exception:
-    sel = None  # команды research дадут понятную ошибку
+    sel = None
 
 
 # ---- Safe converters ----
@@ -83,7 +81,7 @@ def _setup_logging(debug: bool) -> None:
     LOG.debug("Logging configured. Level=%s", "DEBUG" if debug else "INFO")
 
 
-# ---- EXMO client (urllib3 + Retry) ----
+# ---- EXMO HTTP ----
 import urllib3
 from urllib3.util.retry import Retry
 
@@ -121,7 +119,7 @@ def _build_http(retries: Optional[int], backoff: Optional[float]) -> urllib3.Poo
         backoff_factor=back,
         status_forcelist=(429, 500, 502, 503, 504),
         raise_on_status=False,
-        allowed_methods=False,  # ретраи и на GET
+        allowed_methods=False,
     )
     return urllib3.PoolManager(retries=retry, timeout=urllib3.Timeout(connect=5.0, read=15.0))
 
@@ -177,7 +175,7 @@ def _get_candles_arrays(
     return ts, o, h, l, c
 
 
-# ---- Simple stats ----
+# ---- Stats ----
 def _sharpe_by_trades(trade_pnls: List[float]) -> float:
     if not trade_pnls:
         return 0.0
@@ -204,13 +202,13 @@ def _max_drawdown(equity: List[float]) -> float:
 class Trade:
     entry_ts: int
     entry_px: float
-    side: int  # +1 long, -1 short
+    side: int
     exit_ts: int
     exit_px: float
     pnl: float
 
 
-# ---- Strategy params from CLI ----
+# ---- Params from CLI ----
 def _build_params_from_args(strategy: str, args: argparse.Namespace) -> Dict[str, Any]:
     p: Dict[str, Any] = {}
     if getattr(args, "fast", None) is not None:
@@ -290,8 +288,6 @@ def _run_backtest_signals(
 
     if pos != 0:
         exit_trade(len(close) - 1)
-        if eq:
-            eq[-1] = eq[-1]
     return trades, eq
 
 
@@ -326,26 +322,36 @@ def _save_equity_csv(path: str, timestamps: List[int], equity: List[float]) -> N
 # ---- Common CLI args ----
 def _add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--strategy", default="sma")
+    # EMA aliases + base
     p.add_argument("--fast", type=int)
     p.add_argument("--slow", type=int)
+    p.add_argument("--ema-fast", dest="fast", type=int)  # alias for compatibility
+    p.add_argument("--ema-slow", dest="slow", type=int)  # alias for compatibility
+
+    # ADX & filters
     p.add_argument("--adx-len", dest="adx_len", type=int)
     p.add_argument("--adx-on", dest="on", type=float)
     p.add_argument("--adx-off", dest="off", type=float)
     p.add_argument("--require-di", action="store_true")
+
+    # ATR / SuperTrend
     p.add_argument("--atr-len", dest="atr_len", type=int)
     p.add_argument("--atr-mult", dest="atr_mult", type=float)
     p.add_argument("--st-len", type=int)
     p.add_argument("--st-mult", type=float)
 
+    # EXMO data
     p.add_argument("--exmo-pair", dest="pair", default="DOGE_EUR")
     p.add_argument("--exmo-candles", dest="candles", default="1m:500")
 
+    # costs
     p.add_argument("--fee-bps", type=int, default=0)
     p.add_argument("--slip-bps", type=int, default=0)
 
+    # infra
     p.add_argument("--http-retries", type=int)
     p.add_argument("--http-backoff", type=float)
-
+    p.add_argument("--summary-alert", action="store_true")  # accepted & ignored for now
     p.add_argument("--debug", action="store_true")
 
 
@@ -395,6 +401,8 @@ def _run_live_observe(args: argparse.Namespace) -> int:
     params = _build_params_from_args(args.strategy, args)
     LOG.info("[live] observe %s %s strategy=%s params=%s poll=%ss",
              args.pair, args.candles, args.strategy, params, args.poll_sec)
+    if getattr(args, "summary_alert", False):
+        LOG.debug("[live] summary-alert flag accepted (no-op notifier).")
     last_seen_ts = 0
     try:
         while True:
@@ -443,6 +451,8 @@ def _run_live_paper(args: argparse.Namespace) -> int:
     params = _build_params_from_args(args.strategy, args)
     LOG.info("[live:paper] %s %s strategy=%s params=%s poll=%ss",
              args.pair, args.candles, args.strategy, params, args.poll_sec)
+    if getattr(args, "summary_alert", False):
+        LOG.debug("[live:paper] summary-alert flag accepted (no-op notifier).")
 
     initial_balance = as_float_or_none(getattr(args, "initial_balance", None)) or 1000.0
     fee_bps = args.fee_bps or 0
@@ -450,7 +460,7 @@ def _run_live_paper(args: argparse.Namespace) -> int:
     max_pos_pct = pct01_or_none(getattr(args, "max_position_pct", None)) or 1.0
     stop_loss_bps = bps_or_none(getattr(args, "stop_loss_bps", None))
     max_daily_loss_bps = bps_or_none(getattr(args, "max_daily_loss_bps", None))
-    _ = max_daily_loss_bps  # (зарезервировано под дневной стоп)
+    _ = max_daily_loss_bps  # reserved
 
     state = _load_state(getattr(args, "state_file", None), initial_balance)
     last_seen_ts = 0
