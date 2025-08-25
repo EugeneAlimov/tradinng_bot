@@ -29,7 +29,6 @@ try:
 except Exception:
     sel = None
 
-
 # ---- Safe converters ----
 def as_int_or_none(value: Any) -> Optional[int]:
     if value is None:
@@ -43,7 +42,6 @@ def as_int_or_none(value: Any) -> Optional[int]:
     s = str(value).strip()
     return int(s) if s else None
 
-
 def as_float_or_none(value: Any) -> Optional[float]:
     if value is None:
         return None
@@ -56,20 +54,16 @@ def as_float_or_none(value: Any) -> Optional[float]:
     s = str(value).strip()
     return float(s) if s else None
 
-
 def bps_or_none(value: Any) -> Optional[int]:
     i = as_int_or_none(value)
     return i if (i is not None and i >= 0) else None
-
 
 def pct01_or_none(value: Any) -> Optional[float]:
     f = as_float_or_none(value)
     return f if (f is not None and f >= 0.0) else None
 
-
 # ---- Logging ----
 LOG = logging.getLogger("cli")
-
 
 def _setup_logging(debug: bool) -> None:
     level = logging.DEBUG if debug else logging.INFO
@@ -80,14 +74,12 @@ def _setup_logging(debug: bool) -> None:
     )
     LOG.debug("Logging configured. Level=%s", "DEBUG" if debug else "INFO")
 
-
 # ---- EXMO HTTP ----
 import urllib3
 from urllib3.util.retry import Retry
 
 EXMO_HOST = "https://api.exmo.com"
 EXMO_CANDLES_V = "/v1.1/candles_history"
-
 
 def _resolution_minutes(tf: str) -> int:
     tf = tf.strip().lower()
@@ -99,15 +91,12 @@ def _resolution_minutes(tf: str) -> int:
         return int(tf[:-1]) * 60 * 24
     raise ValueError(f"Unsupported timeframe: {tf}")
 
-
 def _parse_pair(pair: str) -> str:
     return pair.strip().upper()
-
 
 def _parse_candles_spec(spec: str) -> Tuple[str, int]:
     tf, cnt = spec.split(":")
     return tf.strip(), int(cnt)
-
 
 def _build_http(retries: Optional[int], backoff: Optional[float]) -> urllib3.PoolManager:
     total = retries if retries is not None else as_int_or_none(os.getenv("HTTP_RETRIES"))
@@ -123,13 +112,12 @@ def _build_http(retries: Optional[int], backoff: Optional[float]) -> urllib3.Poo
     )
     return urllib3.PoolManager(retries=retry, timeout=urllib3.Timeout(connect=5.0, read=15.0))
 
-
 def _exmo_candles_history(
-        http: urllib3.PoolManager,
-        pair: str,
-        resolution_min: int,
-        epoch_from: int,
-        epoch_to: int,
+    http: urllib3.PoolManager,
+    pair: str,
+    resolution_min: int,
+    epoch_from: int,
+    epoch_to: int,
 ) -> List[Dict[str, Any]]:
     params = {
         "symbol": pair,
@@ -145,12 +133,23 @@ def _exmo_candles_history(
     data = json.loads(r.data.decode("utf-8"))
     return data.get("candles") or []
 
+def _ts_to_seconds(x: Any) -> int:
+    """
+    EXMO candles 't' может быть в секундах или миллисекундах.
+    Приводим к секундам.
+    """
+    try:
+        t = int(float(x))
+    except Exception:
+        t = 0
+    # всё, что выглядит как миллисекунды, режем до секунд
+    return t // 1000 if t > 10**12 else t
 
 def _get_candles_arrays(
-        pair: str,
-        spec: str,
-        retries: Optional[int],
-        backoff: Optional[float],
+    pair: str,
+    spec: str,
+    retries: Optional[int],
+    backoff: Optional[float],
 ) -> Tuple[List[int], List[float], List[float], List[float], List[float]]:
     tf, count = _parse_candles_spec(spec)
     res_min = _resolution_minutes(tf)
@@ -158,20 +157,30 @@ def _get_candles_arrays(
     span = res_min * 60 * count
     frm = now - span
     to = now
+
     http = _build_http(retries, backoff)
     raw = _exmo_candles_history(http, _parse_pair(pair), res_min, frm, to)
-    raw.sort(key=lambda x: x.get("t", 0))
-    ts: List[int] = []
-    o: List[float] = []
-    h: List[float] = []
-    l: List[float] = []
-    c: List[float] = []
-    for k in raw:
-        ts.append(int(k["t"]))
-        o.append(float(k["o"]))
-        h.append(float(k["h"]))
-        l.append(float(k["l"]))
-        c.append(float(k["c"]))
+
+    # Нормализуем и сортируем
+    norm = []
+    for k in raw or []:
+        t = _ts_to_seconds(k.get("t"))
+        try:
+            o = float(k.get("o"))
+            h = float(k.get("h"))
+            l = float(k.get("l"))
+            c = float(k.get("c"))
+        except Exception:
+            # пропустим кривую свечу
+            continue
+        norm.append({"t": t, "o": o, "h": h, "l": l, "c": c})
+    norm.sort(key=lambda x: x["t"])
+
+    ts: List[int] = [r["t"] for r in norm]
+    o: List[float] = [r["o"] for r in norm]
+    h: List[float] = [r["h"] for r in norm]
+    l: List[float] = [r["l"] for r in norm]
+    c: List[float] = [r["c"] for r in norm]
     return ts, o, h, l, c
 
 
@@ -185,7 +194,6 @@ def _sharpe_by_trades(trade_pnls: List[float]) -> float:
     sd = math.sqrt(var) if var > 0 else 0.0
     return (m / sd) if sd > 0 else 0.0
 
-
 def _max_drawdown(equity: List[float]) -> float:
     peak = float("-inf")
     mdd = 0.0
@@ -197,7 +205,6 @@ def _max_drawdown(equity: List[float]) -> float:
             mdd = dd
     return mdd
 
-
 @dataclass
 class Trade:
     entry_ts: int
@@ -206,7 +213,6 @@ class Trade:
     exit_ts: int
     exit_px: float
     pnl: float
-
 
 # ---- Params from CLI ----
 def _build_params_from_args(strategy: str, args: argparse.Namespace) -> Dict[str, Any]:
@@ -233,18 +239,17 @@ def _build_params_from_args(strategy: str, args: argparse.Namespace) -> Dict[str
         p["mult"] = float(args.st_mult)
     return p
 
-
 # ---- Backtest engine ----
 def _run_backtest_signals(
-        timestamps: List[int],
-        open_: List[float],
-        high: List[float],
-        low: List[float],
-        close: List[float],
-        signals: List[int],
-        fee_bps: int = 0,
-        slip_bps: int = 0,
-        stop_loss_bps: Optional[int] = None,
+    timestamps: List[int],
+    open_: List[float],
+    high: List[float],
+    low: List[float],
+    close: List[float],
+    signals: List[int],
+    fee_bps: int = 0,
+    slip_bps: int = 0,
+    stop_loss_bps: Optional[int] = None,
 ) -> Tuple[List[Trade], List[float]]:
     trades: List[Trade] = []
     eq: List[float] = []
@@ -290,7 +295,6 @@ def _run_backtest_signals(
         exit_trade(len(close) - 1)
     return trades, eq
 
-
 # ---- CSV helpers ----
 def _save_trades_csv(path: str, trades: List[Trade]) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -309,7 +313,6 @@ def _save_trades_csv(path: str, trades: List[Trade]) -> None:
                 f"{t.pnl:.6f}",
             ])
 
-
 def _save_equity_csv(path: str, timestamps: List[int], equity: List[float]) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -317,7 +320,6 @@ def _save_equity_csv(path: str, timestamps: List[int], equity: List[float]) -> N
         w.writerow(["ts", "iso", "equity"])
         for ts, eq in zip(timestamps, equity):
             w.writerow([ts, datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(), f"{eq:.6f}"])
-
 
 # ---- Common CLI args ----
 def _add_common_args(p: argparse.ArgumentParser) -> None:
@@ -354,12 +356,10 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--summary-alert", action="store_true")  # accepted & ignored for now
     p.add_argument("--debug", action="store_true")
 
-
 def _add_risk_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--max-position-pct", type=float)
     p.add_argument("--stop-loss-bps", type=int)
     p.add_argument("--max-daily-loss-bps", type=int)
-
 
 # ---- Commands ----
 def _run_backtest(args: argparse.Namespace) -> int:
@@ -367,7 +367,8 @@ def _run_backtest(args: argparse.Namespace) -> int:
     ts, o, h, l, c = _get_candles_arrays(args.pair, args.candles, args.http_retries, args.http_backoff)
     defn = strat_registry.get(args.strategy)
     params = _build_params_from_args(args.strategy, args)
-    signals = defn.generate_signals(close=c, open=o, high=h, low=l, **params)  # type: ignore
+    # НЕ передаём open=
+    signals = defn.generate_signals(close=c, high=h, low=l, **params)  # type: ignore
 
     trades, equity = _run_backtest_signals(
         timestamps=ts, open_=o, high=h, low=l, close=c, signals=signals,
@@ -395,7 +396,6 @@ def _run_backtest(args: argparse.Namespace) -> int:
         LOG.info("Saved equity CSV -> %s", args.csv_equity)
     return 0
 
-
 def _run_live_observe(args: argparse.Namespace) -> int:
     LOG.info("Command: trade-live")
     params = _build_params_from_args(args.strategy, args)
@@ -410,7 +410,8 @@ def _run_live_observe(args: argparse.Namespace) -> int:
             if ts and ts[-1] != last_seen_ts:
                 last_seen_ts = ts[-1]
                 defn = strat_registry.get(args.strategy)
-                status_text, state = defn.status(close=c, open=o, high=h, low=l, **params)  # type: ignore
+                # НЕ передаём open=
+                status_text, state = defn.status(close=c, high=h, low=l, **params)  # type: ignore
                 t_iso = datetime.fromtimestamp(ts[-1], tz=timezone.utc).isoformat()
                 LOG.info("[live] %s %s", t_iso, status_text)
             time.sleep(max(1, int(args.poll_sec)))
@@ -418,14 +419,12 @@ def _run_live_observe(args: argparse.Namespace) -> int:
         LOG.info("[live] stop by user")
     return 0
 
-
 @dataclass
 class PaperState:
     balance: float
     position: int
     pos_px: float
     last_day: str
-
 
 def _load_state(path: Optional[str], initial_balance: float) -> PaperState:
     if not path or not os.path.exists(path):
@@ -437,14 +436,12 @@ def _load_state(path: Optional[str], initial_balance: float) -> PaperState:
     except Exception:
         return PaperState(balance=initial_balance, position=0, pos_px=0.0, last_day="")
 
-
 def _save_state(path: Optional[str], state: PaperState) -> None:
     if not path:
         return
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(asdict(state), f, ensure_ascii=False, indent=2)
-
 
 def _run_live_paper(args: argparse.Namespace) -> int:
     LOG.info("Command: trade-live")
@@ -477,7 +474,8 @@ def _run_live_paper(args: argparse.Namespace) -> int:
             last_seen_ts = ts[-1]
 
             defn = strat_registry.get(args.strategy)
-            status_text, state_info = defn.status(close=c, open=o, high=h, low=l, **params)  # type: ignore
+            # НЕ передаём open=
+            status_text, state_info = defn.status(close=c, high=h, low=l, **params)  # type: ignore
             sig = int(state_info.get("signal", 0)) if isinstance(state_info, dict) else 0
 
             px = c[-1]
@@ -485,11 +483,9 @@ def _run_live_paper(args: argparse.Namespace) -> int:
             bps_cost = (fee_bps + slip_bps) * 1e-4
 
             if state.position != 0 and stop_loss_bps:
-                adverse = (state.pos_px - l[-1]) / state.pos_px if state.position > 0 else (h[
-                                                                                                -1] - state.pos_px) / state.pos_px
+                adverse = (state.pos_px - l[-1]) / state.pos_px if state.position > 0 else (h[-1] - state.pos_px) / state.pos_px
                 if adverse > stop_loss_bps * 1e-4:
-                    raw_ret = (px - state.pos_px) / state.pos_px if state.position > 0 else (
-                                                                                                        state.pos_px - px) / state.pos_px
+                    raw_ret = (px - state.pos_px) / state.pos_px if state.position > 0 else (state.pos_px - px) / state.pos_px
                     pnl = raw_ret - 2 * bps_cost
                     state.balance *= (1.0 + pnl * max_pos_pct)
                     trades_out.append(Trade(entry_ts=tstamp, entry_px=state.pos_px, side=state.position,
@@ -499,8 +495,7 @@ def _run_live_paper(args: argparse.Namespace) -> int:
 
             if sig != state.position:
                 if state.position != 0:
-                    raw_ret = (px - state.pos_px) / state.pos_px if state.position > 0 else (
-                                                                                                        state.pos_px - px) / state.pos_px
+                    raw_ret = (px - state.pos_px) / state.pos_px if state.position > 0 else (state.pos_px - px) / state.pos_px
                     pnl = raw_ret - 2 * bps_cost
                     state.balance *= (1.0 + pnl * max_pos_pct)
                     trades_out.append(Trade(entry_ts=tstamp, entry_px=state.pos_px, side=state.position,
@@ -532,12 +527,10 @@ def _run_live_paper(args: argparse.Namespace) -> int:
             LOG.info("Saved equity CSV -> %s", args.csv_equity)
     return 0
 
-
 # ---- Research commands ----
 def _require_sel() -> None:
     if sel is None:
         raise RuntimeError("Research selector module not available (src/application/research/selector.py).")
-
 
 def _resolve_strategies(spec: str) -> List[str]:
     spec = (spec or "").strip()
@@ -547,7 +540,6 @@ def _resolve_strategies(spec: str) -> List[str]:
     if "," in spec:
         return [x.strip() for x in spec.split(",") if x.strip()]
     return [spec] if spec else []
-
 
 def _run_sweep(args: argparse.Namespace) -> int:
     _require_sel()
@@ -572,7 +564,6 @@ def _run_sweep(args: argparse.Namespace) -> int:
         LOG.info("Saved sweep CSV -> %s", args.csv_results)
     return 0
 
-
 def _run_optimize(args: argparse.Namespace) -> int:
     _require_sel()
     LOG.info("Command: optimize")
@@ -595,7 +586,6 @@ def _run_optimize(args: argparse.Namespace) -> int:
         LOG.info("Saved optimize CSV -> %s", args.csv_results)
     return 0
 
-
 def _run_robustness(args: argparse.Namespace) -> int:
     _require_sel()
     LOG.info("Command: robustness")
@@ -615,7 +605,6 @@ def _run_robustness(args: argparse.Namespace) -> int:
             csv.writer(f).writerows(results)
         LOG.info("Saved robustness CSV -> %s", args.csv_results)
     return 0
-
 
 def _run_walk_forward(args: argparse.Namespace) -> int:
     _require_sel()
@@ -639,7 +628,6 @@ def _run_walk_forward(args: argparse.Namespace) -> int:
             csv.writer(f).writerows(results)
         LOG.info("Saved walk-forward CSV -> %s", args.csv_results)
     return 0
-
 
 # ---- Parser/Dispatcher ----
 def _build_parser() -> argparse.ArgumentParser:
@@ -704,13 +692,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     return ap
 
-
 def _dispatch_command(args: argparse.Namespace) -> int:
     handler = getattr(args, "_handler", None)
     if handler is None:
         raise SystemExit("No handler bound to command.")
     return handler(args)
-
 
 def _run_cli(argv: Sequence[str]) -> int:
     debug = any(a in ("--debug",) for a in argv)
@@ -718,7 +704,6 @@ def _run_cli(argv: Sequence[str]) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv))
     return _dispatch_command(args)
-
 
 if __name__ == "__main__":
     sys.exit(_run_cli(sys.argv[1:]))
