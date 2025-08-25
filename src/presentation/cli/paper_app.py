@@ -1,29 +1,62 @@
 # src/presentation/cli/paper_app.py
+"""
+Обёртка для paper-режима.
+- Импортирует основное CLI: src.presentation.cli.app
+- Принудительно добавляет команду: trade-live --mode paper
+- Сохраняет все остальные флаги пользователя как есть
+- Имеет main(), который возвращает вызываемый объект (для твоего теста assert callable(main()))
+"""
+
 from __future__ import annotations
 
 import sys
-from typing import Optional, Sequence
+from typing import List
 
-try:
-    from src.presentation.cli.app import _run_cli  # type: ignore[attr-defined]
-except Exception as e:
-    def _run_cli(_argv: Sequence[str]) -> int:  # noqa: N802
-        print(f"[FATAL] CLI entry not found: {e}", file=sys.stderr)
-        return 2
+from src.presentation.cli import app as app_cli  # используем наше ядро
 
 
-def main(argv: Optional[Sequence[str]] = None):
+def _strip_mode(argv: List[str]) -> List[str]:
+    """Удаляем любые пользовательские --mode XYZ, чтобы не конфликтовало с paper."""
+    out: List[str] = []
+    skip_next = False
+    for i, a in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if a == "--mode":
+            # пропустить сам флаг и его значение
+            skip_next = True
+            continue
+        if a.startswith("--mode="):
+            # пропустить целиком
+            continue
+        # не позволяем пользователю самому подставить подкоманду
+        if a == "trade-live":
+            # пропускаем, мы сами добавим правильную подкоманду
+            continue
+        out.append(a)
+    return out
+
+
+def run(argv: List[str] | None = None) -> int:
     """
-    Совместимо с тестом: `from ... import main; assert callable(main())`
-    - Если argv is None → возвращаем callable (ничего не запускаем).
-    - Если argv передан → форвардим в единый CLI как:
-        trade-live --mode paper <argv...>
+    Реальный раннер. Пример:
+      python -m src.presentation.cli.paper_app --strategy ema_adx ... (любые флаги)
     """
-    if argv is None:
-        return lambda: 0  # просто «что-то вызываемое» для assert callable(...)
-    forwarded = ["trade-live", "--mode", "paper", *list(argv)]
-    return _run_cli(forwarded)
+    user_argv = list(sys.argv[1:] if argv is None else argv)
+    forwarded = ["trade-live", "--mode", "paper"] + _strip_mode(user_argv)
+    # Передаём в общее ядро CLI
+    return app_cli._run_cli(forwarded)
+
+
+def main():
+    """
+    Совместимость с твоим тестом:
+      python -c "from src.presentation.cli.paper_app import main; assert callable(main())"
+    main() возвращает вызываемый объект (функцию), но сам запуск — по желанию.
+    """
+    return run
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(run())
