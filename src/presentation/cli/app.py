@@ -32,6 +32,164 @@ except Exception:
 
 LOG = logging.getLogger("cli")
 
+# ---- helpers: добавить рядом с другими утилитами (выше run_* функций) --------
+import time
+import json
+from typing import Optional, List, Dict
+
+
+def _parse_candles_spec(spec: str) -> tuple[int, int]:
+    """
+    Преобразует строку вида '5m:200' | '5:200' | '1h:1000' | '1d:30'
+    -> (resolution_minutes:int, count:int)
+    По умолчанию, если единица не указана, считаем минуты.
+    """
+    s = str(spec).strip().lower().replace(" ", "")
+    if ":" not in s:
+        raise ValueError(f"Bad candles spec '{spec}'; expected like '5m:200'")
+
+    left, right = s.split(":", 1)
+    # right — количество свечей
+    try:
+        count = int(float(right))
+    except Exception:
+        raise ValueError(f"Bad candles count in '{spec}'")
+
+    # left — число + (опционально) единица времени
+    unit = left[-1]
+    if unit in ("m", "h", "d"):
+        num_s = left[:-1]
+        if not num_s:
+            raise ValueError(f"Bad timeframe minutes in '{spec}'")
+        base = int(float(num_s))
+        if unit == "m":
+            res_min = base
+        elif unit == "h":
+            res_min = base * 60
+        else:  # 'd'
+            res_min = base * 1440
+    else:
+        # единица не указана — трактуем как минуты, например '5:200'
+        res_min = int(float(left))
+
+    if res_min <= 0 or count <= 0:
+        raise ValueError(f"Non-positive timeframe or count in '{spec}'")
+
+    return int(res_min), int(count)
+
+
+def _fetch_exmo_ohlc(pair: str, spec: str, retries: int = 0, backoff: float = 0.0) -> Dict[str, List[float]]:
+    """
+    Тянем свечи с EXMO и приводим к словарю:
+    { 't': [...], 'open': [...], 'high': [...], 'low': [...], 'close': [...], 'volume': [...] }
+    """
+    try:
+        import requests
+    except Exception as e:
+        raise RuntimeError("requests is required to fetch EXMO candles") from e
+
+    res_min, count = _parse_candles_spec(spec)
+    # жёстко гарантируем int
+    res_min = int(res_min)
+    count = int(count)
+    span_sec = int(res_min) * 60 * int(count)
+    now = int(time.time())
+    frm = int(now - span_sec)
+    to = int(now)
+
+    url = "https://api.exmo.com/v1.1/candles_history"
+    params = {"symbol": pair, "resolution": res_min, "from": frm, "to": to}
+
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+
+            candles = data.get("candles")
+            if candles is None:
+                candles = data.get("data", data)
+            if not isinstance(candles, list) or not candles:
+                raise RuntimeError(f"EXMO returned empty candles for {pair} {spec}")
+
+            t_list: List[int] = []
+            o_list: List[float] = []
+            h_list: List[float] = []
+            l_list: List[float] = []
+            c_list: List[float] = []
+            v_list: List[float] = []
+
+            for e in candles:
+                if isinstance(e, dict):
+                    t = int(e.get("t") or e.get("time") or e.get("T") or 0)
+                    o = float(e.get("o") or e.get("open") or 0.0)
+                    h = float(e.get("h") or e.get("high") or 0.0)
+                    l = float(e.get("l") or e.get("low") or 0.0)
+                    c = float(e.get("c") or e.get("close") or 0.0)
+                    v = float(e.get("v") or e.get("volume") or 0.0)
+                else:
+                    # возможный массивный формат [t, o, c, h, l, v]
+                    t = int(e[0])
+                    o = float(e[1])
+                    c = float(e[2])
+                    h = float(e[3])
+                    l = float(e[4])
+                    v = float(e[5]) if len(e) > 5 else 0.0
+                t_list.append(int(t))
+                o_list.append(float(o))
+                h_list.append(float(h))
+                l_list.append(float(l))
+                c_list.append(float(c))
+                v_list.append(float(v))
+
+            return {"t": t_list, "open": o_list, "high": h_list, "low": l_list, "close": c_list, "volume": v_list}
+
+        except Exception as e:
+            if attempt > max(1, (retries or 0) + 1):
+                raise
+            sleep_for = float(backoff or 0.0) * (2 ** (attempt - 1))
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+
+
+def _safe_params_from_args(args: argparse.Namespace) -> dict:
+    """
+    Универсальный сбор параметров стратегии из CLI-аргументов.
+    Если в проекте определён _params_from_args — используем его.
+    Иначе собираем частые поля вручную (достаточно для наших стратегий).
+    """
+    try:
+        fn = globals().get("_params_from_args")
+        if callable(fn):
+            return fn(args, allow_empty=True)  # type: ignore
+    except Exception:
+        pass
+
+    params: dict = {}
+    # Часто используемые ключи — добавляй при необходимости
+    for name in (
+            "fast", "slow",
+            "ema_fast", "ema_slow",
+            "adx_len", "on", "off", "require_di",
+            "atr_len", "atr_mult",
+            "kc_len", "kc_mult",
+            "bb_len", "bb_mult",
+            "don_len",
+            "rsi_len", "rsi_buy", "rsi_sell",
+            "roc_len",
+            "macd_fast", "macd_slow", "macd_signal",
+    ):
+        if hasattr(args, name):
+            val = getattr(args, name)
+            if val is not None:
+                key = name
+                if name.startswith("ema_"):
+                    key = name.replace("ema_", "")
+                params[key] = val
+    return params
+
 
 def _selector_invoke(func_name: str, **our_kwargs):
     """
@@ -368,11 +526,6 @@ def _resolution_minutes(tf: str) -> int:
 
 def _parse_pair(pair: str) -> str:
     return pair.strip().upper()
-
-
-def _parse_candles_spec(spec: str) -> Tuple[str, int]:
-    tf, cnt = spec.split(":")
-    return tf.strip(), int(cnt)
 
 
 def _build_http(retries: Optional[int], backoff: Optional[float]) -> urllib3.PoolManager:
@@ -821,7 +974,6 @@ def _require_sel() -> None:
         raise RuntimeError("Research selector module not available (src/application/research/selector.py).")
 
 
-# --- replace your _run_sweep with this version --------------------------------
 def _run_sweep(args: argparse.Namespace) -> int:
     _require_sel()
     _coalesce_pair_candles(args)
@@ -830,11 +982,20 @@ def _run_sweep(args: argparse.Namespace) -> int:
     http_retries = as_int_or_none(getattr(args, "http_retries", None)) or 0
     http_backoff = as_float_or_none(getattr(args, "http_backoff", None)) or 0.0
 
-    # strategies может быть "auto" (строка) — пробрасываем как есть
+    # NEW: формируем OHLC и дефолтные торговые издержки
+    ohlc = _fetch_exmo_ohlc(args.exmo_pair, args.exmo_candles, http_retries, http_backoff)
+    fee_bps = as_int_or_none(getattr(args, "fee_bps", None)) or 10
+    slip_bps = as_int_or_none(getattr(args, "slip_bps", None)) or 0
+
     results = _selector_invoke(
         "sweep",
+        # старые аргументы останутся совместимыми, если selector их ожидает
         exmo_pair=args.exmo_pair,
         exmo_candles=args.exmo_candles,
+        # ключевые аргументы для текущей версии selector:
+        ohlc=ohlc,
+        fee_bps=fee_bps,
+        slip_bps=slip_bps,
         strategies=args.strategies,
         metric=args.metric,
         top_n=int(getattr(args, "top_n", 0) or 0),
@@ -848,7 +1009,6 @@ def _run_sweep(args: argparse.Namespace) -> int:
     return 0
 
 
-# --- replace your _run_optimize with this version ------------------------------
 def _run_optimize(args: argparse.Namespace) -> int:
     _require_sel()
     _coalesce_pair_candles(args)
@@ -857,10 +1017,17 @@ def _run_optimize(args: argparse.Namespace) -> int:
     http_retries = as_int_or_none(getattr(args, "http_retries", None)) or 0
     http_backoff = as_float_or_none(getattr(args, "http_backoff", None)) or 0.0
 
+    ohlc = _fetch_exmo_ohlc(args.exmo_pair, args.exmo_candles, http_retries, http_backoff)
+    fee_bps = as_int_or_none(getattr(args, "fee_bps", None)) or 10
+    slip_bps = as_int_or_none(getattr(args, "slip_bps", None)) or 0
+
     results = _selector_invoke(
         "optimize",
         exmo_pair=args.exmo_pair,
         exmo_candles=args.exmo_candles,
+        ohlc=ohlc,
+        fee_bps=fee_bps,
+        slip_bps=slip_bps,
         strategy=args.strategy,
         metric=args.metric,
         top_n=int(getattr(args, "top_n", 0) or 0),
@@ -874,19 +1041,25 @@ def _run_optimize(args: argparse.Namespace) -> int:
     return 0
 
 
-# --- replace your _run_robustness with this version ----------------------------
 def _run_robustness(args: argparse.Namespace) -> int:
     _require_sel()
     _coalesce_pair_candles(args)
 
-    params = _params_from_args(args, allow_empty=True)
+    params = _safe_params_from_args(args)
     http_retries = as_int_or_none(getattr(args, "http_retries", None)) or 0
     http_backoff = as_float_or_none(getattr(args, "http_backoff", None)) or 0.0
+
+    ohlc = _fetch_exmo_ohlc(args.exmo_pair, args.exmo_candles, http_retries, http_backoff)
+    fee_bps = as_int_or_none(getattr(args, "fee_bps", None)) or 10
+    slip_bps = as_int_or_none(getattr(args, "slip_bps", None)) or 0
 
     results = _selector_invoke(
         "robustness",
         exmo_pair=args.exmo_pair,
         exmo_candles=args.exmo_candles,
+        ohlc=ohlc,
+        fee_bps=fee_bps,
+        slip_bps=slip_bps,
         strategy=args.strategy,
         params=params,
         robust_level=getattr(args, "robust_level", "std"),
@@ -899,7 +1072,6 @@ def _run_robustness(args: argparse.Namespace) -> int:
     return 0
 
 
-# --- replace your _run_walk_forward with this version --------------------------
 def _run_walk_forward(args: argparse.Namespace) -> int:
     _require_sel()
     _coalesce_pair_candles(args)
@@ -908,10 +1080,17 @@ def _run_walk_forward(args: argparse.Namespace) -> int:
     http_retries = as_int_or_none(getattr(args, "http_retries", None)) or 0
     http_backoff = as_float_or_none(getattr(args, "http_backoff", None)) or 0.0
 
+    ohlc = _fetch_exmo_ohlc(args.exmo_pair, args.exmo_candles, http_retries, http_backoff)
+    fee_bps = as_int_or_none(getattr(args, "fee_bps", None)) or 10
+    slip_bps = as_int_or_none(getattr(args, "slip_bps", None)) or 0
+
     results = _selector_invoke(
         "walk_forward",
         exmo_pair=args.exmo_pair,
         exmo_candles=args.exmo_candles,
+        ohlc=ohlc,
+        fee_bps=fee_bps,
+        slip_bps=slip_bps,
         strategies=args.strategies,
         metric=args.metric,
         min_trades=int(getattr(args, "min_trades", 0) or 0),
