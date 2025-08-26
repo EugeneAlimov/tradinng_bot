@@ -2,326 +2,20 @@
 from __future__ import annotations
 
 import argparse
-import csv
-import inspect
 import json
 import logging
-import os
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-# ---------- Strategy registry ----------
-try:
-    from src.domain.strategy import registry as strat_registry  # type: ignore
-except Exception:
-    try:
-        from src.application.research.strategies import strat_registry  # type: ignore
-    except Exception as e:
-        raise RuntimeError(
-            "Strategy registry not found. Ensure src/domain/strategy/registry.py exists."
-        ) from e
+import urllib3
 
-# ---------- Optional research selector ----------
-try:
-    from src.application.research import selector as sel  # type: ignore
-except Exception:
-    sel = None
-
-LOG = logging.getLogger("cli")
-
-# ---- helpers: добавить рядом с другими утилитами (выше run_* функций) --------
-import time
-import json
-from typing import Optional, List, Dict
+# ===== Logging =====
+logger = logging.getLogger("cli")
 
 
-def _parse_candles_spec(spec: str) -> tuple[int, int]:
-    """
-    Преобразует строку вида '5m:200' | '5:200' | '1h:1000' | '1d:30'
-    -> (resolution_minutes:int, count:int)
-    По умолчанию, если единица не указана, считаем минуты.
-    """
-    s = str(spec).strip().lower().replace(" ", "")
-    if ":" not in s:
-        raise ValueError(f"Bad candles spec '{spec}'; expected like '5m:200'")
-
-    left, right = s.split(":", 1)
-    # right — количество свечей
-    try:
-        count = int(float(right))
-    except Exception:
-        raise ValueError(f"Bad candles count in '{spec}'")
-
-    # left — число + (опционально) единица времени
-    unit = left[-1]
-    if unit in ("m", "h", "d"):
-        num_s = left[:-1]
-        if not num_s:
-            raise ValueError(f"Bad timeframe minutes in '{spec}'")
-        base = int(float(num_s))
-        if unit == "m":
-            res_min = base
-        elif unit == "h":
-            res_min = base * 60
-        else:  # 'd'
-            res_min = base * 1440
-    else:
-        # единица не указана — трактуем как минуты, например '5:200'
-        res_min = int(float(left))
-
-    if res_min <= 0 or count <= 0:
-        raise ValueError(f"Non-positive timeframe or count in '{spec}'")
-
-    return int(res_min), int(count)
-
-
-def _fetch_exmo_ohlc(pair: str, spec: str, retries: int = 0, backoff: float = 0.0) -> Dict[str, List[float]]:
-    """
-    Тянем свечи с EXMO и приводим к словарю:
-    { 't': [...], 'open': [...], 'high': [...], 'low': [...], 'close': [...], 'volume': [...] }
-    """
-    try:
-        import requests
-    except Exception as e:
-        raise RuntimeError("requests is required to fetch EXMO candles") from e
-
-    res_min, count = _parse_candles_spec(spec)
-    # жёстко гарантируем int
-    res_min = int(res_min)
-    count = int(count)
-    span_sec = int(res_min) * 60 * int(count)
-    now = int(time.time())
-    frm = int(now - span_sec)
-    to = int(now)
-
-    url = "https://api.exmo.com/v1.1/candles_history"
-    params = {"symbol": pair, "resolution": res_min, "from": frm, "to": to}
-
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            r = requests.get(url, params=params, timeout=15)
-            r.raise_for_status()
-            data = r.json()
-
-            candles = data.get("candles")
-            if candles is None:
-                candles = data.get("data", data)
-            if not isinstance(candles, list) or not candles:
-                raise RuntimeError(f"EXMO returned empty candles for {pair} {spec}")
-
-            t_list: List[int] = []
-            o_list: List[float] = []
-            h_list: List[float] = []
-            l_list: List[float] = []
-            c_list: List[float] = []
-            v_list: List[float] = []
-
-            for e in candles:
-                if isinstance(e, dict):
-                    t = int(e.get("t") or e.get("time") or e.get("T") or 0)
-                    o = float(e.get("o") or e.get("open") or 0.0)
-                    h = float(e.get("h") or e.get("high") or 0.0)
-                    l = float(e.get("l") or e.get("low") or 0.0)
-                    c = float(e.get("c") or e.get("close") or 0.0)
-                    v = float(e.get("v") or e.get("volume") or 0.0)
-                else:
-                    # возможный массивный формат [t, o, c, h, l, v]
-                    t = int(e[0])
-                    o = float(e[1])
-                    c = float(e[2])
-                    h = float(e[3])
-                    l = float(e[4])
-                    v = float(e[5]) if len(e) > 5 else 0.0
-                t_list.append(int(t))
-                o_list.append(float(o))
-                h_list.append(float(h))
-                l_list.append(float(l))
-                c_list.append(float(c))
-                v_list.append(float(v))
-
-            return {"t": t_list, "open": o_list, "high": h_list, "low": l_list, "close": c_list, "volume": v_list}
-
-        except Exception as e:
-            if attempt > max(1, (retries or 0) + 1):
-                raise
-            sleep_for = float(backoff or 0.0) * (2 ** (attempt - 1))
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-
-
-def _safe_params_from_args(args: argparse.Namespace) -> dict:
-    """
-    Универсальный сбор параметров стратегии из CLI-аргументов.
-    Если в проекте определён _params_from_args — используем его.
-    Иначе собираем частые поля вручную (достаточно для наших стратегий).
-    """
-    try:
-        fn = globals().get("_params_from_args")
-        if callable(fn):
-            return fn(args, allow_empty=True)  # type: ignore
-    except Exception:
-        pass
-
-    params: dict = {}
-    # Часто используемые ключи — добавляй при необходимости
-    for name in (
-            "fast", "slow",
-            "ema_fast", "ema_slow",
-            "adx_len", "on", "off", "require_di",
-            "atr_len", "atr_mult",
-            "kc_len", "kc_mult",
-            "bb_len", "bb_mult",
-            "don_len",
-            "rsi_len", "rsi_buy", "rsi_sell",
-            "roc_len",
-            "macd_fast", "macd_slow", "macd_signal",
-    ):
-        if hasattr(args, name):
-            val = getattr(args, name)
-            if val is not None:
-                key = name
-                if name.startswith("ema_"):
-                    key = name.replace("ema_", "")
-                params[key] = val
-    return params
-
-
-def _selector_invoke(func_name: str, **our_kwargs):
-    """
-    Универсально вызывает sel.<func_name>, автоматически маппя наши ключи
-    на те, которые реально ожидает selector.<func_name>.
-    """
-    _require_sel()
-    func = getattr(sel, func_name)  # type: ignore[attr-defined]
-    sig = inspect.signature(func)
-    expected = set(sig.parameters.keys())
-
-    # Все возможные алиасы для часто используемых параметров:
-    pref_map = {
-        "exmo_pair": ["exmo_pair", "pair", "symbol", "asset", "market", "instrument"],
-        "exmo_candles": ["exmo_candles", "candles", "candles_spec", "span", "bars"],
-        "strategies": ["strategies", "strategy_list", "strats", "strategy"],
-        # если останется только 'strategy', отдадим туда строку/первый элемент
-        "strategy": ["strategy", "name"],
-        "metric": ["metric", "score_metric", "target_metric"],
-        "top_n": ["top_n", "top", "n_top"],
-        "min_trades": ["min_trades", "mintrades", "min_trades_count"],
-        "grid": ["grid", "grid_spec", "grid_dict"],
-        "params": ["params", "strategy_params", "param_values"],
-        "robust_level": ["robust_level", "level", "robustness_level"],
-        "samples": ["samples", "n_samples", "num_samples"],
-        "wf_folds": ["wf_folds", "folds", "n_folds"],
-        "wf_train_frac": ["wf_train_frac", "train_frac", "train_fraction"],
-        "http_retries": ["http_retries", "retries"],
-        "http_backoff": ["http_backoff", "backoff", "backoff_factor"],
-        "min_trades_oos": ["min_trades_oos"],  # на будущее
-    }
-
-    # Подготовим значения: копия, плюс ремонт 'strategies' -> 'strategy' если нужно
-    values = dict(our_kwargs)
-
-    # Если у функции нет 'strategies', но есть 'strategy' — сведём в одну стратегию
-    if "strategies" in values and "strategies" not in expected and "strategy" in expected:
-        s_val = values.get("strategies")
-        if isinstance(s_val, (list, tuple)) and len(s_val) > 0:
-            values["strategy"] = s_val[0]
-        else:
-            values["strategy"] = s_val
-        values.pop("strategies", None)
-
-    # Конечный kwargs только с разрешёнными именами
-    call_kwargs = {}
-
-    for our_key, val in values.items():
-        # 1) Если ключ и так принимается функцией — берём его напрямую
-        if our_key in expected:
-            call_kwargs[our_key] = val
-            continue
-
-        # 2) Иначе проверяем алиасы
-        aliases = pref_map.get(our_key, [])
-        put = False
-        for cand in aliases:
-            if cand in expected:
-                call_kwargs[cand] = val
-                put = True
-                break
-        if put:
-            continue
-
-        # 3) Частные случаи:
-        # - если у нас есть exmo_pair, а функция ожидает 'pair'
-        if our_key == "exmo_pair" and "pair" in expected:
-            call_kwargs["pair"] = val
-            continue
-        # - если у нас exmo_candles, а функция ждёт 'candles'/'candles_spec'
-        if our_key == "exmo_candles":
-            if "candles" in expected:
-                call_kwargs["candles"] = val
-                continue
-            if "candles_spec" in expected:
-                call_kwargs["candles_spec"] = val
-                continue
-        # - если есть wf_* алиасы
-        if our_key == "wf_folds" and "folds" in expected:
-            call_kwargs["folds"] = val
-            continue
-        if our_key == "wf_train_frac" and "train_frac" in expected:
-            call_kwargs["train_frac"] = val
-            continue
-
-        # если ключ вообще не нужен функции — просто игнорируем
-
-    # Особый случай: если функция принимает *args/**kwargs (очень либеральная), просто пробросим левые ключи
-    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-    if accepts_var_kw:
-        # Пробросим всё, чего не хватает (не перекрывая уже выбранное)
-        for k, v in values.items():
-            if k not in call_kwargs:
-                call_kwargs[k] = v
-
-    return func(**call_kwargs)
-
-
-def _save_results_csv_generic(results, csv_path: Optional[str]) -> None:
-    if not csv_path:
-        return
-    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
-
-    # Если у selector есть удобная утилита — используем её
-    saver = getattr(sel, "save_results_csv", None)
-    if callable(saver):
-        saver(results, csv_path)  # type: ignore
-        LOG.info("Saved CSV -> %s", csv_path)
-        return
-
-    # Иначе пишем простой CSV (список dict'ов или что получится)
-    rows: List[dict] = []
-    if isinstance(results, list):
-        for r in results:
-            if isinstance(r, dict):
-                rows.append(r)
-            else:
-                rows.append({"value": str(r)})
-    else:
-        rows.append({"value": str(results)})
-
-    # Заголовки — объединение ключей
-    fieldnames: List[str] = sorted({k for row in rows for k in row.keys()}) or ["value"]
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for row in rows:
-            w.writerow(row)
-    LOG.info("Saved CSV -> %s", csv_path)
-
-
-# ---------- Logging ----------
 def _setup_logging(debug: bool) -> None:
     level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(
@@ -329,865 +23,647 @@ def _setup_logging(debug: bool) -> None:
         format="%(asctime)s %(levelname)s [cli] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    LOG.debug("Logging configured. Level=%s", "DEBUG" if debug else "INFO")
+    logger.debug("Logging configured. Level=%s", "DEBUG" if debug else "INFO")
 
 
-# ---------- Helpers / Aliases ----------
-def _coalesce_pair_candles(args: argparse.Namespace) -> None:
+# ===== External modules (project) =====
+# Стратегии
+try:
+    from src.domain.strategy.registry import get_definition as get_strategy_def
+except Exception:
+    # fallback на старый путь
+    from src.application.research.strategies import strat_registry as _REG  # type: ignore
+
+    def get_strategy_def(name: str):
+        return _REG.get(name)
+
+# Селектор (ресёрч операции)
+from src.application.research import selector as sel  # type: ignore
+
+
+# ===== EXMO candles fetch =====
+_HTTP = urllib3.PoolManager(retries=False, timeout=urllib3.util.Timeout(connect=5.0, read=10.0))
+
+
+def _parse_candles_spec(spec: str) -> Tuple[int, int]:
     """
-    Поддержка алиасов:
-      --exmo-pair  <-> --pair
-      --exmo-candles <-> --candles
-    Гарантирует наличие args.pair/args.candles и args.exmo_pair/args.exmo_candles.
+    '5m:200' -> (resolution_seconds=300, count=200)
+    '1m:1000' -> (60, 1000)
     """
-    if getattr(args, "pair", None) and not getattr(args, "exmo_pair", None):
-        args.exmo_pair = args.pair
-    if getattr(args, "exmo_pair", None) and not getattr(args, "pair", None):
-        args.pair = args.exmo_pair
+    tf, cnt = spec.split(":")
+    cnt_i = int(cnt)
 
-    if getattr(args, "candles", None) and not getattr(args, "exmo_candles", None):
-        args.exmo_candles = args.candles
-    if getattr(args, "exmo_candles", None) and not getattr(args, "candles", None):
-        args.candles = args.exmo_candles
+    unit = tf[-1]
+    num = int(tf[:-1])
+    if unit == "m":
+        res_sec = num * 60
+    elif unit == "h":
+        res_sec = num * 3600
+    elif unit == "d":
+        res_sec = num * 86400
+    elif unit == "s":
+        res_sec = num
+    else:
+        # по умолчанию считаем минуты
+        res_sec = num * 60
+    return res_sec, cnt_i
 
 
-def _read_grid_arg(grid_file: Optional[str]) -> Optional[dict]:
+def _exmo_resolution_param(resolution_sec: int) -> int:
     """
-    Возвращает dict для грид-поиска из файла или STDIN.
-      - path == '-' -> читаем JSON из stdin
-      - None -> None
-      - иначе используем selector.load_grid_json
+    EXMO v1.1 принимает resolution как число минут (или 1 для 1m).
     """
-    if not grid_file:
-        return None
-    if grid_file == "-":
-        data = sys.stdin.read()
-        return json.loads(data) if data.strip() else None
-    if sel is None:
-        raise RuntimeError("selector is not available but --grid-file was provided.")
-    return sel.load_grid_json(grid_file)  # type: ignore
+    if resolution_sec < 60:
+        return 1
+    return resolution_sec // 60
 
 
-def _params_from_args(args: argparse.Namespace, allow_empty: bool = False) -> Dict[str, Any]:
+def _normalize_exmo_ts(ts: int | float) -> int:
     """
-    Собирает параметры стратегии из argparse.Namespace.
-    Поддерживаемые ключи:
-      --fast/--slow/--ema-fast/--ema-slow/--sma-fast/--sma-slow
-      --adx-len/--adx-on/--adx-off/--require-di
-      --atr-len/--atr-mult
-      --st-len/--st-mult
-      --kc-len/--kc-mult
-      --min-adx/--chandelier-len
-      --length/--mult/--exit-rule
-      --n/--signal
-      --params-json '{...}' (сливается поверх CLI)
+    EXMO иногда возвращает секунды, иногда миллисекунды. Нормализуем к секундам.
     """
-    import json as _json
-
-    mapping = {
-        "fast": "fast", "slow": "slow",
-        "ema_fast": "fast", "ema_slow": "slow",
-        "sma_fast": "fast", "sma_slow": "slow",
-
-        "adx_len": "adx_len",
-        "adx_on": "on",
-        "adx_off": "off",
-        "require_di": "require_di",
-
-        "atr_len": "atr_len",
-        "atr_mult": "atr_mult",
-
-        "st_len": "st_len",
-        "st_mult": "st_mult",
-
-        "kc_len": "kc_len",
-        "kc_mult": "kc_mult",
-
-        "min_adx": "min_adx",
-        "chandelier_len": "chandelier_len",
-
-        "length": "length",
-        "mult": "mult",
-        "exit_rule": "exit_rule",
-
-        "n": "n",
-        "signal": "signal",
-
-        "params_json": "__JSON__",
-    }
-
-    skip = {
-        "pair", "exmo_pair", "candles", "exmo_candles",
-        "strategies", "strategy", "metric", "top_n", "min_trades",
-        "wf_folds", "wf_train_frac",
-        "grid_file", "csv_results",
-        "mode", "poll_sec", "heartbeat_sec",
-        "initial_balance", "fee_bps", "slip_bps",
-        "max_position_pct", "stop_loss_bps", "max_daily_loss_bps",
-        "state_file",
-        "summary_alert", "debug",
-        "http_retries", "http_backoff",
-        "_handler", "cmd",
-    }
-
-    def _coerce(v: Any) -> Any:
-        if isinstance(v, (int, float, bool)) or v is None:
-            return v
-        s = str(v).strip()
-        if s.lower() in ("true", "false"):
-            return s.lower() == "true"
-        try:
-            if "." in s or "e" in s.lower():
-                return float(s)
-            return int(s)
-        except Exception:
-            return v
-
-    params: Dict[str, Any] = {}
-    for attr, val in vars(args).items():
-        if attr in skip:
-            continue
-        if attr not in mapping:
-            continue
-        key = mapping[attr]
-        if key == "__JSON__":
-            if val:
-                try:
-                    js = _json.loads(val) if isinstance(val, str) else val
-                    if isinstance(js, dict):
-                        params.update(js)
-                except Exception as e:
-                    LOG.warning("Failed to parse --params-json: %s", e)
-            continue
-        if val is None:
-            continue
-        if isinstance(val, bool):
-            if val:
-                params[key] = True
-            continue
-        params[key] = _coerce(val)
-
-    if not params and not allow_empty:
-        LOG.debug("No strategy params were collected from CLI.")
-    return params
+    t = int(ts)
+    if t > 10_000_000_000:  # миллисекунды
+        return t // 1000
+    return t
 
 
-# ---------- Safe converters ----------
-def as_int_or_none(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    s = str(value).strip()
-    return int(s) if s else None
+def _fetch_exmo_ohlc(
+    pair: str,
+    spec: str,
+    http_retries: int = 3,
+    http_backoff: float = 0.5,
+) -> Dict[str, List[float]]:
+    """
+    Возвращает словарь списков: t, o, h, l, c (timestamps в секундах UTC)
+    """
+    res_sec, count = _parse_candles_spec(spec)
+    resolution = _exmo_resolution_param(res_sec)
 
-
-def as_float_or_none(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, float):
-        return value
-    if isinstance(value, int):
-        return float(value)
-    s = str(value).strip()
-    return float(s) if s else None
-
-
-def bps_or_none(value: Any) -> Optional[int]:
-    i = as_int_or_none(value)
-    return i if (i is not None and i >= 0) else None
-
-
-def pct01_or_none(value: Any) -> Optional[float]:
-    f = as_float_or_none(value)
-    return f if (f is not None and f >= 0.0) else None
-
-
-# ---------- EXMO HTTP ----------
-import urllib3
-from urllib3.util.retry import Retry
-
-EXMO_HOST = "https://api.exmo.com"
-EXMO_CANDLES_V = "/v1.1/candles_history"
-
-
-def _resolution_minutes(tf: str) -> int:
-    tf = tf.strip().lower()
-    if tf.endswith("m"):
-        return int(tf[:-1])
-    if tf.endswith("h"):
-        return int(tf[:-1]) * 60
-    if tf.endswith("d"):
-        return int(tf[:-1]) * 60 * 24
-    raise ValueError(f"Unsupported timeframe: {tf}")
-
-
-def _parse_pair(pair: str) -> str:
-    return pair.strip().upper()
-
-
-def _build_http(retries: Optional[int], backoff: Optional[float]) -> urllib3.PoolManager:
-    total = retries if retries is not None else as_int_or_none(os.getenv("HTTP_RETRIES"))
-    back = backoff if backoff is not None else as_float_or_none(os.getenv("HTTP_BACKOFF"))
-    total = total if total is not None else 3
-    back = back if back is not None else 0.3
-    retry = Retry(
-        total=total,
-        backoff_factor=back,
-        status_forcelist=(429, 500, 502, 503, 504),
-        raise_on_status=False,
-        allowed_methods=None,  # retry on any method
-    )
-    return urllib3.PoolManager(retries=retry, timeout=urllib3.Timeout(connect=5.0, read=15.0))
-
-
-def _exmo_candles_history(
-        http: urllib3.PoolManager,
-        pair: str,
-        resolution_min: int,
-        epoch_from: int,
-        epoch_to: int,
-) -> List[Dict[str, Any]]:
-    params = {
-        "symbol": pair,
-        "resolution": str(resolution_min),
-        "from": str(epoch_from),
-        "to": str(epoch_to),
-    }
-    url = f"{EXMO_HOST}{EXMO_CANDLES_V}"
-    r = http.request("GET", url, fields=params)
-    if r.status != 200:
-        LOG.error("EXMO candles_history failed: %s", r.status)
-        raise RuntimeError(f"EXMO HTTP {r.status}")
-    data = json.loads(r.data.decode("utf-8"))
-    return data.get("candles") or []
-
-
-def _ts_to_seconds(x: Any) -> int:
-    """EXMO 't' может быть в секундах или миллисекундах. Возвращаем секунды."""
-    try:
-        t = int(float(x))
-    except Exception:
-        t = 0
-    return t // 1000 if t > 10 ** 12 else t
-
-
-def _get_candles_arrays(
-        pair: str,
-        spec: str,
-        retries: Optional[int],
-        backoff: Optional[float],
-) -> Tuple[List[int], List[float], List[float], List[float], List[float]]:
-    tf, count = _parse_candles_spec(spec)
-    res_min = _resolution_minutes(tf)
     now = int(time.time())
-    span = res_min * 60 * count
-    frm = now - span
+    span_sec = res_sec * count
+    frm = now - span_sec
     to = now
 
-    http = _build_http(retries, backoff)
-    raw = _exmo_candles_history(http, _parse_pair(pair), res_min, frm, to)
-
-    norm = []
-    for k in raw or []:
-        t = _ts_to_seconds(k.get("t"))
-        try:
-            o = float(k.get("o"))
-            h = float(k.get("h"))
-            l = float(k.get("l"))
-            c = float(k.get("c"))
-        except Exception:
-            continue
-        norm.append({"t": t, "o": o, "h": h, "l": l, "c": c})
-    norm.sort(key=lambda x: x["t"])
-
-    ts: List[int] = [r["t"] for r in norm]
-    o: List[float] = [r["o"] for r in norm]
-    h: List[float] = [r["h"] for r in norm]
-    l: List[float] = [r["l"] for r in norm]
-    c: List[float] = [r["c"] for r in norm]
-    return ts, o, h, l, c
-
-
-# ---------- Metrics ----------
-def _sharpe_by_trades(trade_pnls: List[float]) -> float:
-    if not trade_pnls:
-        return 0.0
-    import math
-
-    m = sum(trade_pnls) / len(trade_pnls)
-    var = sum((x - m) ** 2 for x in trade_pnls) / len(trade_pnls)
-    sd = math.sqrt(var) if var > 0 else 0.0
-    return (m / sd) if sd > 0 else 0.0
-
-
-def _max_drawdown(equity: List[float]) -> float:
-    peak = float("-inf")
-    mdd = 0.0
-    for v in equity:
-        if v > peak:
-            peak = v
-        dd = v - peak
-        if dd < mdd:
-            mdd = dd
-    return mdd
-
-
-# ---------- Backtest engine ----------
-@dataclass
-class Trade:
-    entry_ts: int
-    entry_px: float
-    side: int
-    exit_ts: int
-    exit_px: float
-    pnl: float
-
-
-def _run_backtest_signals(
-        timestamps: List[int],
-        open_: List[float],
-        high: List[float],
-        low: List[float],
-        close: List[float],
-        signals: List[int],
-        fee_bps: int = 0,
-        slip_bps: int = 0,
-        stop_loss_bps: Optional[int] = None,
-) -> Tuple[List[Trade], List[float]]:
-    trades: List[Trade] = []
-    eq: List[float] = []
-    pos = 0
-    entry_px = 0.0
-    entry_ts = 0
-    equity = 0.0
-    bps_cost = (fee_bps + slip_bps) * 0.0001
-
-    def exit_trade(i_idx: int):
-        nonlocal pos, entry_px, entry_ts, equity
-        if pos == 0:
-            return
-        px = close[i_idx]
-        ts = timestamps[i_idx]
-        raw_ret = (px - entry_px) / entry_px if pos > 0 else (entry_px - px) / entry_px
-        pnl = raw_ret - 2 * bps_cost
-        trades.append(Trade(entry_ts, entry_px, pos, ts, px, pnl))
-        equity += pnl
-        pos = 0
-        entry_px = 0.0
-        entry_ts = 0
-
-    for i in range(len(close)):
-        sig = signals[i] if i < len(signals) else 0
-        eq.append(equity)
-
-        if pos != 0 and stop_loss_bps is not None and stop_loss_bps > 0:
-            adverse = (entry_px - low[i]) / entry_px if pos > 0 else (high[i] - entry_px) / entry_px
-            if adverse > stop_loss_bps * 1e-4:
-                exit_trade(i)
-                continue
-
-        if sig != pos:
-            if pos != 0:
-                exit_trade(i)
-            if sig != 0:
-                pos = sig
-                entry_px = close[i]
-                entry_ts = timestamps[i]
-
-    if pos != 0:
-        exit_trade(len(close) - 1)
-    return trades, eq
-
-
-# ---------- CSV helpers ----------
-def _save_trades_csv(path: str, trades: List[Trade]) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["entry_ts", "entry_iso", "entry_px", "side", "exit_ts", "exit_iso", "exit_px", "pnl"])
-        for t in trades:
-            w.writerow([
-                t.entry_ts,
-                datetime.fromtimestamp(t.entry_ts, tz=timezone.utc).isoformat(),
-                f"{t.entry_px:.6f}",
-                t.side,
-                t.exit_ts,
-                datetime.fromtimestamp(t.exit_ts, tz=timezone.utc).isoformat(),
-                f"{t.exit_px:.6f}",
-                f"{t.pnl:.6f}",
-            ])
-
-
-def _save_equity_csv(path: str, timestamps: List[int], equity: List[float]) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["ts", "iso", "equity"])
-        for ts, eq in zip(timestamps, equity):
-            w.writerow([ts, datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(), f"{eq:.6f}"])
-
-
-# ---------- Common CLI args ----------
-def _add_common_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--strategy", default="sma")
-
-    # EMA/SMA
-    p.add_argument("--fast", type=int)
-    p.add_argument("--slow", type=int)
-    p.add_argument("--ema-fast", dest="fast", type=int)
-    p.add_argument("--ema-slow", dest="slow", type=int)
-    p.add_argument("--sma-fast", dest="fast", type=int)
-    p.add_argument("--sma-slow", dest="slow", type=int)
-
-    # ADX & filters
-    p.add_argument("--adx-len", dest="adx_len", type=int)
-    p.add_argument("--adx-on", dest="adx_on", type=float)
-    p.add_argument("--adx-off", dest="adx_off", type=float)
-    p.add_argument("--require-di", action="store_true")
-
-    # ATR / SuperTrend / Keltner / прочее
-    p.add_argument("--atr-len", dest="atr_len", type=int)
-    p.add_argument("--atr-mult", dest="atr_mult", type=float)
-    p.add_argument("--st-len", dest="st_len", type=int)
-    p.add_argument("--st-mult", dest="st_mult", type=float)
-    p.add_argument("--kc-len", dest="kc_len", type=int)
-    p.add_argument("--kc-mult", dest="kc_mult", type=float)
-    p.add_argument("--min-adx", dest="min_adx", type=float)
-    p.add_argument("--chandelier-len", dest="chandelier_len", type=int)
-    p.add_argument("--length", dest="length", type=int)
-    p.add_argument("--mult", dest="mult", type=float)
-    p.add_argument("--exit-rule", dest="exit_rule")
-    p.add_argument("--n", dest="n", type=int)
-    p.add_argument("--signal", dest="signal", type=int)
-    p.add_argument("--params-json", dest="params_json", help="Extra params as JSON string")
-
-    # EXMO data (с алиасами)
-    p.add_argument("--exmo-pair", dest="pair", default="DOGE_EUR", help="EXMO symbol, e.g. DOGE_EUR")
-    p.add_argument("--pair", dest="pair", help="Alias of --exmo-pair")
-    p.add_argument("--exmo-candles", dest="candles", default="1m:500", help="e.g. 5m:2500")
-    p.add_argument("--candles", dest="candles", help="Alias of --exmo-candles")
-
-    # costs
-    p.add_argument("--fee-bps", type=int, default=0)
-    p.add_argument("--slip-bps", type=int, default=0)
-
-    # infra
-    p.add_argument("--http-retries", type=int)
-    p.add_argument("--http-backoff", type=float)
-    p.add_argument("--summary-alert", action="store_true")
-    p.add_argument("--debug", action="store_true")
-
-
-def _add_risk_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--max-position-pct", type=float)
-    p.add_argument("--stop-loss-bps", type=int)
-    p.add_argument("--max-daily-loss-bps", type=int)
-
-
-# ---------- Commands: backtest / live ----------
-def _run_backtest(args: argparse.Namespace) -> int:
-    LOG.info("Command: backtest")
-    _coalesce_pair_candles(args)
-    ts, o, h, l, c = _get_candles_arrays(args.pair, args.candles, args.http_retries, args.http_backoff)
-
-    defn = strat_registry.get(args.strategy)
-    params = _params_from_args(args, allow_empty=True)
-
-    # НЕ передаём open=
-    signals = defn.generate_signals(close=c, high=h, low=l, **params)  # type: ignore
-
-    trades, equity = _run_backtest_signals(
-        timestamps=ts, open_=o, high=h, low=l, close=c, signals=signals,
-        fee_bps=args.fee_bps or 0, slip_bps=args.slip_bps or 0,
-        stop_loss_bps=bps_or_none(getattr(args, "stop_loss_bps", None)),
+    url = (
+        f"https://api.exmo.com/v1.1/candles_history"
+        f"?symbol={pair}&resolution={resolution}&from={frm}&to={to}"
     )
 
-    wins = sum(1 for t in trades if t.pnl > 0)
-    n = len(trades)
-    win_rate = (wins / n * 100.0) if n else 0.0
-    avg_pnl = (sum(t.pnl for t in trades) / n) if n else 0.0
-    total_pnl = sum(t.pnl for t in trades)
-    maxdd = _max_drawdown(equity)
-    sharpe = _sharpe_by_trades([t.pnl for t in trades])
+    attempt = 0
+    while True:
+        try:
+            r = _HTTP.request("GET", url)
+            if r.status != 200:
+                raise RuntimeError(f"EXMO HTTP {r.status}")
+            data = json.loads(r.data.decode("utf-8"))
+            candles = data.get("candles") or []
 
-    LOG.info("Backtest %s %s strategy=%s params=%s", args.pair, args.candles, args.strategy, params)
-    LOG.info("Trades: %s  WinRate: %.1f%%  AvgPnL: %.6f  TotalPnL: %.6f  MaxDD: %.6f  Sharpe(trades): %.2f",
-             n, win_rate, avg_pnl, total_pnl, maxdd, sharpe)
+            t_list: List[int] = []
+            o_list: List[float] = []
+            h_list: List[float] = []
+            l_list: List[float] = []
+            c_list: List[float] = []
 
-    if getattr(args, "csv_trades", None):
-        _save_trades_csv(args.csv_trades, trades)
-        LOG.info("Saved trades CSV -> %s", args.csv_trades)
-    if getattr(args, "csv_equity", None):
-        _save_equity_csv(args.csv_equity, ts, equity)
-        LOG.info("Saved equity CSV -> %s", args.csv_equity)
-    return 0
+            for c in candles:
+                # поля: t, o, h, l, c, v
+                t = _normalize_exmo_ts(c.get("t", 0))
+                t_list.append(t)
+                o_list.append(float(c.get("o", 0.0)))
+                h_list.append(float(c.get("h", 0.0)))
+                l_list.append(float(c.get("l", 0.0)))
+                c_list.append(float(c.get("c", 0.0)))
 
+            # гарантируем наличие данных
+            if not t_list or not c_list:
+                raise RuntimeError("Empty candles from EXMO")
 
-def _run_live_observe(args: argparse.Namespace) -> int:
-    LOG.info("Command: trade-live")
-    _coalesce_pair_candles(args)
-    params = _params_from_args(args, allow_empty=True)
-    LOG.info("[live] observe %s %s strategy=%s params=%s poll=%ss",
-             args.pair, args.candles, args.strategy, params, args.poll_sec)
-    if getattr(args, "summary_alert", False):
-        LOG.debug("[live] summary-alert flag accepted (no-op notifier).")
-
-    last_seen_ts = 0
-    try:
-        while True:
-            ts, o, h, l, c = _get_candles_arrays(args.pair, args.candles, args.http_retries, args.http_backoff)
-            if ts and ts[-1] != last_seen_ts:
-                last_seen_ts = ts[-1]
-                defn = strat_registry.get(args.strategy)
-                # НЕ передаём open=
-                status_text, state = defn.status(close=c, high=h, low=l, **params)  # type: ignore
-                t_iso = datetime.fromtimestamp(ts[-1], tz=timezone.utc).isoformat()
-                LOG.info("[live] %s %s", t_iso, status_text)
-            time.sleep(max(1, int(args.poll_sec)))
-    except KeyboardInterrupt:
-        LOG.info("[live] stop by user")
-    return 0
+            return {"t": t_list, "o": o_list, "h": h_list, "l": l_list, "c": c_list}
+        except Exception as e:
+            attempt += 1
+            if attempt > http_retries:
+                logger.error("EXMO fetch failed after %d attempts: %s", attempt - 1, e)
+                raise
+            sleep_s = http_backoff * (2 ** (attempt - 1))
+            logger.warning("EXMO fetch failed (attempt %d/%d): %s; retry in %.2fs",
+                           attempt, http_retries, e, sleep_s)
+            time.sleep(sleep_s)
 
 
-@dataclass
-class PaperState:
-    balance: float
-    position: int
-    pos_px: float
-    last_day: str
+# ===== Helpers =====
+def _weights_from_args(args: argparse.Namespace) -> Optional[Dict[str, float]]:
+    """
+    Весовые коэффициенты для score (если нужны). Если флагов нет — вернём None.
+    Поддерживаем флаг вида: --score-weights "win=0.2,total=0.4,sharpe=0.4"
+    """
+    raw = getattr(args, "score_weights", None)
+    if not raw:
+        return None
+    weights: Dict[str, float] = {}
+    for part in str(raw).split(","):
+        if not part.strip():
+            continue
+        k, v = part.split("=")
+        weights[k.strip()] = float(v.strip())
+    return weights
 
 
-def _load_state(path: Optional[str], initial_balance: float) -> PaperState:
-    if not path or not os.path.exists(path):
-        return PaperState(balance=initial_balance, position=0, pos_px=0.0, last_day="")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return PaperState(**data)
-    except Exception:
-        return PaperState(balance=initial_balance, position=0, pos_px=0.0, last_day="")
+def _params_from_args(strategy: str, args: argparse.Namespace) -> Dict[str, Any]:
+    """
+    Извлекаем параметры стратегии из CLI аргументов.
+    Поддержаны: ema, ema_adx, ema_adx_atr (можно расширять по мере необходимости).
+    """
+    out: Dict[str, Any] = {}
+
+    def _maybe(name: str, cast=float):
+        if hasattr(args, name) and getattr(args, name) is not None:
+            try:
+                out[name.replace("-", "_")] = cast(getattr(args, name))
+            except Exception:
+                pass
+
+    # общее (EMA)
+    _maybe("ema_fast", int)
+    _maybe("ema_slow", int)
+
+    if strategy in ("ema_adx", "ema_adx_atr"):
+        _maybe("adx_len", int)
+        _maybe("adx_on", float)
+        _maybe("adx_off", float)
+        if hasattr(args, "require_di"):
+            out["require_di"] = bool(getattr(args, "require_di"))
+
+    if strategy == "ema_adx_atr":
+        _maybe("atr_len", int)
+        _maybe("atr_mult", float)
+
+    return out
 
 
-def _save_state(path: Optional[str], state: PaperState) -> None:
-    if not path:
-        return
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(asdict(state), f, ensure_ascii=False, indent=2)
+def _print_table(headers: List[str], rows: List[List[Any]]) -> None:
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(str(cell)))
+
+    def fmt(row: List[Any]) -> str:
+        return "  ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row))
+
+    logger.info(fmt(headers))
+    for r in rows:
+        logger.info(fmt(r))
 
 
-def _run_live_paper(args: argparse.Namespace) -> int:
-    LOG.info("Command: trade-live")
-    _coalesce_pair_candles(args)
-    params = _params_from_args(args, allow_empty=True)
-    LOG.info("[live:paper] %s %s strategy=%s params=%s poll=%ss",
-             args.pair, args.candles, args.strategy, params, args.poll_sec)
-    if getattr(args, "summary_alert", False):
-        LOG.debug("[live:paper] summary-alert flag accepted (no-op notifier).")
+def _selector_invoke(
+    func_name: str,
+    *,
+    ohlc: Dict[str, List[float]],
+    strategy: str | None = None,
+    strategies: List[str] | None = None,
+    metric: str | None = None,
+    top_n: int | None = None,
+    min_trades: int | None = None,
+    fee_bps: int = 10,
+    slip_bps: int = 2,
+    grid: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    weights: Optional[Dict[str, float]] = None,
+) -> Any:
+    """
+    Универсальный адаптер к src.application.research.selector.*
+    Приводит аргументы к актуальным сигнатурам селектора.
+    """
+    func = getattr(sel, func_name)
 
-    initial_balance = as_float_or_none(getattr(args, "initial_balance", None)) or 1000.0
-    fee_bps = args.fee_bps or 0
-    slip_bps = args.slip_bps or 0
-    max_pos_pct = pct01_or_none(getattr(args, "max_position_pct", None)) or 1.0
-    stop_loss_bps = bps_or_none(getattr(args, "stop_loss_bps", None))
-    _ = bps_or_none(getattr(args, "max_daily_loss_bps", None))  # зарезервировано
+    call_kwargs: Dict[str, Any] = {
+        "ohlc": ohlc,
+        "fee_bps": fee_bps,
+        "slip_bps": slip_bps,
+    }
+    if strategy is not None:
+        call_kwargs["strategy"] = strategy
+    if strategies is not None:
+        call_kwargs["strategies"] = strategies
+    if metric is not None:
+        call_kwargs["metric"] = metric
+    if top_n is not None:
+        call_kwargs["top_n"] = top_n
+    if min_trades is not None:
+        call_kwargs["min_trades"] = min_trades
+    if grid is not None:
+        call_kwargs["grid"] = grid
+    if weights is not None and func_name in ("sweep", "optimize"):
+        call_kwargs["score_weights"] = weights
 
-    state = _load_state(getattr(args, "state_file", None), initial_balance)
-    last_seen_ts = 0
-    trades_out: List[Trade] = []
-    eq_out_ts: List[int] = []
-    eq_out: List[float] = []
-
-    try:
-        while True:
-            ts, o, h, l, c = _get_candles_arrays(args.pair, args.candles, args.http_retries, args.http_backoff)
-            if not ts or ts[-1] == last_seen_ts:
-                time.sleep(max(1, int(args.poll_sec)))
-                continue
-            last_seen_ts = ts[-1]
-
-            defn = strat_registry.get(args.strategy)
-            status_text, state_info = defn.status(close=c, high=h, low=l, **params)  # type: ignore
-            sig = int(state_info.get("signal", 0)) if isinstance(state_info, dict) else 0
-
-            px = c[-1]
-            tstamp = ts[-1]
-            bps_cost = (fee_bps + slip_bps) * 1e-4
-
-            # стоп-лосс
-            if state.position != 0 and stop_loss_bps:
-                adverse = (state.pos_px - l[-1]) / state.pos_px if state.position > 0 else (h[
-                                                                                                -1] - state.pos_px) / state.pos_px
-                if adverse > stop_loss_bps * 1e-4:
-                    raw_ret = (px - state.pos_px) / state.pos_px if state.position > 0 else (
-                                                                                                    state.pos_px - px) / state.pos_px
-                    pnl = raw_ret - 2 * bps_cost
-                    state.balance *= (1.0 + pnl * max_pos_pct)
-                    trades_out.append(Trade(entry_ts=tstamp, entry_px=state.pos_px, side=state.position,
-                                            exit_ts=tstamp, exit_px=px, pnl=pnl))
-                    state.position = 0
-                    state.pos_px = 0.0
-
-            # сигнал сменился
-            if sig != state.position:
-                if state.position != 0:
-                    raw_ret = (px - state.pos_px) / state.pos_px if state.position > 0 else (
-                                                                                                    state.pos_px - px) / state.pos_px
-                    pnl = raw_ret - 2 * bps_cost
-                    state.balance *= (1.0 + pnl * max_pos_pct)
-                    trades_out.append(Trade(entry_ts=tstamp, entry_px=state.pos_px, side=state.position,
-                                            exit_ts=tstamp, exit_px=px, pnl=pnl))
-                    state.position = 0
-                    state.pos_px = 0.0
-                if sig != 0:
-                    state.position = sig
-                    state.pos_px = px
-
-            eq_out_ts.append(tstamp)
-            eq_out.append(state.balance)
-
-            t_iso = datetime.fromtimestamp(tstamp, tz=timezone.utc).isoformat()
-            LOG.info("[live:paper] %s close=%.6f sig=%+d %s", t_iso, px, sig, status_text)
-
-            _save_state(getattr(args, "state_file", None), state)
-            if getattr(args, "csv_trades", None) and trades_out:
-                _save_trades_csv(args.csv_trades, trades_out)
-            if getattr(args, "csv_equity", None) and eq_out_ts:
-                _save_equity_csv(args.csv_equity, eq_out_ts, eq_out)
-
-            time.sleep(max(1, int(args.poll_sec)))
-    except KeyboardInterrupt:
-        LOG.info("[live:paper] stop by user")
-        if getattr(args, "csv_trades", None) and trades_out:
-            LOG.info("Saved trades CSV -> %s", args.csv_trades)
-        if getattr(args, "csv_equity", None) and eq_out_ts:
-            LOG.info("Saved equity CSV -> %s", args.csv_equity)
-    return 0
+    return func(**call_kwargs)
 
 
-# ---------- Research commands ----------
-def _require_sel() -> None:
-    if sel is None:
-        raise RuntimeError("Research selector module not available (src/application/research/selector.py).")
-
-
+# ===== Commands =====
 def _run_sweep(args: argparse.Namespace) -> int:
-    _require_sel()
-    _coalesce_pair_candles(args)
+    http_retries = int(getattr(args, "http_retries", 3))
+    http_backoff = float(getattr(args, "http_backoff", 0.5))
+    ohlc = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
 
-    grid = _read_grid_arg(getattr(args, "grid_file", None))
-    http_retries = as_int_or_none(getattr(args, "http_retries", None)) or 0
-    http_backoff = as_float_or_none(getattr(args, "http_backoff", None)) or 0.0
+    strategies = []
+    if args.strategies == "auto":
+        strategies = ["sma", "ema", "ema_adx", "ema_adx_atr", "supertrend",
+                      "keltner", "adx", "sma_atr", "rsi2", "donchian", "bbands", "roc"]
+    else:
+        strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
 
-    # NEW: формируем OHLC и дефолтные торговые издержки
-    ohlc = _fetch_exmo_ohlc(args.exmo_pair, args.exmo_candles, http_retries, http_backoff)
-    fee_bps = as_int_or_none(getattr(args, "fee_bps", None)) or 10
-    slip_bps = as_int_or_none(getattr(args, "slip_bps", None)) or 0
+    weights = _weights_from_args(args)
 
     results = _selector_invoke(
         "sweep",
-        # старые аргументы останутся совместимыми, если selector их ожидает
-        exmo_pair=args.exmo_pair,
-        exmo_candles=args.exmo_candles,
-        # ключевые аргументы для текущей версии selector:
         ohlc=ohlc,
-        fee_bps=fee_bps,
-        slip_bps=slip_bps,
-        strategies=args.strategies,
+        strategies=strategies,
         metric=args.metric,
-        top_n=int(getattr(args, "top_n", 0) or 0),
-        min_trades=int(getattr(args, "min_trades", 0) or 0),
-        grid=grid,
-        http_retries=http_retries,
-        http_backoff=http_backoff,
+        top_n=int(args.top_n),
+        min_trades=int(args.min_trades),
+        fee_bps=int(args.fee_bps),
+        slip_bps=int(args.slip_bps),
+        weights=weights,
     )
 
-    _save_results_csv_generic(results, getattr(args, "csv_results", None))
+    # вывод
+    headers = ["strategy", "params", "trades", "win%", "avgPnL", "totalPnL", "maxDD", "sharpe", "score"]
+    rows: List[List[Any]] = []
+    for r in results:
+        rows.append([
+            r.get("strategy"),
+            json.dumps(r.get("params"), ensure_ascii=False),
+            r.get("trades"),
+            f"{r.get('win_rate', 0.0):.1f}",
+            f"{r.get('avg_pnl', 0.0):.6f}",
+            f"{r.get('total_pnl', 0.0):.6f}",
+            f"{r.get('max_dd', 0.0):.6f}",
+            f"{r.get('sharpe', 0.0):.3f}",
+            f"{r.get('score', 0.0):.3f}",
+        ])
+    _print_table(headers, rows)
+
+    if args.csv_results:
+        import csv
+        with open(args.csv_results, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(headers)
+            for r in rows:
+                w.writerow(r)
+        logger.info("Saved sweep CSV -> %s", args.csv_results)
+
     return 0
 
 
 def _run_optimize(args: argparse.Namespace) -> int:
-    _require_sel()
-    _coalesce_pair_candles(args)
+    http_retries = int(getattr(args, "http_retries", 3))
+    http_backoff = float(getattr(args, "http_backoff", 0.5))
+    ohlc = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
 
-    grid = _read_grid_arg(getattr(args, "grid_file", None))
-    http_retries = as_int_or_none(getattr(args, "http_retries", None)) or 0
-    http_backoff = as_float_or_none(getattr(args, "http_backoff", None)) or 0.0
+    grid = None
+    if args.grid_file:
+        grid = _load_grid_json(args.grid_file)
 
-    ohlc = _fetch_exmo_ohlc(args.exmo_pair, args.exmo_candles, http_retries, http_backoff)
-    fee_bps = as_int_or_none(getattr(args, "fee_bps", None)) or 10
-    slip_bps = as_int_or_none(getattr(args, "slip_bps", None)) or 0
+    weights = _weights_from_args(args)
 
     results = _selector_invoke(
         "optimize",
-        exmo_pair=args.exmo_pair,
-        exmo_candles=args.exmo_candles,
         ohlc=ohlc,
-        fee_bps=fee_bps,
-        slip_bps=slip_bps,
         strategy=args.strategy,
         metric=args.metric,
-        top_n=int(getattr(args, "top_n", 0) or 0),
-        min_trades=int(getattr(args, "min_trades", 0) or 0),
+        top_n=int(args.top_n),
+        min_trades=int(args.min_trades),
+        fee_bps=int(args.fee_bps),
+        slip_bps=int(args.slip_bps),
         grid=grid,
-        http_retries=http_retries,
-        http_backoff=http_backoff,
+        weights=weights,
     )
 
-    _save_results_csv_generic(results, getattr(args, "csv_results", None))
+    headers = ["strategy", "params", "trades", "win%", "avgPnL", "totalPnL", "maxDD", "sharpe", "score"]
+    rows: List[List[Any]] = []
+    for r in results:
+        rows.append([
+            r.get("strategy"),
+            json.dumps(r.get("params"), ensure_ascii=False),
+            r.get("trades"),
+            f"{r.get('win_rate', 0.0):.1f}",
+            f"{r.get('avg_pnl', 0.0):.6f}",
+            f"{r.get('total_pnl', 0.0):.6f}",
+            f"{r.get('max_dd', 0.0):.6f}",
+            f"{r.get('sharpe', 0.0):.3f}",
+            f"{r.get('score', 0.0):.3f}",
+        ])
+    _print_table(headers, rows)
+
+    if args.csv_results:
+        import csv
+        with open(args.csv_results, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(headers)
+            for r in rows:
+                w.writerow(r)
+        logger.info("Saved optimize CSV -> %s", args.csv_results)
+
     return 0
 
 
 def _run_robustness(args: argparse.Namespace) -> int:
-    _require_sel()
-    _coalesce_pair_candles(args)
+    http_retries = int(getattr(args, "http_retries", 3))
+    http_backoff = float(getattr(args, "http_backoff", 0.5))
+    ohlc = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
 
-    params = _safe_params_from_args(args)
-    http_retries = as_int_or_none(getattr(args, "http_retries", None)) or 0
-    http_backoff = as_float_or_none(getattr(args, "http_backoff", None)) or 0.0
+    params = _params_from_args(args.strategy, args)
 
-    ohlc = _fetch_exmo_ohlc(args.exmo_pair, args.exmo_candles, http_retries, http_backoff)
-    fee_bps = as_int_or_none(getattr(args, "fee_bps", None)) or 10
-    slip_bps = as_int_or_none(getattr(args, "slip_bps", None)) or 0
-
-    results = _selector_invoke(
-        "robustness",
-        exmo_pair=args.exmo_pair,
-        exmo_candles=args.exmo_candles,
+    results = sel.robustness(
         ohlc=ohlc,
-        fee_bps=fee_bps,
-        slip_bps=slip_bps,
         strategy=args.strategy,
-        params=params,
-        robust_level=getattr(args, "robust_level", "std"),
-        samples=int(getattr(args, "samples", 0) or 0),
-        http_retries=http_retries,
-        http_backoff=http_backoff,
+        params=params if params else None,
+        level=args.robust_level,
+        samples=int(args.samples),
+        fee_bps=int(args.fee_bps),
+        slip_bps=int(args.slip_bps),
     )
 
-    _save_results_csv_generic(results, getattr(args, "csv_results", None))
+    # агрегируем в табличку
+    headers = ["passes", "total", "pass_ratio", "avgSharpe", "avgTotal", "worstSharpe", "worstTotal", "robustScore"]
+    rows = [[
+        results.get("passes", 0),
+        results.get("total", 0),
+        f"{results.get('pass_ratio', 0.0):.3f}",
+        f"{results.get('avg_sharpe', 0.0):.3f}",
+        f"{results.get('avg_total', 0.0):.6f}",
+        f"{results.get('worst_sharpe', 0.0):.3f}",
+        f"{results.get('worst_total', 0.0):.6f}",
+        f"{results.get('robust_score', 0.0):.3f}",
+    ]]
+    _print_table(headers, rows)
+
+    if args.csv_results:
+        import csv
+        with open(args.csv_results, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(headers)
+            for r in rows:
+                w.writerow(r)
+        logger.info("Saved robustness CSV -> %s", args.csv_results)
+
     return 0
 
 
 def _run_walk_forward(args: argparse.Namespace) -> int:
-    _require_sel()
-    _coalesce_pair_candles(args)
+    http_retries = int(getattr(args, "http_retries", 3))
+    http_backoff = float(getattr(args, "http_backoff", 0.5))
+    ohlc = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
 
-    grid = _read_grid_arg(getattr(args, "grid_file", None))
-    http_retries = as_int_or_none(getattr(args, "http_retries", None)) or 0
-    http_backoff = as_float_or_none(getattr(args, "http_backoff", None)) or 0.0
+    grid = None
+    if args.grid_file:
+        grid = _load_grid_json(args.grid_file)
 
-    ohlc = _fetch_exmo_ohlc(args.exmo_pair, args.exmo_candles, http_retries, http_backoff)
-    fee_bps = as_int_or_none(getattr(args, "fee_bps", None)) or 10
-    slip_bps = as_int_or_none(getattr(args, "slip_bps", None)) or 0
-
-    results = _selector_invoke(
-        "walk_forward",
-        exmo_pair=args.exmo_pair,
-        exmo_candles=args.exmo_candles,
+    res = sel.walk_forward(
         ohlc=ohlc,
-        fee_bps=fee_bps,
-        slip_bps=slip_bps,
-        strategies=args.strategies,
+        strategies=[s.strip() for s in args.strategies.split(",") if s.strip()],
         metric=args.metric,
-        min_trades=int(getattr(args, "min_trades", 0) or 0),
-        wf_folds=int(getattr(args, "wf_folds", 0) or 0),
-        wf_train_frac=float(getattr(args, "wf_train_frac", 0.7) or 0.7),
+        min_trades=int(args.min_trades),
+        folds=int(args.wf_folds),
+        train_frac=float(args.wf_train_frac),
+        fee_bps=int(args.fee_bps),
+        slip_bps=int(args.slip_bps),
         grid=grid,
-        http_retries=http_retries,
-        http_backoff=http_backoff,
     )
 
-    _save_results_csv_generic(results, getattr(args, "csv_results", None))
+    # печать
+    logger.info(
+        "WF aggregate: folds=%s trades=%s totalPnL=%.6f avgSharpe=%.2f",
+        res.get("folds_total"), res.get("trades_total"),
+        res.get("total_pnl", 0.0), res.get("avg_sharpe", 0.0)
+    )
+
+    if args.csv_results:
+        import csv
+        # Ожидаем, что res["folds"] — список словарей по фолдам
+        headers = ["fold", "train_start", "train_end", "test_start", "test_end", "trades", "total", "sharpe", "best"]
+        with open(args.csv_results, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(headers)
+            for i, fold in enumerate(res.get("folds", []), 1):
+                w.writerow([
+                    i,
+                    fold.get("train_start"),
+                    fold.get("train_end"),
+                    fold.get("test_start"),
+                    fold.get("test_end"),
+                    fold.get("trades"),
+                    f"{fold.get('total', 0.0):.6f}",
+                    f"{fold.get('sharpe', 0.0):.3f}",
+                    json.dumps(fold.get("best"), ensure_ascii=False),
+                ])
+        logger.info("Saved walk-forward CSV -> %s", args.csv_results)
+
     return 0
 
 
-# ---------- Parser / Dispatcher ----------
+# ===== Live (observe/paper) =====
+def _run_live_observe(args: argparse.Namespace) -> int:
+    http_retries = int(getattr(args, "http_retries", 3))
+    http_backoff = float(getattr(args, "http_backoff", 0.5))
+
+    logger.info(
+        "[live] observe %s %s strategy=%s params=%s poll=%ss",
+        args.pair, args.candles, args.strategy,
+        _params_from_args(args.strategy, args), int(args.poll_sec)
+    )
+
+    if getattr(args, "summary_alert", False):
+        logger.debug("[live] summary-alert flag accepted (no-op notifier).")
+
+    strategy_def = get_strategy_def(args.strategy)
+    if not strategy_def:
+        raise RuntimeError(f"Unknown strategy: {args.strategy}")
+
+    while True:
+        ohlc = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
+        # последние значения
+        t = ohlc["t"][-1]
+        o = ohlc["o"][-1]
+        h = ohlc["h"][-1]
+        l = ohlc["l"][-1]
+        c = ohlc["c"][-1]
+
+        params = _params_from_args(args.strategy, args)
+
+        # NB: используем open_ — так ожидают многие реализации status()
+        status_text, _state = strategy_def.status(
+            close=c, open_=o, high=h, low=l, **params
+        )
+
+        t_iso = datetime.fromtimestamp(int(t), tz=timezone.utc).isoformat()
+        logger.info("[live] %s %s", t_iso, status_text)
+
+        time.sleep(float(args.poll_sec))
+
+
+def _run_live_paper(args: argparse.Namespace) -> int:
+    http_retries = int(getattr(args, "http_retries", 3))
+    http_backoff = float(getattr(args, "http_backoff", 0.5))
+
+    logger.info(
+        "[live:paper] %s %s strategy=%s params=%s poll=%ss",
+        args.pair, args.candles, args.strategy,
+        _params_from_args(args.strategy, args), int(args.poll_sec)
+    )
+    if getattr(args, "summary_alert", False):
+        logger.debug("[live:paper] summary-alert flag accepted (no-op notifier).")
+
+    strategy_def = get_strategy_def(args.strategy)
+    if not strategy_def:
+        raise RuntimeError(f"Unknown strategy: {args.strategy}")
+
+    # простая paper-петля (без состояния — сохранение CSV на каждом тике)
+    trades_path = getattr(args, "csv_trades", None)
+    equity_path = getattr(args, "csv_equity", None)
+
+    equity = 1_000.0  # абстрактная метрика equity, для демо
+    position = 0  # -1 / 0 / +1
+
+    while True:
+        ohlc = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
+        t = ohlc["t"][-1]
+        o = ohlc["o"][-1]
+        h = ohlc["h"][-1]
+        l = ohlc["l"][-1]
+        c = ohlc["c"][-1]
+        params = _params_from_args(args.strategy, args)
+
+        status_text, state_info = strategy_def.status(
+            close=c, open_=o, high=h, low=l, **params
+        )
+        sig = int(state_info.get("signal", 0)) if isinstance(state_info, dict) else 0
+
+        # очень простой симулятор (для визуального движения equity)
+        if sig != 0:
+            position = sig
+        equity += position * (c - o)  # псевдо-PnL
+
+        t_iso = datetime.fromtimestamp(int(t), tz=timezone.utc).isoformat()
+        logger.info("[live:paper] %s close=%.6f sig=%+d %s", t_iso, c, sig, status_text)
+
+        if equity_path:
+            with open(equity_path, "a", encoding="utf-8") as f:
+                f.write(f"{t_iso},{equity:.6f}\n")
+
+        if trades_path and sig != 0:
+            with open(trades_path, "a", encoding="utf-8") as f:
+                f.write(f"{t_iso},{sig},{c:.6f}\n")
+
+        time.sleep(float(args.poll_sec))
+
+
+# ===== Grid loader =====
+def _load_grid_json(path: str) -> Dict[str, List[Dict[str, Any]]]:
+    if path == "-":
+        data = sys.stdin.read()
+        return json.loads(data)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ===== CLI =====
 def _build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="exmo-bot", add_help=True)
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = argparse.ArgumentParser("exmo-bot")
 
-    # backtest
-    p = sub.add_parser("backtest", help="Run simple backtest over candles")
-    _add_common_args(p)
-    _add_risk_args(p)
-    p.add_argument("--csv-trades")
-    p.add_argument("--csv-equity")
-    p.set_defaults(_handler=_run_backtest)
+    # общие флаги рынка (с обратной совместимостью имён)
+    p.add_argument("--pair", "--exmo-pair", dest="pair", required=False, help="Symbol, e.g. DOGE_EUR")
+    p.add_argument("--candles", "--exmo-candles", dest="candles", required=False, help='Like "5m:2500"')
 
-    # live
-    p = sub.add_parser("trade-live", help="Run live engine (observe or paper)")
-    _add_common_args(p)
-    p.add_argument("--mode", choices=["observe", "paper"], default="observe")
-    p.add_argument("--poll-sec", type=int, default=10)
-    p.add_argument("--heartbeat-sec", type=int, default=60)
-    p.add_argument("--initial-balance", type=float)
-    _add_risk_args(p)
-    p.add_argument("--state-file")
-    p.add_argument("--csv-trades")
-    p.add_argument("--csv-equity")
-    p.set_defaults(_handler=lambda a: _run_live_paper(a) if a.mode == "paper" else _run_live_observe(a))
+    p.add_argument("--fee-bps", dest="fee_bps", type=int, default=10)
+    p.add_argument("--slip-bps", dest="slip_bps", type=int, default=2)
+    p.add_argument("--http-retries", dest="http_retries", type=int, default=3)
+    p.add_argument("--http-backoff", dest="http_backoff", type=float, default=0.5)
+    p.add_argument("--debug", dest="debug", action="store_true")
+
+    sub = p.add_subparsers(dest="_cmd")
 
     # sweep
-    p = sub.add_parser("sweep", help="Grid search over multiple strategies")
-    _add_common_args(p)
-    p.add_argument("--strategies", default="auto")
-    p.add_argument("--metric", default="sharpe")
-    p.add_argument("--top-n", type=int, default=8)
-    p.add_argument("--min-trades", type=int, default=3)
-    p.add_argument("--grid-file")
-    p.add_argument("--csv-results")
-    p.set_defaults(_handler=_run_sweep)
+    sp = sub.add_parser("sweep")
+    sp.set_defaults(_handler=_run_sweep)
+    sp.add_argument("--strategies", required=True)  # "auto" | "a,b,c"
+    sp.add_argument("--metric", required=True)
+    sp.add_argument("--top-n", dest="top_n", type=int, default=5)
+    sp.add_argument("--min-trades", dest="min_trades", type=int, default=1)
+    sp.add_argument("--csv-results", dest="csv_results")
+    sp.add_argument("--score-weights", dest="score_weights")
 
     # optimize
-    p = sub.add_parser("optimize", help="Optimize a single strategy over a grid")
-    _add_common_args(p)
-    p.add_argument("--metric", default="sharpe")
-    p.add_argument("--top-n", type=int, default=10)
-    p.add_argument("--min-trades", type=int, default=3)
-    p.add_argument("--grid-file")
-    p.add_argument("--csv-results")
-    p.set_defaults(_handler=_run_optimize)
+    sp = sub.add_parser("optimize")
+    sp.set_defaults(_handler=_run_optimize)
+    sp.add_argument("--strategy", required=True)
+    sp.add_argument("--metric", required=True)
+    sp.add_argument("--top-n", dest="top_n", type=int, default=5)
+    sp.add_argument("--min-trades", dest="min_trades", type=int, default=1)
+    sp.add_argument("--grid-file", dest="grid_file")
+    sp.add_argument("--csv-results", dest="csv_results")
+    sp.add_argument("--score-weights", dest="score_weights")
 
     # robustness
-    p = sub.add_parser("robustness", help="Noise/perturbation robustness check")
-    _add_common_args(p)
-    p.add_argument("--robust-level", dest="robust_level", choices=["lite", "std", "hard"], default="std")
-    p.add_argument("--samples", type=int, default=10)
-    p.add_argument("--csv-results")
-    p.set_defaults(_handler=_run_robustness)
+    sp = sub.add_parser("robustness")
+    sp.set_defaults(_handler=_run_robustness)
+    sp.add_argument("--strategy", required=True)
+    sp.add_argument("--robust-level", dest="robust_level", type=float, default=0.1)
+    sp.add_argument("--samples", type=int, default=25)
+    sp.add_argument("--csv-results", dest="csv_results")
 
     # walk-forward
-    p = sub.add_parser("walk-forward", help="Walk-forward validation")
-    _add_common_args(p)
-    p.add_argument("--strategies", default="auto")
-    p.add_argument("--wf-folds", type=int, default=3)
-    p.add_argument("--wf-train-frac", type=float, default=0.7)
-    p.add_argument("--metric", default="sharpe")
-    p.add_argument("--min-trades", type=int, default=5)
-    p.add_argument("--grid-file")
-    p.add_argument("--csv-results")
-    p.set_defaults(_handler=_run_walk_forward)
+    sp = sub.add_parser("walk-forward")
+    sp.set_defaults(_handler=_run_walk_forward)
+    sp.add_argument("--strategies", required=True)  # "a,b,c"
+    sp.add_argument("--metric", required=True)
+    sp.add_argument("--min-trades", dest="min_trades", type=int, default=1)
+    sp.add_argument("--wf-folds", dest="wf_folds", type=int, default=3)
+    sp.add_argument("--wf-train-frac", dest="wf_train_frac", type=float, default=0.7)
+    sp.add_argument("--grid-file", dest="grid_file")
+    sp.add_argument("--csv-results", dest="csv_results")
 
-    return ap
+    # trade-live
+    sp = sub.add_parser("trade-live")
+    sp.add_argument("--mode", choices=["observe", "paper"], required=True)
+    sp.add_argument("--strategy", required=True)
+    sp.add_argument("--poll-sec", dest="poll_sec", type=float, default=10.0)
+    sp.add_argument("--summary-alert", dest="summary_alert", action="store_true")
+    sp.add_argument("--csv-trades", dest="csv_trades")
+    sp.add_argument("--csv-equity", dest="csv_equity")
+    sp.set_defaults(_handler=lambda a: _run_live_paper(a) if a.mode == "paper" else _run_live_observe(a))
+
+    # Параметры стратегий (опционально)
+    for name, tpe in [
+        ("ema-fast", int), ("ema-slow", int),
+        ("adx-len", int), ("adx-on", float), ("adx-off", float), ("require-di", None),
+        ("atr-len", int), ("atr-mult", float),
+    ]:
+        flag = f"--{name}"
+        dest = name.replace("-", "_")
+        if tpe is None:
+            p.add_argument(flag, dest=dest, action="store_true")
+        else:
+            p.add_argument(flag, dest=dest, type=tpe)
+
+    return p
 
 
-def _dispatch_command(args: argparse.Namespace) -> int:
-    handler = getattr(args, "_handler", None)
-    if handler is None:
-        raise SystemExit("No handler bound to command.")
-    return handler(args)
-
-
-def _run_cli(argv: Sequence[str]) -> int:
-    debug = any(a in ("--debug",) for a in argv)
-    _setup_logging(debug)
+def _run_cli(argv: List[str]) -> int:
     parser = _build_parser()
-    args = parser.parse_args(list(argv))
-    return _dispatch_command(args)
+    args = parser.parse_args(argv)
+
+    debug = bool(getattr(args, "debug", False))
+    _setup_logging(debug)
+
+    # sanity: для команд анализа требуем pair/candles
+    if args._cmd in {"sweep", "optimize", "robustness", "walk-forward", "trade-live"}:
+        if not args.pair or not args.candles:
+            parser.error("--pair and --candles are required for this command")
+
+    handler = getattr(args, "_handler", None)
+    if not handler:
+        parser.print_help()
+        return 2
+    return handler(args)
 
 
 if __name__ == "__main__":
