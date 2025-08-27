@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json, os, time, hashlib
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 DEFAULT_CACHE_DIR = ".cache/candles"
 DEFAULT_TTL_SEC = 60  # 1 минута актуальности окна
