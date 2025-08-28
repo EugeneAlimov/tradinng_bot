@@ -24,7 +24,7 @@ import sys
 import time
 import logging
 import inspect
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, IO, cast
 from datetime import datetime, timezone
 
 import urllib3
@@ -33,7 +33,7 @@ import pandas as pd
 # Наш селектор (единая точка алгоритмики)
 try:
     from src.application.research import selector as sel
-except Exception:  # хотим понятную ошибку пользователю на раннем этапе
+except Exception:
     sel = None  # type: ignore
 
 # ----------------------------- Логи -----------------------------
@@ -70,6 +70,7 @@ AUTO_STRATEGIES: List[str] = [
     "bbands",
     "roc",
 ]
+
 
 # ----------------------------- Утилиты -----------------------------
 
@@ -135,15 +136,11 @@ def _http_client(retries: int, backoff: float) -> urllib3.PoolManager:
 
 
 def _fetch_exmo_ohlc(pair: str, candles_spec: str, http_retries: int, http_backoff: float) -> pd.DataFrame:
-    """
-    Тянем OHLC с EXMO /v1.1/candles_history.
-    Возвращает DataFrame с колонками: ['ts','open','high','low','close','volume']
-    """
     minutes, _, span_sec = _parse_candles_spec(candles_spec)
     now = int(time.time())
     frm = int(now - span_sec)
     to = now
-    resolution = minutes  # EXMO resolution = минуты
+    resolution = minutes
 
     http = _http_client(http_retries, http_backoff)
     url = (
@@ -151,36 +148,39 @@ def _fetch_exmo_ohlc(pair: str, candles_spec: str, http_retries: int, http_backo
         f"?symbol={pair}&resolution={resolution}&from={frm}&to={to}"
     )
 
-    logger.debug("Starting new HTTPS connection (1): api.exmo.com:443")
-    r = http.request("GET", url)
-    logger.debug('https://api.exmo.com:443 "GET %s HTTP/1.1" %s %s',
-                 url.replace("https://api.exmo.com", ""), r.status, "None")
+    attempts = max(1, http_retries + 1)  # поверх встроенного retry сделаем ещё несколько попыток
+    for i in range(attempts):
+        try:
+            logger.debug("Starting new HTTPS connection (%d): api.exmo.com:443", i + 1)
+            r = http.request("GET", url)
+            logger.debug('https://api.exmo.com:443 "GET %s HTTP/1.1" %s %s',
+                         url.replace("https://api.exmo.com", ""), r.status, "None")
+            if r.status != 200:
+                raise RuntimeError(f"EXMO HTTP {r.status}")
 
-    if r.status != 200:
-        raise RuntimeError(f"EXMO HTTP {r.status}")
+            payload = json.loads(r.data.decode("utf-8"))
+            candles = (payload or {}).get("candles") or []
+            if not candles:
+                logger.warning("EXMO returned empty candles for %s %s", pair, candles_spec)
+                return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
 
-    try:
-        payload = json.loads(r.data.decode("utf-8"))
-    except Exception as e:
-        raise RuntimeError("EXMO response decode error") from e
+            df = pd.DataFrame(candles).rename(
+                columns={"t": "ts", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
+            for col in ("open", "high", "low", "close", "volume"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["ts"] = pd.to_numeric(df["ts"], errors="coerce").astype("Int64")
+            df = df.dropna(subset=["ts", "close"]).reset_index(drop=True)
+            return df
 
-    if not payload or "candles" not in payload:
-        raise RuntimeError("EXMO payload malformed (no 'candles')")
-
-    candles = payload["candles"] or []
-    if not candles:
-        # Пусто — вернём empty DF, пусть верхний уровень решает
-        return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
-
-    df = pd.DataFrame(candles)  # keys: t, o, h, l, c, v
-    mapping = {"t": "ts", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}
-    df = df.rename(columns=mapping)
-    # типы
-    for col in ("open", "high", "low", "close", "volume"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["ts"] = pd.to_numeric(df["ts"], errors="coerce").astype("Int64")
-    df = df.dropna(subset=["ts", "close"]).reset_index(drop=True)
-    return df
+        except Exception as e:
+            # логируем и ждём бэкофф
+            logger.warning("EXMO fetch attempt %d/%d failed: %s", i + 1, attempts, e)
+            if i + 1 < attempts:
+                time.sleep(http_backoff * (i + 1))
+            else:
+                # финальный провал — возвращаем пустой DF, чтобы верхний уровень не падал
+                logger.error("EXMO fetch failed after %d attempts, returning empty dataframe", attempts)
+                return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
 
 
 def _ensure_dir(path: Optional[str]) -> None:
@@ -261,15 +261,15 @@ def _selector_invoke(func_name: str, **call_kwargs):
 
     # Синонимы логических ключей -> возможные имена в целевой функции
     synonyms = {
-        "metric":      ["metric", "metric_name", "objective", "score", "scorer"],
-        "strategies":  ["strategies", "strategy_names", "strategy_list"],
-        "ohlc":        ["ohlc", "bars", "candles", "data"],
-        "top_n":       ["top_n", "k", "n_top"],
-        "min_trades":  ["min_trades", "min_trs", "min_signals"],
-        "fee_bps":     ["fee_bps", "fee"],
-        "slip_bps":    ["slip_bps", "slip"],
-        "weights":     ["weights", "metric_weights"],
-        # grid передаём как есть, но если автор назвал иначе — подхватится через **kwargs
+        "metric": ["metric", "metric_name", "objective", "score", "scorer"],
+        "strategies": ["strategies", "strategy_names", "strategy_list"],
+        "ohlc": ["ohlc", "bars", "candles", "data"],
+        "top_n": ["top_n", "k", "n_top"],
+        "min_trades": ["min_trades", "min_trs", "min_signals"],
+        "fee_bps": ["fee_bps", "fee"],
+        "slip_bps": ["slip_bps", "slip"],
+        "weights": ["weights", "metric_weights"],
+        # grid передаём как есть
     }
 
     # 1) нормализуем по синонимам
@@ -294,9 +294,12 @@ def _selector_invoke(func_name: str, **call_kwargs):
     return func(**normalized)
 
 
-# ----------------------------- Печать таблиц -----------------------------
+# ----------------------------- Печать / сохранение -----------------------------
 
 def _print_rows_table(rows: List[Dict[str, Any]], metric: str) -> None:
+    """
+    Простой табличный вывод (оставлен для совместимости, сейчас не используется).
+    """
     if not rows:
         logger.info("no results")
         return
@@ -307,7 +310,7 @@ def _print_rows_table(rows: List[Dict[str, Any]], metric: str) -> None:
         fmt_rows.append([
             str(r.get("strategy", "")),
             json.dumps(r.get("params", {}), ensure_ascii=False, separators=(",", ": ")),
-            str(r.get("trades", "")),
+            str(r.get("trades", r.get("n_trades", ""))),
             f"{r.get('winrate', 0.0):.1%}" if isinstance(r.get("winrate", None), (int, float)) else "",
             f"{r.get('avg_pnl', 0.0):.6f}" if isinstance(r.get("avg_pnl", None), (int, float)) else "",
             f"{r.get('total_pnl', 0.0):.6f}" if isinstance(r.get("total_pnl", None), (int, float)) else "",
@@ -324,6 +327,61 @@ def _print_rows_table(rows: List[Dict[str, Any]], metric: str) -> None:
         logger.info(sep.join(row[i].ljust(widths[i]) for i in range(len(headers))))
 
 
+def _print_table(rows: List[Dict[str, Any]], metric: str) -> None:
+    """
+    Красивый вывод результатов. Последняя колонка — выбранная метрика (METRIC).
+    Ожидает строки формата, возвращаемого selector.*: поля
+      strategy, params, trades/n_trades, win%, avgPnL/avg_pnl, totalPnL/total_pnl, maxDD/max_dd, sharpe, calmar, score
+    """
+    if not rows:
+        logger.info("no results")
+        return
+
+    m = metric.lower()
+    headers = ["strategy", "params", "trades", "win%", "avgPnL", "totalPnL", "maxDD", "sharpe", "METRIC"]
+    widths = [11, 45, 6, 6, 7, 9, 7, 7, 8]
+
+    def _val(r: Dict[str, Any], key: str, default: Any = "") -> Any:
+        if key == "trades":
+            return int(r.get("trades", r.get("n_trades", 0)))
+        return r.get(key, default)
+
+    def _metric_val(r: Dict[str, Any]) -> float:
+        if m == "score":
+            return float(_val(r, "score", 0.0))
+        if m == "sharpe":
+            return float(_val(r, "sharpe", 0.0))
+        if m == "calmar":
+            return float(_val(r, "calmar", 0.0))
+        if m in ("totalpnl", "total_pnl", "pnl"):
+            return float(_val(r, "totalPnL", _val(r, "total_pnl", 0.0)))
+        if m in ("win%", "winrate", "win"):
+            return float(_val(r, "win%", 0.0))
+        return float(_val(r, m, 0.0))
+
+    def _fmt(v: Any, w: int, prec: int | None = None) -> str:
+        if isinstance(v, float):
+            return f"{v:>{w}.{prec if prec is not None else 3}f}"
+        return f"{str(v):>{w}}"
+
+    logger.info(" ".join(_fmt(h, w) for h, w in zip(headers, widths)))
+    logger.info(" ".join(_fmt("-" * len(h), w) for h, w in zip(headers, widths)))
+
+    for r in rows:
+        row_vals = [
+            _fmt(_val(r, "strategy", ""), widths[0]),
+            _fmt(json.dumps(_val(r, "params", {}), ensure_ascii=False, separators=(",", ":")), widths[1]),
+            _fmt(_val(r, "trades"), widths[2]),
+            _fmt(float(_val(r, "win%", 0.0)), widths[3]),
+            _fmt(float(_val(r, "avgPnL", _val(r, "avg_pnl", 0.0))), widths[4]),
+            _fmt(float(_val(r, "totalPnL", _val(r, "total_pnl", 0.0))), widths[5]),
+            _fmt(float(_val(r, "maxDD", _val(r, "max_dd", 0.0))), widths[6]),
+            _fmt(float(_val(r, "sharpe", 0.0)), widths[7]),
+            _fmt(float(_metric_val(r)), widths[8]),
+        ]
+        logger.info(" ".join(row_vals))
+
+
 def _save_csv(path: Optional[str], rows: List[Dict[str, Any]]) -> None:
     if not path:
         return
@@ -332,176 +390,191 @@ def _save_csv(path: Optional[str], rows: List[Dict[str, Any]]) -> None:
     logger.info("Saved CSV -> %s", path)
 
 
+def _maybe_write_csv(rows: List[Dict[str, Any]], path: Optional[str]) -> None:
+    if not path:
+        return
+    _ensure_dir(path)
+    try:
+        pd.DataFrame(rows).to_csv(path, index=False)
+        logger.info("Saved CSV -> %s", path)
+    except Exception as e:
+        logger.error("CSV save failed %s: %s", path, e)
+
+
+def _maybe_write_json(obj: Dict[str, Any], path: Optional[str]) -> None:
+    if not path:
+        return
+    _ensure_dir(path)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            jf: IO[str] = cast(IO[str], f)  # удовлетворяем type checker
+            json.dump(obj, jf, ensure_ascii=False, indent=2)
+        logger.info("Saved JSON -> %s", path)
+    except Exception as e:
+        logger.error("JSON save failed %s: %s", path, e)
+
+
 # ----------------------------- Запуски команд -----------------------------
 
 def _run_sweep(args: argparse.Namespace) -> int:
-    http_retries = _as_int(getattr(args, "http_retries", None), 2)
-    http_backoff = _as_float(getattr(args, "http_backoff", None), 0.5)
-    ohlc = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
-    if ohlc.empty:
-        logger.info("OHLC is empty, nothing to do.")
-        return 2
+    ohlc = _fetch_exmo_ohlc(args.pair, args.candles, _as_int(getattr(args, "http_retries", None), 2),
+                            _as_float(getattr(args, "http_backoff", None), 0.5))
 
-    strategies = (
-        _list_from_csv_arg(args.strategies)
-        if args.strategies and args.strategies != "auto"
-        else AUTO_STRATEGIES
-    )
-    grid: Optional[Dict[str, Any]] = _load_grid(getattr(args, "grid_file", None))
+    # Определим список стратегий
+    strategies = getattr(args, "strategies", "auto")
+    if isinstance(strategies, str) and strategies.lower() == "auto":
+        strategies = AUTO_STRATEGIES
+    elif isinstance(strategies, str):
+        strategies = _list_from_csv_arg(strategies)
 
+    metric = getattr(args, "metric", "score")
     results: List[Dict[str, Any]] = _selector_invoke(
         "sweep",
         ohlc=ohlc,
         strategies=strategies,
-        metric=args.metric,
-        grid=grid,  # <- обязательный в твоём селекторе
-        top_n=int(args.top_n),
-        min_trades=int(args.min_trades),
-        fee_bps=_as_int(getattr(args, "fee_bps", None), 0),
-        slip_bps=_as_int(getattr(args, "slip_bps", None), 0),
+        grid=_load_grid(getattr(args, "grid_file", None)),
+        fee_bps=_as_int(getattr(args, "fee_bps", None), 10),
+        slip_bps=_as_int(getattr(args, "slip_bps", None), 2),
+        metric=metric,
+        top_n=_as_int(getattr(args, "top_n", None), 10),
+        min_trades=_as_int(getattr(args, "min_trades", None), 5),
         weights=_weights_from_args(args),
     )
-    _print_rows_table(results, metric=args.metric)
-    _save_csv(getattr(args, "csv_results", None), results)
+
+    _print_table(results, metric)
+    _maybe_write_csv(results, getattr(args, "csv_results", None))
     return 0
 
 
 def _run_optimize(args: argparse.Namespace) -> int:
-    http_retries = _as_int(getattr(args, "http_retries", None), 2)
-    http_backoff = _as_float(getattr(args, "http_backoff", None), 0.5)
-    ohlc = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
-    if ohlc.empty:
-        logger.info("OHLC is empty, nothing to do.")
-        return 2
+    ohlc = _fetch_exmo_ohlc(args.pair, args.candles, _as_int(getattr(args, "http_retries", None), 2),
+                            _as_float(getattr(args, "http_backoff", None), 0.5))
 
+    metric = getattr(args, "metric", "score")
     results: List[Dict[str, Any]] = _selector_invoke(
         "optimize",
         ohlc=ohlc,
-        strategy=args.strategy,
-        metric=args.metric,
-        top_n=int(args.top_n),
-        min_trades=int(args.min_trades),
-        fee_bps=_as_int(getattr(args, "fee_bps", None), 0),
-        slip_bps=_as_int(getattr(args, "slip_bps", None), 0),
+        strategy=getattr(args, "strategy"),
+        grid=_load_grid(getattr(args, "grid_file", None)),
+        fee_bps=_as_int(getattr(args, "fee_bps", None), 10),
+        slip_bps=_as_int(getattr(args, "slip_bps", None), 2),
+        metric=metric,
+        top_n=_as_int(getattr(args, "top_n", None), 10),
+        min_trades=_as_int(getattr(args, "min_trades", None), 5),
     )
-    _print_rows_table(results, metric=args.metric)
-    _save_csv(getattr(args, "csv_results", None), results)
+
+    _print_table(results, metric)
+    _maybe_write_csv(results, getattr(args, "csv_results", None))
     return 0
 
 
 def _run_robustness(args: argparse.Namespace) -> int:
-    http_retries = _as_int(getattr(args, "http_retries", None), 2)
-    http_backoff = _as_float(getattr(args, "http_backoff", None), 0.5)
-    ohlc = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
-    if ohlc.empty:
-        logger.info("OHLC is empty, nothing to do.")
-        return 2
+    ohlc = _fetch_exmo_ohlc(args.pair, args.candles, _as_int(getattr(args, "http_retries", None), 2),
+                            _as_float(getattr(args, "http_backoff", None), 0.5))
 
-    params = _params_from_args(args)
-
-    # robust_level может быть строкой ("std") или числом (0.1)
-    robust_level: Any = getattr(args, "robust_level", "std")
-    try:
-        if isinstance(robust_level, str):
-            rl = robust_level.strip().lower()
-            robust_level = rl if rl in ("std", "lo", "hi") else float(robust_level)
-        else:
-            robust_level = float(robust_level)
-    except Exception:
-        robust_level = "std"
-
-    rows: List[Dict[str, Any]] = _selector_invoke(
+    results: List[Dict[str, Any]] = _selector_invoke(
         "robustness",
         ohlc=ohlc,
-        strategy=args.strategy,
-        params=params if params else None,
-        level=robust_level,
-        samples=int(getattr(args, "samples", 20)),
-        fee_bps=_as_int(getattr(args, "fee_bps", None), 0),
-        slip_bps=_as_int(getattr(args, "slip_bps", None), 0),
+        strategy=getattr(args, "strategy"),
+        params=_params_from_args(args),
+        fee_bps=_as_int(getattr(args, "fee_bps", None), 10),
+        slip_bps=_as_int(getattr(args, "slip_bps", None), 2),
+        level=_as_float(getattr(args, "robust_level", None), 0.1),
+        samples=_as_int(getattr(args, "samples", None), 50),
     )
 
-    if rows:
-        try:
-            avg_sharpe = float(pd.DataFrame(rows)["sharpe"].mean())
-        except Exception:
-            avg_sharpe = float("nan")
-        logger.info("robustness samples=%d  avgSharpe=%.3f", len(rows), avg_sharpe)
-
-    _save_csv(getattr(args, "csv_results", None), rows)
+    results = sorted(results, key=lambda r: float(r.get("sharpe", 0.0)), reverse=True)[:20]
+    _print_table(results, "sharpe")
+    _maybe_write_csv(results, getattr(args, "csv_results", None))
     return 0
 
 
 def _run_walk_forward(args: argparse.Namespace) -> int:
-    http_retries = _as_int(getattr(args, "http_retries", None), 2)
-    http_backoff = _as_float(getattr(args, "http_backoff", None), 0.5)
-    ohlc = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
-    if ohlc.empty:
-        logger.info("OHLC is empty, nothing to do.")
-        return 2
+    ohlc = _fetch_exmo_ohlc(args.pair, args.candles, _as_int(getattr(args, "http_retries", None), 2),
+                            _as_float(getattr(args, "http_backoff", None), 0.5))
 
-    strategies = (
-        _list_from_csv_arg(args.strategies)
-        if args.strategies and args.strategies != "auto"
-        else AUTO_STRATEGIES
-    )
-    grid: Optional[Dict[str, Any]] = _load_grid(getattr(args, "grid_file", None))
+    strategies = getattr(args, "strategies", "auto")
+    if isinstance(strategies, str) and strategies.lower() == "auto":
+        strategies = AUTO_STRATEGIES
+    elif isinstance(strategies, str):
+        strategies = _list_from_csv_arg(strategies)
 
+    metric = getattr(args, "metric", "sharpe")
     result: Dict[str, Any] = _selector_invoke(
         "walk_forward",
         ohlc=ohlc,
         strategies=strategies,
-        metric=args.metric,
-        min_trades=int(args.min_trades),
-        folds=int(args.wf_folds),
-        train_frac=float(args.wf_train_frac),
-        grid=grid,
-        fee_bps=_as_int(getattr(args, "fee_bps", None), 0),
-        slip_bps=_as_int(getattr(args, "slip_bps", None), 0),
+        grid=_load_grid(getattr(args, "grid_file", None)),
+        fee_bps=_as_int(getattr(args, "fee_bps", None), 10),
+        slip_bps=_as_int(getattr(args, "slip_bps", None), 2),
+        folds=_as_int(getattr(args, "wf_folds", None), 3),
+        train_frac=_as_float(getattr(args, "wf_train_frac", None), 0.7),
+        metric=metric,
+        min_trades=_as_int(getattr(args, "min_trades", None), 5),
     )
 
-    folds = result.get("folds", [])
-    agg_trades = sum(int(f.get("trades", 0)) for f in folds) if isinstance(folds, list) else 0
-    avg_sharpe = float(result.get("avg_sharpe", 0.0))
-    total_pnl = float(result.get("total_pnl", 0.0))
+    folds: List[Dict[str, Any]] = result.get("folds", [])
+    if not folds:
+        logger.info("no results")
+        return 0
+
+    headers = ["fold", "train_range", "test_range", "best.strategy", "best.params", "OOS_sharpe", "OOS_calmar",
+               "OOS_totalRet%"]
+    widths = [4, 25, 25, 14, 40, 10, 10, 14]
+    logger.info(" ".join(f"{h:>{w}}" for h, w in zip(headers, widths)))
+    logger.info(" ".join(f"{'-' * len(h):>{w}}" for h, w in zip(headers, widths)))
+
+    for f in folds:
+        best = f.get("best") or {}
+        oos = f.get("oos") or {}
+        row = [
+            f"{int(f.get('fold', 0)):>{widths[0]}}",
+            f"{str(tuple(f.get('train_range', ('', '')))):>{widths[1]}}",
+            f"{str(tuple(f.get('test_range', ('', '')))):>{widths[2]}}",
+            f"{str(best.get('strategy', '')):>{widths[3]}}",
+            f"{json.dumps(best.get('params', {}), ensure_ascii=False, separators=(',', ':')):>{widths[4]}}",
+            f"{float(oos.get('sharpe', 0.0)):>{widths[5]}.3f}",
+            f"{float(oos.get('calmar', 0.0)):>{widths[6]}.3f}",
+            f"{float(oos.get('totalPnL', oos.get('total_pnl', 0.0)) * 100.0):>{widths[7]}.2f}",
+        ]
+        logger.info(" ".join(row))
+
     logger.info(
-        "WF aggregate: folds=%d trades=%d totalPnL=%.6f avgSharpe=%.2f",
-        int(args.wf_folds), agg_trades, total_pnl, avg_sharpe,
+        "mean OOS sharpe = %.3f | mean OOS calmar = %.3f | mean OOS totalRet%% = %.2f",
+        float(result.get('oos_sharpe_mean', 0.0)),
+        float(result.get('oos_calmar_mean', 0.0)),
+        float(result.get('oos_total_return_pct_mean', 0.0)),
     )
-
-    _save_csv(getattr(args, "csv_results", None), folds if isinstance(folds, list) else [])
+    _maybe_write_json(result, getattr(args, "json_results", None))
     return 0
 
 
 # ----------------------------- Live режимы -----------------------------
 
 def _run_live_observe(args: argparse.Namespace) -> int:
-    """
-    Минимальный observe: периодически печатаем таймштамп и последнюю цену.
-    """
     http_retries = _as_int(getattr(args, "http_retries", None), 2)
     http_backoff = _as_float(getattr(args, "http_backoff", None), 0.5)
     poll_sec = _as_float(getattr(args, "poll_sec", None), 10.0)
 
-    logger.info(
-        "[live] observe %s %s strategy=%s params=%s poll=%ss",
-        args.pair,
-        args.candles,
-        args.strategy,
-        json.dumps(_params_from_args(args), ensure_ascii=False),
-        int(poll_sec),
-    )
+    logger.info("[live] observe %s %s strategy=%s params=%s poll=%ss",
+                args.pair, args.candles, args.strategy,
+                json.dumps(_params_from_args(args), ensure_ascii=False),
+                int(poll_sec))
     if getattr(args, "summary_alert", False):
         logger.debug("[live] summary-alert flag accepted (no-op notifier).")
 
     try:
         while True:
-            df = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
-            if not df.empty:
-                last = df.iloc[-1]
-                t_raw = int(last.get("ts", last.get("t", 0)))
-                t_iso = datetime.fromtimestamp(_ts_seconds(t_raw), tz=timezone.utc).isoformat()
-                logger.info("[live] %s close=%.6f", t_iso, float(last["close"]))
+            try:
+                df = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
+                if not df.empty:
+                    last = df.iloc[-1]
+                    t_iso = datetime.fromtimestamp(_ts_seconds(int(last["ts"])), tz=timezone.utc).isoformat()
+                    logger.info("[live] %s close=%.6f", t_iso, float(last["close"]))
+                else:
+                    logger.warning("[live] got empty data batch")
+            except Exception as e:
+                logger.warning("[live] fetch error: %s", e)
             time.sleep(poll_sec)
     except KeyboardInterrupt:
         logger.info("[live] stop by user")
@@ -540,23 +613,22 @@ def _run_live_paper(args: argparse.Namespace) -> int:
 
     try:
         while True:
-            df = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
-            if not df.empty:
-                last = df.iloc[-1]
-                ts = _ts_seconds(int(last["ts"]))
-                price = float(last["close"])
-                equity_rows.append(
-                    {"ts": ts, "equity": balance, "price": price, "fee_bps": fee_bps, "slip_bps": slip_bps}
-                )
-                logger.info(
-                    "[live:paper] %s close=%.6f sig=+0",
-                    datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
-                    price,
-                )
-
-                # периодически сохраняем
-                if len(equity_rows) % 6 == 0 and equity_csv:
-                    pd.DataFrame(equity_rows).to_csv(equity_csv, index=False)
+            try:
+                df = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
+                if not df.empty:
+                    last = df.iloc[-1]
+                    ts = _ts_seconds(int(last["ts"]))
+                    price = float(last["close"])
+                    equity_rows.append({"ts": ts, "equity": balance, "price": price,
+                                        "fee_bps": fee_bps, "slip_bps": slip_bps})
+                    logger.info("[live:paper] %s close=%.6f sig=+0",
+                                datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(), price)
+                    if len(equity_rows) % 6 == 0 and equity_csv:
+                        pd.DataFrame(equity_rows).to_csv(equity_csv, index=False)
+                else:
+                    logger.warning("[live:paper] got empty data batch")
+            except Exception as e:
+                logger.warning("[live:paper] fetch error: %s", e)
             time.sleep(poll_sec)
     except KeyboardInterrupt:
         logger.info("[live:paper] stop by user")
@@ -578,7 +650,7 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # Глобальные опции (мы их дополнительно «подхватываем» из любого места в _run_cli)
+    # Глобальные опции
     parser.add_argument("--pair", default="DOGE_EUR", help="EXMO symbol, e.g. DOGE_EUR")
     parser.add_argument("--candles", default="5m:2000", help="timeframe:bars, e.g. 5m:2000")
     parser.add_argument("--fee-bps", dest="fee_bps", type=int, default=0, help="commission in bps (1/100 of percent)")
