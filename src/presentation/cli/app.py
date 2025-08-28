@@ -10,9 +10,9 @@ EXMO research & live CLI.
   - walk-forward  : walk-forward валидация
   - trade-live    : observe / paper режимы
 
-Требует модуль selector:
+Ожидается модуль селектора:
   src.application.research.selector
-    (sweep / optimize / robustness / walk_forward / load_grid_json / available_strategies)
+    (sweep / optimize / robustness / walk_forward / available_strategies / ...)
 """
 
 from __future__ import annotations
@@ -23,17 +23,17 @@ import os
 import sys
 import time
 import logging
+import inspect
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 
-# Внешнее HTTP (EXMO)
 import urllib3
 import pandas as pd
 
 # Наш селектор (единая точка алгоритмики)
 try:
     from src.application.research import selector as sel
-except Exception:  # noqa: BLE001 - хотим понятную ошибку пользователю
+except Exception:  # хотим понятную ошибку пользователю на раннем этапе
     sel = None  # type: ignore
 
 # ----------------------------- Логи -----------------------------
@@ -48,10 +48,8 @@ def _configure_logging(debug: bool = False) -> None:
         format="%(asctime)s %(levelname)s [cli] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    # как в логах пользователя — подробный urllib3 только в debug
     if debug:
-        for noisy in ("urllib3",):
-            logging.getLogger(noisy).setLevel(logging.DEBUG)
+        logging.getLogger("urllib3").setLevel(logging.DEBUG)
     else:
         logging.getLogger("urllib3").setLevel(logging.WARNING)
 
@@ -73,8 +71,33 @@ AUTO_STRATEGIES: List[str] = [
     "roc",
 ]
 
-
 # ----------------------------- Утилиты -----------------------------
+
+def _as_int(val, default=0) -> int:
+    try:
+        return int(val) if val is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(val, default=0.0) -> float:
+    try:
+        return float(val) if val is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _ts_seconds(any_ts: int) -> int:
+    """
+    Приводим timestamp к секундам. Если прилетели миллисекунды/микросекунды —
+    аккуратно делим на 1000.
+    """
+    t = int(any_ts)
+    # > 1e11 — это уже мс/мкс (сейчас ~1.7e9 сек)
+    if t > 10 ** 11:
+        t //= 1000
+    return t
+
 
 def _minutes_from_tf(tf: str) -> int:
     """'1m' -> 1, '5m' -> 5, '15m' -> 15, '1h'/'60m' -> 60."""
@@ -83,7 +106,7 @@ def _minutes_from_tf(tf: str) -> int:
         return int(tf[:-1])
     if tf.endswith("h"):
         return int(tf[:-1]) * 60
-    # допустим "60" или "60m"
+    # допустим "60" без суффикса
     return int(tf)
 
 
@@ -130,14 +153,15 @@ def _fetch_exmo_ohlc(pair: str, candles_spec: str, http_retries: int, http_backo
 
     logger.debug("Starting new HTTPS connection (1): api.exmo.com:443")
     r = http.request("GET", url)
-    logger.debug('https://api.exmo.com:443 "GET %s HTTP/1.1" %s %s', url.replace("https://api.exmo.com", ""), r.status, "None")
+    logger.debug('https://api.exmo.com:443 "GET %s HTTP/1.1" %s %s',
+                 url.replace("https://api.exmo.com", ""), r.status, "None")
 
     if r.status != 200:
         raise RuntimeError(f"EXMO HTTP {r.status}")
 
     try:
         payload = json.loads(r.data.decode("utf-8"))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         raise RuntimeError("EXMO response decode error") from e
 
     if not payload or "candles" not in payload:
@@ -149,7 +173,6 @@ def _fetch_exmo_ohlc(pair: str, candles_spec: str, http_retries: int, http_backo
         return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
 
     df = pd.DataFrame(candles)  # keys: t, o, h, l, c, v
-    # нормализуем
     mapping = {"t": "ts", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}
     df = df.rename(columns=mapping)
     # типы
@@ -212,22 +235,68 @@ def _weights_from_args(_: argparse.Namespace) -> Dict[str, float]:
     }
 
 
-def _selector_invoke(fn_name: str, **call_kwargs: Any) -> Any:
+def _load_grid(path: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    if path == "-":
+        data = sys.stdin.read()
+        return json.loads(data) if data else None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _selector_invoke(func_name: str, **call_kwargs):
+    """
+    Безопасный вызов селекторных функций с автопереназначением имён параметров.
+    Позволяет нам передавать 'metric', а на стороне селектора принимать, например,
+    'metric_name' или 'objective'.
+    """
     if sel is None:
-        raise RuntimeError("Selector module not found: src.application.research.selector")
-    func = getattr(sel, fn_name, None)
-    if func is None:
-        raise RuntimeError(f"Selector.{fn_name} is missing")
-    return func(**call_kwargs)
+        raise RuntimeError("Selector module is not available (src.application.research.selector)")
+
+    func = getattr(sel, func_name)
+    sig = inspect.signature(func)
+    params = sig.parameters
+    has_var_kw = any(p.kind == p.VAR_KEYWORD for p in params.values())
+
+    # Синонимы логических ключей -> возможные имена в целевой функции
+    synonyms = {
+        "metric":      ["metric", "metric_name", "objective", "score", "scorer"],
+        "strategies":  ["strategies", "strategy_names", "strategy_list"],
+        "ohlc":        ["ohlc", "bars", "candles", "data"],
+        "top_n":       ["top_n", "k", "n_top"],
+        "min_trades":  ["min_trades", "min_trs", "min_signals"],
+        "fee_bps":     ["fee_bps", "fee"],
+        "slip_bps":    ["slip_bps", "slip"],
+        "weights":     ["weights", "metric_weights"],
+        # grid передаём как есть, но если автор назвал иначе — подхватится через **kwargs
+    }
+
+    # 1) нормализуем по синонимам
+    normalized: Dict[str, Any] = {}
+    tmp = dict(call_kwargs)
+
+    for logical_key, alias_list in synonyms.items():
+        if logical_key in tmp:
+            val = tmp.pop(logical_key)
+            target = next((a for a in alias_list if a in params), None)
+            if target is not None:
+                normalized[target] = val
+            else:
+                if has_var_kw:
+                    normalized[alias_list[0]] = val
+
+    # 2) докладываем остальные ключи, которые сигнатура понимает (или есть **kwargs)
+    for k, v in tmp.items():
+        if k in params or has_var_kw:
+            normalized[k] = v
+
+    return func(**normalized)
 
 
 # ----------------------------- Печать таблиц -----------------------------
 
 def _print_rows_table(rows: List[Dict[str, Any]], metric: str) -> None:
-    """
-    Ряды от селектора — выводим компактную таблицу.
-    Ожидаем поля: strategy, params, trades, winrate, avg_pnl, total_pnl, max_dd, sharpe, <metric>
-    """
     if not rows:
         logger.info("no results")
         return
@@ -263,21 +332,11 @@ def _save_csv(path: Optional[str], rows: List[Dict[str, Any]]) -> None:
     logger.info("Saved CSV -> %s", path)
 
 
-def _load_grid(path: Optional[str]) -> Optional[Dict[str, Any]]:
-    if not path:
-        return None
-    if path == "-":
-        data = sys.stdin.read()
-        return json.loads(data) if data else None
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
 # ----------------------------- Запуски команд -----------------------------
 
 def _run_sweep(args: argparse.Namespace) -> int:
-    http_retries = int(getattr(args, "http_retries", 2))
-    http_backoff = float(getattr(args, "http_backoff", 0.5))
+    http_retries = _as_int(getattr(args, "http_retries", None), 2)
+    http_backoff = _as_float(getattr(args, "http_backoff", None), 0.5)
     ohlc = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
     if ohlc.empty:
         logger.info("OHLC is empty, nothing to do.")
@@ -288,16 +347,19 @@ def _run_sweep(args: argparse.Namespace) -> int:
         if args.strategies and args.strategies != "auto"
         else AUTO_STRATEGIES
     )
+    grid: Optional[Dict[str, Any]] = _load_grid(getattr(args, "grid_file", None))
 
     results: List[Dict[str, Any]] = _selector_invoke(
         "sweep",
         ohlc=ohlc,
         strategies=strategies,
         metric=args.metric,
+        grid=grid,  # <- обязательный в твоём селекторе
         top_n=int(args.top_n),
         min_trades=int(args.min_trades),
-        fee_bps=int(getattr(args, "fee_bps", 0)),
-        slip_bps=int(getattr(args, "slip_bps", 0)),
+        fee_bps=_as_int(getattr(args, "fee_bps", None), 0),
+        slip_bps=_as_int(getattr(args, "slip_bps", None), 0),
+        weights=_weights_from_args(args),
     )
     _print_rows_table(results, metric=args.metric)
     _save_csv(getattr(args, "csv_results", None), results)
@@ -305,8 +367,8 @@ def _run_sweep(args: argparse.Namespace) -> int:
 
 
 def _run_optimize(args: argparse.Namespace) -> int:
-    http_retries = int(getattr(args, "http_retries", 2))
-    http_backoff = float(getattr(args, "http_backoff", 0.5))
+    http_retries = _as_int(getattr(args, "http_retries", None), 2)
+    http_backoff = _as_float(getattr(args, "http_backoff", None), 0.5)
     ohlc = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
     if ohlc.empty:
         logger.info("OHLC is empty, nothing to do.")
@@ -319,8 +381,8 @@ def _run_optimize(args: argparse.Namespace) -> int:
         metric=args.metric,
         top_n=int(args.top_n),
         min_trades=int(args.min_trades),
-        fee_bps=int(getattr(args, "fee_bps", 0)),
-        slip_bps=int(getattr(args, "slip_bps", 0)),
+        fee_bps=_as_int(getattr(args, "fee_bps", None), 0),
+        slip_bps=_as_int(getattr(args, "slip_bps", None), 0),
     )
     _print_rows_table(results, metric=args.metric)
     _save_csv(getattr(args, "csv_results", None), results)
@@ -328,8 +390,8 @@ def _run_optimize(args: argparse.Namespace) -> int:
 
 
 def _run_robustness(args: argparse.Namespace) -> int:
-    http_retries = int(getattr(args, "http_retries", 2))
-    http_backoff = float(getattr(args, "http_backoff", 0.5))
+    http_retries = _as_int(getattr(args, "http_retries", None), 2)
+    http_backoff = _as_float(getattr(args, "http_backoff", None), 0.5)
     ohlc = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
     if ohlc.empty:
         logger.info("OHLC is empty, nothing to do.")
@@ -341,9 +403,8 @@ def _run_robustness(args: argparse.Namespace) -> int:
     robust_level: Any = getattr(args, "robust_level", "std")
     try:
         if isinstance(robust_level, str):
-            robust_level = robust_level.strip()
-            if robust_level.lower() not in ("std", "lo", "hi"):
-                robust_level = float(robust_level)
+            rl = robust_level.strip().lower()
+            robust_level = rl if rl in ("std", "lo", "hi") else float(robust_level)
         else:
             robust_level = float(robust_level)
     except Exception:
@@ -356,8 +417,8 @@ def _run_robustness(args: argparse.Namespace) -> int:
         params=params if params else None,
         level=robust_level,
         samples=int(getattr(args, "samples", 20)),
-        fee_bps=int(getattr(args, "fee_bps", 0)),
-        slip_bps=int(getattr(args, "slip_bps", 0)),
+        fee_bps=_as_int(getattr(args, "fee_bps", None), 0),
+        slip_bps=_as_int(getattr(args, "slip_bps", None), 0),
     )
 
     if rows:
@@ -372,8 +433,8 @@ def _run_robustness(args: argparse.Namespace) -> int:
 
 
 def _run_walk_forward(args: argparse.Namespace) -> int:
-    http_retries = int(getattr(args, "http_retries", 2))
-    http_backoff = float(getattr(args, "http_backoff", 0.5))
+    http_retries = _as_int(getattr(args, "http_retries", None), 2)
+    http_backoff = _as_float(getattr(args, "http_backoff", None), 0.5)
     ohlc = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
     if ohlc.empty:
         logger.info("OHLC is empty, nothing to do.")
@@ -395,16 +456,18 @@ def _run_walk_forward(args: argparse.Namespace) -> int:
         folds=int(args.wf_folds),
         train_frac=float(args.wf_train_frac),
         grid=grid,
-        fee_bps=int(getattr(args, "fee_bps", 0)),
-        slip_bps=int(getattr(args, "slip_bps", 0)),
+        fee_bps=_as_int(getattr(args, "fee_bps", None), 0),
+        slip_bps=_as_int(getattr(args, "slip_bps", None), 0),
     )
 
     folds = result.get("folds", [])
     agg_trades = sum(int(f.get("trades", 0)) for f in folds) if isinstance(folds, list) else 0
     avg_sharpe = float(result.get("avg_sharpe", 0.0))
     total_pnl = float(result.get("total_pnl", 0.0))
-    logger.info("WF aggregate: folds=%d trades=%d totalPnL=%.6f avgSharpe=%.2f",
-                int(args.wf_folds), agg_trades, total_pnl, avg_sharpe)
+    logger.info(
+        "WF aggregate: folds=%d trades=%d totalPnL=%.6f avgSharpe=%.2f",
+        int(args.wf_folds), agg_trades, total_pnl, avg_sharpe,
+    )
 
     _save_csv(getattr(args, "csv_results", None), folds if isinstance(folds, list) else [])
     return 0
@@ -416,9 +479,9 @@ def _run_live_observe(args: argparse.Namespace) -> int:
     """
     Минимальный observe: периодически печатаем таймштамп и последнюю цену.
     """
-    http_retries = int(getattr(args, "http_retries", 2))
-    http_backoff = float(getattr(args, "http_backoff", 0.5))
-    poll_sec = float(getattr(args, "poll_sec", 10))
+    http_retries = _as_int(getattr(args, "http_retries", None), 2)
+    http_backoff = _as_float(getattr(args, "http_backoff", None), 0.5)
+    poll_sec = _as_float(getattr(args, "poll_sec", None), 10.0)
 
     logger.info(
         "[live] observe %s %s strategy=%s params=%s poll=%ss",
@@ -436,7 +499,8 @@ def _run_live_observe(args: argparse.Namespace) -> int:
             df = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
             if not df.empty:
                 last = df.iloc[-1]
-                t_iso = datetime.fromtimestamp(int(last["ts"]), tz=timezone.utc).isoformat()
+                t_raw = int(last.get("ts", last.get("t", 0)))
+                t_iso = datetime.fromtimestamp(_ts_seconds(t_raw), tz=timezone.utc).isoformat()
                 logger.info("[live] %s close=%.6f", t_iso, float(last["close"]))
             time.sleep(poll_sec)
     except KeyboardInterrupt:
@@ -446,13 +510,13 @@ def _run_live_observe(args: argparse.Namespace) -> int:
 
 def _run_live_paper(args: argparse.Namespace) -> int:
     """
-    Простейший paper: ведём equity=кеш (без сделок), чтобы проверить пайплайн сохранения CSV.
+    Простейший paper: мониторим equity=кеш (без сделок), проверяем пайплайн CSV.
     """
-    http_retries = int(getattr(args, "http_retries", 2))
-    http_backoff = float(getattr(args, "http_backoff", 0.5))
-    poll_sec = float(getattr(args, "poll_sec", 10))
-    fee_bps = int(getattr(args, "fee_bps", 0))
-    slip_bps = int(getattr(args, "slip_bps", 0))
+    http_retries = _as_int(getattr(args, "http_retries", None), 2)
+    http_backoff = _as_float(getattr(args, "http_backoff", None), 0.5)
+    poll_sec = _as_float(getattr(args, "poll_sec", None), 10.0)
+    fee_bps = _as_int(getattr(args, "fee_bps", None), 0)
+    slip_bps = _as_int(getattr(args, "slip_bps", None), 0)
 
     equity_csv = getattr(args, "csv_equity", None)
     trades_csv = getattr(args, "csv_trades", None)
@@ -470,9 +534,7 @@ def _run_live_paper(args: argparse.Namespace) -> int:
     if getattr(args, "summary_alert", False):
         logger.debug("[live:paper] summary-alert flag accepted (no-op notifier).")
 
-    balance = float(getattr(args, "initial_balance", 0.0) or 0.0)
-    if balance <= 0:
-        balance = 1000.0  # дефолтный виртуальный капитал
+    balance = float(getattr(args, "initial_balance", 0.0) or 1000.0)
     equity_rows: List[Dict[str, Any]] = []
     trades_rows: List[Dict[str, Any]] = []
 
@@ -481,11 +543,16 @@ def _run_live_paper(args: argparse.Namespace) -> int:
             df = _fetch_exmo_ohlc(args.pair, args.candles, http_retries, http_backoff)
             if not df.empty:
                 last = df.iloc[-1]
-                ts = int(last["ts"])
+                ts = _ts_seconds(int(last["ts"]))
                 price = float(last["close"])
-                # Без сделок — чисто мониторинг equity
-                equity_rows.append({"ts": ts, "equity": balance, "price": price, "fee_bps": fee_bps, "slip_bps": slip_bps})
-                logger.info("[live:paper] %s close=%.6f sig=+0", datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(), price)
+                equity_rows.append(
+                    {"ts": ts, "equity": balance, "price": price, "fee_bps": fee_bps, "slip_bps": slip_bps}
+                )
+                logger.info(
+                    "[live:paper] %s close=%.6f sig=+0",
+                    datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                    price,
+                )
 
                 # периодически сохраняем
                 if len(equity_rows) % 6 == 0 and equity_csv:
@@ -511,8 +578,7 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # Глобальные опции (для помощи/--help). Фактически мы их парсим предварительно,
-    # см. _run_cli — там разрешаем располагать флаги и до, и после подкоманды.
+    # Глобальные опции (мы их дополнительно «подхватываем» из любого места в _run_cli)
     parser.add_argument("--pair", default="DOGE_EUR", help="EXMO symbol, e.g. DOGE_EUR")
     parser.add_argument("--candles", default="5m:2000", help="timeframe:bars, e.g. 5m:2000")
     parser.add_argument("--fee-bps", dest="fee_bps", type=int, default=0, help="commission in bps (1/100 of percent)")
@@ -537,6 +603,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("sweep", help="strategy sweep")
     p.add_argument("--strategies", default="auto", help="comma separated or 'auto'")
     p.add_argument("--metric", default="score")
+    p.add_argument("--grid-file", dest="grid_file", help="'-' to read JSON from stdin")
     p.add_argument("--top-n", dest="top_n", type=int, default=10)
     p.add_argument("--min-trades", dest="min_trades", type=int, default=1)
     p.add_argument("--csv-results", dest="csv_results")
@@ -638,6 +705,6 @@ def _run_cli(argv: List[str]) -> int:
 if __name__ == "__main__":  # pragma: no cover
     try:
         sys.exit(_run_cli(sys.argv[1:]))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.exception("Fatal: %s", e)
         sys.exit(1)
