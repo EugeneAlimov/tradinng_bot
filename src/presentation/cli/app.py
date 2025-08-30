@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple, cast
 from src.backtest.execution import ExecConfig, enrich_trades_with_costs, pnls_from_trades
+from src.strategies.registry import get_strategy
+
 
 import numpy as np
 import pandas as pd
@@ -406,26 +408,22 @@ def _build_trades_from_signals(
 
 
 def _strategy_ema_adx(df: pd.DataFrame, **params) -> np.ndarray:
-    if df.empty:
-        return np.asarray([], dtype=float)
-    long_on, long_off, *_ = _signals_ema_adx(df, **params)
-    trades, pnls = _build_trades_from_signals(df, long_on, long_off)
+    trades, pnls = get_strategy("ema_adx")(df, **params)
     return pnls
 
 
-def _strategy_ema_adx_trades(df: pd.DataFrame, **params) -> Tuple[List[Dict[str, Any]], np.ndarray]:
-    if df.empty:
-        return [], np.asarray([], dtype=float)
-    long_on, long_off, ema_f, ema_s, adx = _signals_ema_adx(df, **params)
-    return _build_trades_from_signals(df, long_on, long_off, ema_f, ema_s, adx)
+def _strategy_ema_adx_trades(df: pd.DataFrame, **params):
+    return get_strategy("ema_adx")(df, **params)
 
 
 def _strategy_ema_adx_atr(df: pd.DataFrame, **params) -> np.ndarray:
-    return _strategy_ema_adx(df, **params)
+    trades, pnls = get_strategy("ema_adx_atr")(df, **params)
+    return pnls
 
 
-def _strategy_ema_adx_atr_trades(df: pd.DataFrame, **params) -> Tuple[List[Dict[str, Any]], np.ndarray]:
-    return _strategy_ema_adx_trades(df, **params)
+def _strategy_ema_adx_atr_trades(df: pd.DataFrame, **params):
+    return get_strategy("ema_adx_atr")(df, **params)
+
 
 
 # ---------------------------------------------------------------------
