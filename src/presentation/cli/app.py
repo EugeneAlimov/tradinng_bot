@@ -11,52 +11,30 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+import random
 
 import numpy as np
 import pandas as pd
-
-# --- Надёжный импорт HttpClient/HttpConfig с резервом ---
-# Сценарий: в окружении может быть старая версия http_utils без HttpConfig.
-# Тогда мы всё равно подтянем HttpClient, а HttpConfig определим локально.
-try:
-    from src.infrastructure.http.http_utils import HttpClient, HttpConfig  # type: ignore
-except Exception:  # noqa: BLE001
-    import importlib
-    _hu = importlib.import_module("src.infrastructure.http.http_utils")
-    HttpClient = getattr(_hu, "HttpClient")
-    if hasattr(_hu, "HttpConfig"):
-        HttpConfig = getattr(_hu, "HttpConfig")  # type: ignore
-    else:
-        # Локальный дубль, совместимый по полям с HttpClient
-        @dataclass(frozen=True)
-        class HttpConfig:  # type: ignore[no-redef]
-            retries: int = 3
-            backoff: float = 1.0
-            timeout_sec: float = 10.0
-            pool_connections: int = 2
-            pool_maxsize: int = 4
-            jitter_frac: float = 0.25
-            status_forcelist: Tuple[int, ...] = (429, 500, 502, 503, 504)
-            allowed_methods: Tuple[str, ...] = ("GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS")
+import urllib3
+from urllib3.util import Retry, Timeout
 
 LOG = logging.getLogger("cli")
+EXMO_BASE_URL = "https://api.exmo.com"
 
 # =========================
 # ЛОГИРОВАНИЕ
 # =========================
-
 def _setup_logging(debug: bool) -> None:
     level = logging.DEBUG if debug else logging.INFO
     fmt = "%(asctime)s %(levelname)s [cli] %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
     logging.basicConfig(level=level, format=fmt, datefmt=datefmt, force=True)
-    # меньше шума при --debug
+    # меньше шума от urllib3
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # =========================
 # CLI
 # =========================
-
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="tradinng-bot", description="EXMO research & live CLI")
 
@@ -112,26 +90,73 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 # =========================
-# HTTP CLIENT (singleton)
+# ВСТРОЕННЫЙ HTTP (singleton)
 # =========================
+_PM: Optional[urllib3.PoolManager] = None
+_RETRY: Optional[Retry] = None
+_TIMEOUT: Optional[Timeout] = None
 
-_HTTP: Optional[HttpClient] = None
+def _init_http(args: argparse.Namespace) -> None:
+    global _PM, _RETRY, _TIMEOUT
+    if _PM is not None:
+        return
+    retries = int(getattr(args, "http_retries", 3))
+    backoff = float(getattr(args, "http_backoff", 1.0))
+    timeout_sec = float(getattr(args, "http_timeout", 10.0))
 
-def _get_http(args: argparse.Namespace) -> HttpClient:
-    global _HTTP
-    if _HTTP is None:
-        cfg = HttpConfig(
-            retries=int(getattr(args, "http_retries", 3)),
-            backoff=float(getattr(args, "http_backoff", 1.0)),
-            timeout_sec=float(getattr(args, "http_timeout", 10.0)),
-        )
-        _HTTP = HttpClient(cfg)
-    return _HTTP
+    _RETRY = Retry(
+        total=retries,
+        connect=retries,
+        read=retries,
+        redirect=retries,
+        status=retries,
+        backoff_factor=backoff,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods={"GET", "HEAD", "OPTIONS"},
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+    _PM = urllib3.PoolManager(num_pools=4, maxsize=8, retries=False)
+    _TIMEOUT = Timeout(total=timeout_sec)
+
+def _sleep_with_jitter(base_sec: float) -> None:
+    if base_sec <= 0:
+        return
+    time.sleep(base_sec + random.random() * base_sec * 0.25)
+
+def _http_get_json(args: argparse.Namespace, url: str) -> Tuple[int, Optional[Dict[str, Any]]]:
+    """Единый GET JSON поверх встроенного urllib3 с ретраями и джиттером."""
+    _init_http(args)
+    assert _PM and _RETRY and _TIMEOUT
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            LOG.debug("Starting new HTTPS connection (1): api.exmo.com:443")
+            r = _PM.request("GET", url, retries=_RETRY, timeout=_TIMEOUT, preload_content=True)
+            status = int(r.status or 0)
+            text = r.data.decode("utf-8", errors="replace") if r.data else ""
+            if not text:
+                if attempt > (_RETRY.total or 0):
+                    return status, None
+                _sleep_with_jitter(_RETRY.backoff_factor or 0.5)
+                continue
+            try:
+                return status, json.loads(text)
+            except Exception:
+                LOG.warning("JSON parse failed (status=%s): %s...", status, text[:120])
+                return status, None
+        except Exception as e:
+            LOG.warning("Retrying (attempt %s/%s) after error: %s",
+                        attempt, (_RETRY.total or 0) + 1, e)
+            if attempt > (_RETRY.total or 0):
+                LOG.error("Fatal: HTTPSConnectionPool(host='api.exmo.com', port=443): fetch failed (status=0) %s", url)
+                return 0, None
+            _sleep_with_jitter(_RETRY.backoff_factor or 0.5)
 
 # =========================
 # УТИЛИТЫ
 # =========================
-
 def _ensure_out_dir(path: str) -> None:
     try:
         os.makedirs(path, exist_ok=True)
@@ -155,7 +180,6 @@ def _epoch_now() -> int:
 # =========================
 # EXMO OHLC
 # =========================
-
 def _fetch_exmo_ohlc(args: argparse.Namespace, pair: str, candles: str) -> pd.DataFrame:
     """
     Мягкие фейлы: при сетевой ошибке — пустой DataFrame (и предупреждение в лог).
@@ -167,13 +191,11 @@ def _fetch_exmo_ohlc(args: argparse.Namespace, pair: str, candles: str) -> pd.Da
     t_to = now - 1  # отступим от текущего момента
 
     url = (
-        "https://api.exmo.com/v1.1/candles_history"
+        f"{EXMO_BASE_URL}/v1.1/candles_history"
         f"?symbol={pair}&resolution={res_min}&from={t_from}&to={t_to}"
     )
-    http = _get_http(args)
 
-    LOG.debug("Starting new HTTPS connection (1): api.exmo.com:443")
-    status, payload = http.get_json(url)
+    status, payload = _http_get_json(args, url)
     if status != 200 or payload is None:
         LOG.error(
             "Fatal: HTTPSConnectionPool(host='api.exmo.com', port=443): fetch failed (status=%s) %s",
@@ -195,14 +217,12 @@ def _fetch_exmo_ohlc(args: argparse.Namespace, pair: str, candles: str) -> pd.Da
         "v": "volume",
     })
     df = df.sort_values("time").reset_index(drop=True)
-    # timestamp в секундах (по логам)
     df["dt"] = pd.to_datetime(df["time"], unit="s", utc=True)
     return df[["dt", "open", "high", "low", "close", "volume", "time"]]
 
 # =========================
 # ИНДИКАТОРЫ
 # =========================
-
 def _ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
 
@@ -235,7 +255,6 @@ def _dx(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> Tuple
 # =========================
 # ПРОСТОЙ БЭКТЕСТЕР EMA+ADX(+ATR)
 # =========================
-
 @dataclass
 class EmaAdxParams:
     fast: int
@@ -339,7 +358,6 @@ def _empty_metrics() -> Dict[str, Any]:
 # =========================
 # SWEEP
 # =========================
-
 def _sweep_param_grid(strategies: str) -> List[Tuple[str, Dict[str, Any]]]:
     grid: List[Tuple[str, Dict[str, Any]]] = []
     if strategies == "auto":
@@ -395,7 +413,7 @@ def _run_sweep(args: argparse.Namespace) -> int:
     _print_table(view, metric)
 
     _ensure_out_dir(args.out_dir)
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     base = f"sweep_{args.pair}_{args.candles.replace(':','-')}_{ts}"
     try:
         res.to_csv(os.path.join(args.out_dir, base + ".csv"), index=False)
@@ -439,7 +457,6 @@ def _print_table(df: pd.DataFrame, metric: str) -> None:
 # =========================
 # LIVE
 # =========================
-
 def _dispatch_live(args: argparse.Namespace) -> int:
     if args.mode == "paper":
         return _run_live_paper(args)
@@ -481,7 +498,6 @@ def _run_live_paper(args: argparse.Namespace) -> int:
 # =========================
 # STUBS
 # =========================
-
 def _run_optimize_stub(args: argparse.Namespace) -> int:
     LOG.info("Command: optimize (stub) — not implemented yet.")
     return 0
@@ -501,7 +517,6 @@ def _run_walk_forward_stub(args: argparse.Namespace) -> int:
 # =========================
 # ENTRY
 # =========================
-
 def _dispatch_command(args: argparse.Namespace) -> int:
     return args._handler(args)  # type: ignore[attr-defined]
 
