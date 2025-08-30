@@ -1,230 +1,139 @@
+# src/backtest/selector.py
 from __future__ import annotations
 
 import json
-import logging
+import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union, List
+from typing import Any, Dict, List, Sequence
 
-import numpy as np
 import pandas as pd
 
-log = logging.getLogger(__name__)
-
-# Единый порядок колонок для всех выводов отбора
-STANDARD_COLUMNS: List[str] = [
-    "strategy",  # str: имя стратегии (ema_adx, ema_adx_atr, ...)
-    "params",  # str|dict: параметры стратегии, компактный JSON
-    "n_trades",  # int
-    "win_rate",  # float [0..1]
-    "avg_pnl",  # float per-trade avg PnL (в базовой валюте)
-    "total_pnl",  # float total PnL (в базовой валюте)
-    "max_dd",  # float max drawdown (в тех же единицах, что и pnl)
-    "sharpe",  # float
-    "calmar",  # float
-    # Дополнительные (могут отсутствовать)
-    "period_start",  # str|ts
-    "period_end",  # str|ts
-    "train_valid",  # 'train'|'valid'|'full'
-    "notes",  # произвольные заметки
-]
-
-COLUMN_DESCRIPTIONS: Mapping[str, str] = {
-    "strategy": "Strategy id/name.",
-    "params": "Strategy parameters; JSON string or dict.",
-    "n_trades": "Number of closed trades taken in the test window.",
-    "win_rate": "Fraction of profitable trades (0..1).",
-    "avg_pnl": "Average PnL per trade (base currency).",
-    "total_pnl": "Total PnL over the period (base currency).",
-    "max_dd": "Maximum drawdown (same units as PnL).",
-    "sharpe": "Sharpe ratio (annualization depends on upstream calculation).",
-    "calmar": "Calmar ratio (annualization depends on upstream calculation).",
-    "period_start": "Start timestamp of the evaluated period (UTC).",
-    "period_end": "End timestamp of the evaluated period (UTC).",
-    "train_valid": "Which fold/segment the row belongs to: 'train', 'valid', or 'full'.",
-    "notes": "Free-form notes.",
-}
-
-
-def _compact_params(params: Any) -> Any:
-    """
-    Приводим params к компактному и стабильному виду.
-    - dict/list/tuple -> JSON без пробелов с отсортированными ключами
-    - прочее -> str(params) при ошибке сериализации
-    """
-    if isinstance(params, (dict, list, tuple)):
-        try:
-            return json.dumps(params, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-        except Exception:
-            return str(params)
-    return params
-
-
-def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Добавляет недостающие стандартные колонки с NaN и упорядочивает их."""
-    for col in STANDARD_COLUMNS:
-        if col not in df.columns:
-            df[col] = np.nan
-    # Компактный params
-    if "params" in df.columns:
-        df["params"] = df["params"].map(_compact_params)
-    # Типы
-    for c in ["n_trades"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
-    for c in ["win_rate", "avg_pnl", "total_pnl", "max_dd", "sharpe", "calmar"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    # Порядок колонок: сначала стандартные, потом любые прочие
-    other = [c for c in df.columns if c not in STANDARD_COLUMNS]
-    ordered = STANDARD_COLUMNS + other
-    return df[ordered]
-
-
-def _safe_metric_series(df: pd.DataFrame, metric: str) -> pd.Series:
-    """Безопасно получить серию метрики, заполнив отсутствующие -inf для корректной сортировки."""
-    if metric in df.columns:
-        return pd.to_numeric(df[metric], errors="coerce").fillna(-np.inf)
-    log.warning("Метрика '%s' отсутствует в результатах. Сортировка будет по заглушкам.", metric)
-    return pd.Series([-np.inf] * len(df), index=df.index)
+# Единый порядок колонок для табличных результатов
+PREFERRED_COL_ORDER: Sequence[str] = (
+    "strategy", "params",
+    "size", "fees_bps", "slippage_bps",
+    "n_trades", "win_rate", "avg_pnl", "total_pnl", "max_dd", "sharpe", "calmar",
+)
 
 
 @dataclass
 class SelectorConfig:
     metric: str = "sharpe"
-    top_n: int = 10
+    top_n: int = 3
     min_trades: int = 1
-    # Санити: отбрасывать строки, где нет числа по ключевым метрикам
-    dropna_metrics: Tuple[str, ...] = ("n_trades",)
+    # Если None — выбираем направление сортировки автоматически (обычно по убыванию)
+    ascending: bool | None = None
 
 
 class Selector:
     """
-    Единая обвязка для "отбора лучших результатов":
-    - нормализация колонок,
-    - фильтрация по min_trades,
-    - сортировка по метрике,
-    - усечение до top_n,
-    - опциональный дамп схемы колонок (через dump_schema).
+    Единая логика отбора лучших строк по метрике + фильтры.
     """
 
     def __init__(self, cfg: SelectorConfig):
         self.cfg = cfg
 
-    def run(self, results: Union[pd.DataFrame, Sequence[Mapping[str, Any]]]) -> pd.DataFrame:
-        df = self._to_frame(results)
-        if df.empty:
-            return self._finish(df)
+    def run(self, rows: List[Dict[str, Any]]) -> pd.DataFrame:
+        if not rows:
+            return pd.DataFrame(columns=list(PREFERRED_COL_ORDER))
 
-        df = _ensure_columns(df)
+        df = pd.DataFrame(rows)
 
-        # Санити: выбросить None/NaN в ключевых полях
-        if self.cfg.dropna_metrics:
-            for col in self.cfg.dropna_metrics:
-                if col in df.columns:
-                    df = df[df[col].notna()]
+        # Параметры в JSON-строку для стабильного вывода/CSV
+        if "params" in df.columns:
+            df["params"] = df["params"].apply(
+                lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (dict, list)) else x)
 
-        # Фильтр по min_trades
+        # Фильтр по min_trades (если поле присутствует)
         if "n_trades" in df.columns:
-            df = df[(df["n_trades"].fillna(0) >= int(self.cfg.min_trades))]
+            df = df.loc[df["n_trades"].fillna(0).astype(int) >= int(self.cfg.min_trades)].copy()
 
-        # Сортировка по выбранной метрике (desc)
-        metric_ser = _safe_metric_series(df, self.cfg.metric)
-        df = (
-            df.assign(_metric_sort=metric_ser)
-            .sort_values("_metric_sort", ascending=False)
-            .drop(columns=["_metric_sort"])
-        )
-
-        # Усечение
-        if self.cfg.top_n and self.cfg.top_n > 0:
-            df = df.head(int(self.cfg.top_n))
-
-        return self._finish(df)
-
-    @staticmethod
-    def _to_frame(results: Union[pd.DataFrame, Sequence[Mapping[str, Any]]]) -> pd.DataFrame:
-        if results is None:
-            return pd.DataFrame(columns=STANDARD_COLUMNS)
-        if isinstance(results, pd.DataFrame):
-            return results.copy()
-        try:
-            return pd.DataFrame(list(results))
-        except Exception:
-            log.exception("Не удалось привести результаты к DataFrame")
-            return pd.DataFrame(columns=STANDARD_COLUMNS)
-
-    @staticmethod
-    def _finish(df: pd.DataFrame) -> pd.DataFrame:
-        # Финальные косметические правки
+        # Если пусто после фильтра — вернуть пустую таблицу, но с заголовками
         if df.empty:
-            return df
-        for col, nd in [
-            ("win_rate", 4),
-            ("avg_pnl", 6),
-            ("total_pnl", 6),
-            ("max_dd", 6),
-            ("sharpe", 4),
-            ("calmar", 4),
-        ]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").round(nd)
-        return df.reset_index(drop=True)
+            return pd.DataFrame(columns=self._ordered_cols(df))
+
+        # Определяем направление сортировки
+        asc = self._choose_ascending(df, self.cfg.metric, self.cfg.ascending)
+
+        # Если метрика отсутствует — не падаем, просто не сортируем
+        if self.cfg.metric in df.columns:
+            df = df.sort_values(self.cfg.metric, ascending=asc, kind="mergesort")  # стабильная сортировка
+
+        # Обрезаем top_n
+        df = df.head(int(self.cfg.top_n)).reset_index(drop=True)
+
+        # Переупорядочиваем колонки
+        cols = self._ordered_cols(df)
+        return df.loc[:, cols]
+
+    @staticmethod
+    def _choose_ascending(_df: pd.DataFrame, metric: str, user_flag: bool | None) -> bool:
+        if user_flag is not None:
+            return bool(user_flag)
+        m = str(metric).lower()
+        # Для метрик вида "loss"/RMSE/MSE/MAE — меньше лучше → сортируем по возрастанию.
+        if m in {"loss", "rmse", "mse", "mae"}:
+            return True
+
+        # В остальных случаях (sharpe, calmar, win_rate, total_pnl, max_dd<=0 и т.д.)
+        # больше лучше → сортируем по убыванию.
+        return False
+
+    @staticmethod
+    def _ordered_cols(df: pd.DataFrame) -> List[str]:
+        pref = [c for c in PREFERRED_COL_ORDER if c in df.columns]
+        rest = [c for c in df.columns if c not in pref]
+        return pref + rest
 
 
-def dump_schema(df: pd.DataFrame, out_path: Union[str, Path]) -> Path:
+# ---------------------------- Артефакты ---------------------------- #
+
+_TS_FMT = "%Y%m%d_%H%M%S"
+_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _utc_now_str() -> str:
+    return datetime.now(timezone.utc).strftime(_TS_FMT)
+
+
+def _sanitize(s: str) -> str:
+    return _SANITIZE_RE.sub("_", s.strip())
+
+
+def make_artifact_path(out_dir: str, out_prefix: str, pair: str, candles: str, stem: str, ext: str) -> str:
     """
-    Сохраняет JSON со схемой колонок: имя, dtype, описание.
-    Возвращает путь к файлу.
+    Единый формат имени файла:
+      {out_dir}/{out_prefix}{pair}_{candles}_{stem}_{UTC}.ext
+    Папка создаётся при необходимости.
     """
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
+    prefix = f"{_sanitize(out_prefix)}_" if out_prefix else ""
+    fname = f"{prefix}{_sanitize(pair)}_{_sanitize(candles)}_{_sanitize(stem)}_{_utc_now_str()}.{_sanitize(ext)}"
+    return os.path.join(out_dir, fname)
 
-    def dtype_to_str(dt: Any) -> str:
-        try:
-            return str(pd.Series([], dtype=dt).dtype)
-        except Exception:
-            return str(dt)
 
-    schema = []
-    for col in df.columns:
-        dtype = dtype_to_str(df[col].dtype if col in df.columns else "object")
-        schema.append({
-            "name": col,
-            "dtype": dtype,
-            "description": COLUMN_DESCRIPTIONS.get(col, ""),
-        })
-
-    payload = {
-        "generated_utc": datetime.now(timezone.utc).isoformat(),
-        "columns": schema,
-        "standard_order": STANDARD_COLUMNS,
+def dump_schema(df: pd.DataFrame, path: str) -> None:
+    """
+    Сохраняет JSON-схему результата для downstream-инструментов:
+      - фиксированный порядок и типы колонок
+      - версию схемы
+      - отметку времени UTC
+    """
+    schema = {
+        "schema_version": "1.0",
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "columns": [
+            {
+                "name": str(col),
+                "dtype": str(df[col].dtype) if col in df.columns else "unknown",
+            }
+            for col in df.columns
+        ],
+        "preferred_order": list(PREFERRED_COL_ORDER),
+        "primary_metric": getattr(df, "primary_metric", None),
+        "rows": int(df.shape[0]),
     }
-
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-    log.info("Schema dumped to %s", out_path)
-    return out_path
-
-
-def make_artifact_path(
-        out_dir: Union[str, Path],
-        out_prefix: Optional[str],
-        pair: str,
-        candles: str,
-        suffix: str,
-        ext: str,
-        utc_now: Optional[datetime] = None,
-) -> Path:
-    """
-    Унифицированный конструктор имени артефакта:
-    out/data/{prefix_}{pair}_{candles}_{YYYYmmddTHHMMSSZ}_{suffix}.{ext}
-    """
-    out_dir = Path(out_dir or "out/data")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ts = (utc_now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
-    prefix = (out_prefix + "_") if out_prefix else ""
-    filename = f"{prefix}{pair}_{candles}_{ts}_{suffix}.{ext}".replace("/", "-")
-    return out_dir / filename
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(schema, ensure_ascii=False, indent=2))
