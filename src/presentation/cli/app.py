@@ -21,6 +21,7 @@ from urllib3.util import Retry, Timeout
 LOG = logging.getLogger("cli")
 EXMO_BASE_URL = "https://api.exmo.com"
 
+
 # =========================
 # ЛОГИРОВАНИЕ
 # =========================
@@ -29,8 +30,8 @@ def _setup_logging(debug: bool) -> None:
     fmt = "%(asctime)s %(levelname)s [cli] %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
     logging.basicConfig(level=level, format=fmt, datefmt=datefmt, force=True)
-    # меньше шума от urllib3
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+
 
 # =========================
 # CLI
@@ -89,12 +90,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     return p
 
+
 # =========================
 # ВСТРОЕННЫЙ HTTP (singleton)
 # =========================
 _PM: Optional[urllib3.PoolManager] = None
 _RETRY: Optional[Retry] = None
 _TIMEOUT: Optional[Timeout] = None
+
 
 def _init_http(args: argparse.Namespace) -> None:
     global _PM, _RETRY, _TIMEOUT
@@ -119,10 +122,12 @@ def _init_http(args: argparse.Namespace) -> None:
     _PM = urllib3.PoolManager(num_pools=4, maxsize=8, retries=False)
     _TIMEOUT = Timeout(total=timeout_sec)
 
+
 def _sleep_with_jitter(base_sec: float) -> None:
     if base_sec <= 0:
         return
     time.sleep(base_sec + random.random() * base_sec * 0.25)
+
 
 def _http_get_json(args: argparse.Namespace, url: str) -> Tuple[int, Optional[Dict[str, Any]]]:
     """Единый GET JSON поверх встроенного urllib3 с ретраями и джиттером."""
@@ -154,6 +159,7 @@ def _http_get_json(args: argparse.Namespace, url: str) -> Tuple[int, Optional[Di
                 return 0, None
             _sleep_with_jitter(_RETRY.backoff_factor or 0.5)
 
+
 # =========================
 # УТИЛИТЫ
 # =========================
@@ -162,6 +168,7 @@ def _ensure_out_dir(path: str) -> None:
         os.makedirs(path, exist_ok=True)
     except Exception as e:  # noqa: BLE001
         LOG.warning("Cannot create out dir %s: %s", path, e)
+
 
 def _parse_candles_arg(arg: str) -> Tuple[int, int]:
     """
@@ -174,8 +181,26 @@ def _parse_candles_arg(arg: str) -> Tuple[int, int]:
     n = int(bars)
     return res, n
 
+
 def _epoch_now() -> int:
     return int(datetime.now(timezone.utc).timestamp())
+
+
+def _epoch_series_to_seconds(s: pd.Series) -> pd.Series:
+    """
+    Приводим значения времени к секундам эпохи:
+    - если максимум > 1e12 → считаем, что это миллисекунды и делим на 1000;
+    - допускаем строки → to_numeric;
+    - отбрасываем NaN и приводим к int64.
+    """
+    s_num = pd.to_numeric(s, errors="coerce")
+    maxv = float(s_num.max()) if len(s_num) else 0.0
+    if maxv > 1e12:  # миллисекунды
+        s_num = (s_num / 1000.0)
+    # округление вниз безопаснее для таймстемпов
+    s_num = np.floor(s_num).astype("Int64")
+    return s_num.astype("int64", errors="ignore")
+
 
 # =========================
 # EXMO OHLC
@@ -216,15 +241,36 @@ def _fetch_exmo_ohlc(args: argparse.Namespace, pair: str, candles: str) -> pd.Da
         "l": "low",
         "v": "volume",
     })
-    df = df.sort_values("time").reset_index(drop=True)
-    df["dt"] = pd.to_datetime(df["time"], unit="s", utc=True)
+
+    # Нормализуем время → секунды эпохи, затем в UTC
+    if "time" not in df.columns:
+        LOG.warning("No 'time' column in payload, keys=%s", list(df.columns))
+        return pd.DataFrame()
+
+    df["time"] = _epoch_series_to_seconds(df["time"])
+    # конвертируем в datetime с защитой от выходов за диапазон
+    dt = pd.to_datetime(df["time"], unit="s", utc=True, errors="coerce")
+    bad = dt.isna().sum()
+    if bad:
+        LOG.warning("Dropped %d rows with invalid timestamps", int(bad))
+    df["dt"] = dt
+    df = df.dropna(subset=["dt"]).sort_values("time").reset_index(drop=True)
+
+    # Числовые столбцы
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
     return df[["dt", "open", "high", "low", "close", "volume", "time"]]
+
 
 # =========================
 # ИНДИКАТОРЫ
 # =========================
 def _ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
+
 
 def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
     prev_close = close.shift(1)
@@ -233,9 +279,11 @@ def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
     c = (low - prev_close).abs()
     return pd.concat([a, b, c], axis=1).max(axis=1)
 
+
 def _atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
     tr = _true_range(high, low, close)
     return tr.ewm(span=length, adjust=False).mean()
+
 
 def _dx(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
     up = high.diff()
@@ -252,6 +300,7 @@ def _dx(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> Tuple
     adx = dx.ewm(span=length, adjust=False).mean()
     return adx.fillna(0.0), plus_di.fillna(0.0), minus_di.fillna(0.0)
 
+
 # =========================
 # ПРОСТОЙ БЭКТЕСТЕР EMA+ADX(+ATR)
 # =========================
@@ -265,6 +314,7 @@ class EmaAdxParams:
     require_di: bool = True
     atr_len: int = 14
     atr_mult: float = 0.0  # <=0 => без стопа
+
 
 def _backtest_ema_adx(df: pd.DataFrame, p: EmaAdxParams) -> Dict[str, Any]:
     if df.empty or len(df) < max(p.fast, p.slow, p.adx_len) + 5:
@@ -332,7 +382,8 @@ def _backtest_ema_adx(df: pd.DataFrame, p: EmaAdxParams) -> Dict[str, Any]:
     std = float(ret.std(ddof=1)) if len(ret) > 1 else 0.0
     sharpe = (avg_pnl / std) if std > 0 else 0.0
     max_dd = float(dd_min)
-    calmar = (total_pnl / abs(max_dd)) if max_dd < 0 else (math.copysign(math.inf, total_pnl) if total_pnl != 0 else 0.0)
+    calmar = (total_pnl / abs(max_dd)) if max_dd < 0 else (
+        math.copysign(math.inf, total_pnl) if total_pnl != 0 else 0.0)
 
     return {
         "n_trades": int(n_trades),
@@ -343,6 +394,7 @@ def _backtest_ema_adx(df: pd.DataFrame, p: EmaAdxParams) -> Dict[str, Any]:
         "sharpe": round(sharpe, 6),
         "calmar": round(calmar, 6),
     }
+
 
 def _empty_metrics() -> Dict[str, Any]:
     return {
@@ -355,6 +407,7 @@ def _empty_metrics() -> Dict[str, Any]:
         "calmar": 0.0,
     }
 
+
 # =========================
 # SWEEP
 # =========================
@@ -366,6 +419,7 @@ def _sweep_param_grid(strategies: str) -> List[Tuple[str, Dict[str, Any]]]:
         grid.append(("ema_adx_atr", dict(fast=10, slow=26, atr_len=14, atr_mult=2.0, **base)))
         grid.append(("ema_adx_atr", dict(fast=10, slow=26, atr_len=14, atr_mult=2.5, **base)))
     return grid
+
 
 def _strategy_run(name: str, params: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any]:
     if name in ("ema_adx", "ema_adx_atr"):
@@ -381,6 +435,7 @@ def _strategy_run(name: str, params: Dict[str, Any], df: pd.DataFrame) -> Dict[s
         )
         return _backtest_ema_adx(df, p)
     return _empty_metrics()
+
 
 def _run_sweep(args: argparse.Namespace) -> int:
     LOG.info("Command: sweep")
@@ -414,7 +469,7 @@ def _run_sweep(args: argparse.Namespace) -> int:
 
     _ensure_out_dir(args.out_dir)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    base = f"sweep_{args.pair}_{args.candles.replace(':','-')}_{ts}"
+    base = f"sweep_{args.pair}_{args.candles.replace(':', '-')}_{ts}"
     try:
         res.to_csv(os.path.join(args.out_dir, base + ".csv"), index=False)
         with open(os.path.join(args.out_dir, base + ".json"), "w", encoding="utf-8") as f:
@@ -423,6 +478,7 @@ def _run_sweep(args: argparse.Namespace) -> int:
         LOG.warning("Cannot save results into %s: %s", args.out_dir, e)
 
     return 0
+
 
 def _print_table(df: pd.DataFrame, metric: str) -> None:
     cols = [
@@ -442,17 +498,18 @@ def _print_table(df: pd.DataFrame, metric: str) -> None:
     LOG.info("  %s", sep)
     for _, r in df.iterrows():
         line = "  ".join([
-            f"{str(r.get('strategy','')):>10}",
-            f"{str(r.get('params','')):>44}",
-            f"{int(r.get('n_trades',0)):>6}",
-            f"{float(r.get('win_rate',0.0)):>6.3f}",
-            f"{float(r.get('avg_pnl',0.0)):>7.3f}",
-            f"{float(r.get('total_pnl',0.0)):>9.3f}",
-            f"{float(r.get('max_dd',0.0)):>7.3f}",
-            f"{float(r.get('sharpe',0.0)):>7.3f}",
-            f"{float(r.get(metric,0.0)):>{len(metric)}.3f}",
+            f"{str(r.get('strategy', '')):>10}",
+            f"{str(r.get('params', '')):>44}",
+            f"{int(r.get('n_trades', 0)):>6}",
+            f"{float(r.get('win_rate', 0.0)):>6.3f}",
+            f"{float(r.get('avg_pnl', 0.0)):>7.3f}",
+            f"{float(r.get('total_pnl', 0.0)):>9.3f}",
+            f"{float(r.get('max_dd', 0.0)):>7.3f}",
+            f"{float(r.get('sharpe', 0.0)):>7.3f}",
+            f"{float(r.get(metric, 0.0)):>{len(metric)}.3f}",
         ])
         LOG.info("  %s", line)
+
 
 # =========================
 # LIVE
@@ -461,6 +518,7 @@ def _dispatch_live(args: argparse.Namespace) -> int:
     if args.mode == "paper":
         return _run_live_paper(args)
     return _run_live_observe(args)
+
 
 def _run_live_observe(args: argparse.Namespace) -> int:
     LOG.info(
@@ -491,9 +549,11 @@ def _run_live_observe(args: argparse.Namespace) -> int:
         LOG.info("[live] stop by user")
         return 0
 
+
 def _run_live_paper(args: argparse.Namespace) -> int:
     LOG.info("[live] paper mode is not implemented yet (stub).")
     return 0
+
 
 # =========================
 # STUBS
@@ -502,9 +562,11 @@ def _run_optimize_stub(args: argparse.Namespace) -> int:
     LOG.info("Command: optimize (stub) — not implemented yet.")
     return 0
 
+
 def _run_robustness_stub(args: argparse.Namespace) -> int:
     LOG.info("Command: robustness (stub) — not implemented yet.")
     return 0
+
 
 def _run_walk_forward_stub(args: argparse.Namespace) -> int:
     LOG.info(
@@ -514,11 +576,13 @@ def _run_walk_forward_stub(args: argparse.Namespace) -> int:
     )
     return 0
 
+
 # =========================
 # ENTRY
 # =========================
 def _dispatch_command(args: argparse.Namespace) -> int:
     return args._handler(args)  # type: ignore[attr-defined]
+
 
 def _run_cli(argv: List[str]) -> int:
     parser = _build_parser()
@@ -527,8 +591,10 @@ def _run_cli(argv: List[str]) -> int:
     LOG.debug("Logging configured. Level=%s", "DEBUG" if args.debug else "INFO")
     return _dispatch_command(args)
 
+
 def main() -> None:
     sys.exit(_run_cli(sys.argv[1:]))
+
 
 if __name__ == "__main__":
     main()
