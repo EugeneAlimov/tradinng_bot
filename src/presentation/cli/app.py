@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple, cast
+from src.backtest.execution import ExecConfig, enrich_trades_with_costs, pnls_from_trades
 
 import numpy as np
 import pandas as pd
@@ -514,6 +515,17 @@ def _dump_tabular(args, pair: str, candles: str, cmd: str, selected_df: pd.DataF
     dump_schema(selected_df, schema_path)
 
 
+def _reorder_result_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Единый порядок колонок во всех командах."""
+    preferred = [
+        "strategy", "params",
+        "size", "fees_bps", "slippage_bps",
+        "n_trades", "win_rate", "avg_pnl", "total_pnl", "max_dd", "sharpe", "calmar",
+    ]
+    cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
+    return df.loc[:, cols]
+
+
 def _run_sweep(args) -> int:
     LOG.info("Command: sweep")
     df = _fetch_exmo_ohlc(args, args.pair, args.candles)
@@ -525,18 +537,36 @@ def _run_sweep(args) -> int:
         s.strip() for s in args.strategies.split(",") if s.strip()
     ]
 
+    cfg = ExecConfig(
+        size=getattr(args, "size", 1.0),
+        fees_bps=getattr(args, "fees_bps", 0.0),
+        slippage_bps=getattr(args, "slippage_bps", 0.0),
+    )
+
     rows: List[Dict[str, Any]] = []
     for name in strategies:
         if name == "ema_adx":
             params = {"fast": 12, "slow": 21, "adx_len": 14, "on": 25.0, "off": 16.0, "require_di": True}
+            trades, _ = _strategy_ema_adx_trades(df, **params)
         else:
             params = {"fast": 12, "slow": 21, "adx_len": 14, "on": 25.0, "off": 16.0, "require_di": True,
                       "atr_len": 14, "atr_mult": 2.0}
-        pnls = _strategy_ema_adx(df, **params) if name == "ema_adx" else _strategy_ema_adx_atr(df, **params)
+            trades, _ = _strategy_ema_adx_atr_trades(df, **params)
+
+        trades = enrich_trades_with_costs(trades, cfg)
+        pnls = pnls_from_trades(trades, use_net=True)
         met = _compute_metrics(pnls)
-        rows.append({"strategy": name, "params": params, **met})
+        rows.append({
+            "strategy": name,
+            "params": params,
+            "size": cfg.size,
+            "fees_bps": cfg.fees_bps,
+            "slippage_bps": cfg.slippage_bps,
+            **met
+        })
 
     selected = _rows_to_selected(rows, args.metric, args.top_n, args.min_trades)
+    selected = _reorder_result_columns(selected)
     _print_selected(selected)
     _dump_tabular(args, args.pair, args.candles, "sweep", selected)
     return 0
@@ -554,13 +584,32 @@ def _run_optimize(args) -> int:
     if g is None:
         raise ValueError(f"grid for strategy '{args.strategy}' is not provided")
 
+    cfg = ExecConfig(
+        size=getattr(args, "size", 1.0),
+        fees_bps=getattr(args, "fees_bps", 0.0),
+        slippage_bps=getattr(args, "slippage_bps", 0.0),
+    )
+
     rows: List[Dict[str, Any]] = []
     for params in _iter_grid(g):
-        pnls = _strategy_ema_adx(df, **params) if args.strategy == "ema_adx" else _strategy_ema_adx_atr(df, **params)
+        if args.strategy == "ema_adx":
+            trades, _ = _strategy_ema_adx_trades(df, **params)
+        else:
+            trades, _ = _strategy_ema_adx_atr_trades(df, **params)
+        trades = enrich_trades_with_costs(trades, cfg)
+        pnls = pnls_from_trades(trades, use_net=True)
         met = _compute_metrics(pnls)
-        rows.append({"strategy": args.strategy, "params": params, **met})
+        rows.append({
+            "strategy": args.strategy,
+            "params": params,
+            "size": cfg.size,
+            "fees_bps": cfg.fees_bps,
+            "slippage_bps": cfg.slippage_bps,
+            **met
+        })
 
     selected = _rows_to_selected(rows, args.metric, args.top_n, args.min_trades)
+    selected = _reorder_result_columns(selected)
     _print_selected(selected)
     _dump_tabular(args, args.pair, args.candles, "optimize", selected)
     return 0
@@ -589,18 +638,35 @@ def _run_robustness(args) -> int:
         base_params["atr_len"] = args.atr_len
         base_params["atr_mult"] = args.atr_mult
 
+    cfg = ExecConfig(
+        size=getattr(args, "size", 1.0),
+        fees_bps=getattr(args, "fees_bps", 0.0),
+        slippage_bps=getattr(args, "slippage_bps", 0.0),
+    )
+
     all_pnls: List[float] = []
     for win in splits:
         if win.empty:
             continue
-        pnls = _strategy_ema_adx(win, **base_params) if strat == "ema_adx" else _strategy_ema_adx_atr(win,
-                                                                                                      **base_params)
-        all_pnls.extend(list(pnls))
+        if strat == "ema_adx":
+            trades, _ = _strategy_ema_adx_trades(win, **base_params)
+        else:
+            trades, _ = _strategy_ema_adx_atr_trades(win, **base_params)
+        trades = enrich_trades_with_costs(trades, cfg)
+        pnls_win = pnls_from_trades(trades, use_net=True)
+        all_pnls.extend(list(pnls_win))
 
     met = _compute_metrics(np.asarray(all_pnls, dtype=float))
-    row = {"strategy": strat,
-           "params": {**base_params, **({"atr_len": 14, "atr_mult": 0.0} if strat == "ema_adx" else {})}, **met}
+    row = {
+        "strategy": strat,
+        "params": {**base_params, **({"atr_len": 14, "atr_mult": 0.0} if strat == "ema_adx" else {})},
+        "size": cfg.size,
+        "fees_bps": cfg.fees_bps,
+        "slippage_bps": cfg.slippage_bps,
+        **met
+    }
     selected = _rows_to_selected([row], "sharpe", 1, args.min_trades)
+    selected = _reorder_result_columns(selected)
     _print_selected(selected)
     _dump_tabular(args, args.pair, args.candles, "robustness", selected)
     return 0
@@ -624,6 +690,12 @@ def _run_walk_forward(args) -> int:
     if grid_for is None:
         raise ValueError(f"grid for strategy '{args.strategy}' is not provided")
 
+    cfg = ExecConfig(
+        size=getattr(args, "size", 1.0),
+        fees_bps=getattr(args, "fees_bps", 0.0),
+        slippage_bps=getattr(args, "slippage_bps", 0.0),
+    )
+
     all_valid_pnls: List[float] = []
 
     for fold in parts:
@@ -636,12 +708,25 @@ def _run_walk_forward(args) -> int:
         if valid.empty or train.empty:
             continue
 
+        # поиск лучших параметров на train
         cand_rows: List[Dict[str, Any]] = []
         for params in _iter_grid(grid_for):
-            pnls = _strategy_ema_adx(train, **params) if args.strategy == "ema_adx" else _strategy_ema_adx_atr(train,
-                                                                                                               **params)
-            met = _compute_metrics(pnls)
-            cand_rows.append({"strategy": args.strategy, "params": params, **met})
+            if args.strategy == "ema_adx":
+                trades_tr, _ = _strategy_ema_adx_trades(train, **params)
+            else:
+                trades_tr, _ = _strategy_ema_adx_atr_trades(train, **params)
+            trades_tr = enrich_trades_with_costs(trades_tr, cfg)
+            pnls_tr = pnls_from_trades(trades_tr, use_net=True)
+            met = _compute_metrics(pnls_tr)
+            cand_rows.append({
+                "strategy": args.strategy,
+                "params": params,
+                "size": cfg.size,
+                "fees_bps": cfg.fees_bps,
+                "slippage_bps": cfg.slippage_bps,
+                **met
+            })
+
         selected_train = _rows_to_selected(cand_rows, args.metric, 1, args.min_trades)
         if selected_train.empty:
             continue
@@ -649,8 +734,13 @@ def _run_walk_forward(args) -> int:
         if isinstance(best_params, str):
             best_params = json.loads(best_params)
 
-        pnls_valid = _strategy_ema_adx(valid, **best_params) if args.strategy == "ema_adx" else _strategy_ema_adx_atr(
-            valid, **best_params)
+        # валидация на valid
+        if args.strategy == "ema_adx":
+            trades_v, _ = _strategy_ema_adx_trades(valid, **best_params)
+        else:
+            trades_v, _ = _strategy_ema_adx_atr_trades(valid, **best_params)
+        trades_v = enrich_trades_with_costs(trades_v, cfg)
+        pnls_valid = pnls_from_trades(trades_v, use_net=True)
         all_valid_pnls.extend(list(pnls_valid))
 
     if not all_valid_pnls:
@@ -661,9 +751,13 @@ def _run_walk_forward(args) -> int:
     out = {
         "strategy": args.strategy,
         "params": f"<wf best per fold from {folds} folds>",
+        "size": cfg.size,
+        "fees_bps": cfg.fees_bps,
+        "slippage_bps": cfg.slippage_bps,
         **met,
     }
     selected = _rows_to_selected([out], args.metric, 1, args.min_trades)
+    selected = _reorder_result_columns(selected)
     _print_selected(selected)
     _dump_tabular(args, args.pair, args.candles, "walk-forward", selected)
     return 0
@@ -713,15 +807,28 @@ def _run_live_paper(args) -> int:
         base_params["atr_len"] = args.atr_len
         base_params["atr_mult"] = args.atr_mult
 
+    # строим сделки по стратегии
     if args.strategy == "ema_adx":
-        trades, pnls = _strategy_ema_adx_trades(df, **base_params)
+        trades, _ = _strategy_ema_adx_trades(df, **base_params)
         params_for_log = {**base_params, "atr_len": 14, "atr_mult": 0.0}
     else:
-        trades, pnls = _strategy_ema_adx_atr_trades(df, **base_params)
+        trades, _ = _strategy_ema_adx_atr_trades(df, **base_params)
         params_for_log = dict(base_params)
 
+    # применяем исполнение (fees/slippage/size)
+    cfg = ExecConfig(size=args.size, fees_bps=args.fees_bps, slippage_bps=args.slippage_bps)
+    trades = enrich_trades_with_costs(trades, cfg)
+    pnls = pnls_from_trades(trades, use_net=True)
+
     met = _compute_metrics(pnls)
-    row = {"strategy": args.strategy, "params": params_for_log, **met}
+    row = {
+        "strategy": args.strategy,
+        "params": params_for_log,
+        "size": cfg.size,
+        "fees_bps": cfg.fees_bps,
+        "slippage_bps": cfg.slippage_bps,
+        **met
+    }
     LOG.info("[paper] trades=%s total_pnl=%.6f sharpe=%.3f", met["n_trades"], met["total_pnl"], met["sharpe"])
 
     _dump_live_artifacts(args, args.pair, args.candles, row, trades, pnls)
@@ -764,6 +871,7 @@ def _dump_live_artifacts(
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="tradinng-bot", description="EXMO research & live CLI")
 
+    # === Глобальные настройки (идут ДО подкоманды) ===
     p.add_argument("--pair", type=str, default="DOGE_EUR", help="EXMO symbol, e.g. DOGE_EUR")
     p.add_argument("--candles", type=str, default="5m:2000", help="timeframe:bars, e.g. 5m:2000")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
@@ -771,12 +879,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out-prefix", type=str, default="", help="Filename prefix for artifacts (optional)")
     p.add_argument("--jsonl", action="store_true", help="Also save JSONL where applicable")
 
+    # HTTP
     p.add_argument("--http-retries", type=int, default=3, help="HTTP retries")
     p.add_argument("--http-backoff", type=float, default=1.0, help="HTTP backoff factor")
     p.add_argument("--http-timeout", type=float, default=15.0, help="HTTP timeout seconds")
 
+    # Execution (глобально для единообразия расчётов во всех командах)
+    p.add_argument("--fees-bps", type=float, default=0.0, help="Fee in basis points (e.g., 25 = 0.25%)")
+    p.add_argument("--slippage-bps", type=float, default=0.0, help="Slippage in basis points per side")
+    p.add_argument("--size", type=float, default=1.0, help="Position size in base units")
+
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    # === sweep ===
     sp = sub.add_parser("sweep", help="Quick strategies sweep")
     sp.add_argument("--strategies", type=str, default="auto", help="auto or comma list")
     sp.add_argument("--metric", type=str, default="sharpe", help="Sort metric")
@@ -784,6 +899,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--min-trades", type=int, default=1, help="Filter min trades")
     sp.set_defaults(_handler=_run_sweep)
 
+    # === optimize ===
     op = sub.add_parser("optimize", help="Grid search params")
     op.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
     op.add_argument("--metric", type=str, default="sharpe")
@@ -792,6 +908,7 @@ def _build_parser() -> argparse.ArgumentParser:
     op.add_argument("--grid-file", type=str, default="", help="JSON file with grid or '-' for stdin")
     op.set_defaults(_handler=_run_optimize)
 
+    # === robustness ===
     rb = sub.add_parser("robustness", help="Robustness by windows")
     rb.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
     rb.add_argument("--rb-windows", type=int, default=6)
@@ -806,6 +923,7 @@ def _build_parser() -> argparse.ArgumentParser:
     rb.add_argument("--atr-mult", type=float, dest="atr_mult", default=2.0)
     rb.set_defaults(_handler=_run_robustness)
 
+    # === walk-forward ===
     wf = sub.add_parser("walk-forward", help="Walk-forward validation")
     wf.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
     wf.add_argument("--metric", type=str, default="sharpe")
@@ -815,6 +933,7 @@ def _build_parser() -> argparse.ArgumentParser:
     wf.add_argument("--grid-file", type=str, default="", help="JSON file with grid or '-' for stdin")
     wf.set_defaults(_handler=_run_walk_forward)
 
+    # === trade-live ===
     tl = sub.add_parser("trade-live", help="Live modes")
     tl.add_argument("--mode", type=str, required=True, choices=["observe", "paper"])
     tl.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
@@ -826,11 +945,10 @@ def _build_parser() -> argparse.ArgumentParser:
     tl.add_argument("--require-di", action="store_true", dest="require_di")
     tl.add_argument("--atr-len", type=int, dest="atr_len", default=14)
     tl.add_argument("--atr-mult", type=float, dest="atr_mult", default=2.0)
+    # observe only
     tl.add_argument("--poll-sec", type=int, default=10)
     tl.add_argument("--summary-alert", action="store_true")
-    tl.add_argument("--fees-bps", type=float, default=0.0)
-    tl.add_argument("--slippage-bps", type=float, default=0.0)
-    tl.add_argument("--size", type=float, default=1.0)
+    # ВАЖНО: fees/slippage/size теперь глобальные — не дублируем в подкоманде
     tl.set_defaults(_handler=_dispatch_live)
 
     return p
