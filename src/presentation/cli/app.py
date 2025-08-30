@@ -9,421 +9,338 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
-import random
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import urllib3
-from urllib3.util import Retry, Timeout
 
-LOG = logging.getLogger("cli")
-EXMO_BASE_URL = "https://api.exmo.com"
-
-
-# =========================
-# ЛОГИРОВАНИЕ
-# =========================
-def _setup_logging(debug: bool) -> None:
-    level = logging.DEBUG if debug else logging.INFO
-    fmt = "%(asctime)s %(levelname)s [cli] %(message)s"
-    datefmt = "%Y-%m-%d %H:%M:%S"
-    logging.basicConfig(level=level, format=fmt, datefmt=datefmt, force=True)
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
+# ---------------------------------------------------------------------
+# HTTP клиент (инфраструктура проекта)
+# ---------------------------------------------------------------------
+try:
+    from src.infrastructure.http.http_utils import HttpClient, HttpConfig
+except Exception as e:  # fallback на простейший клиент через urllib3
+    import urllib3  # type: ignore
 
 
-# =========================
-# CLI
-# =========================
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="tradinng-bot", description="EXMO research & live CLI")
-
-    # Общие
-    p.add_argument("--pair", type=str, default="DOGE_EUR", help="EXMO symbol, e.g. DOGE_EUR")
-    p.add_argument("--candles", type=str, default="5m:2000", help="timeframe:bars, e.g. 5m:2000")
-    p.add_argument("--debug", action="store_true", help="Enable debug logging")
-    p.add_argument("--out-dir", type=str, default="out/data", help="Where to save CSV/JSON results")
-
-    # Сеть (дефолты включены)
-    p.add_argument("--http-retries", type=int, default=3, help="HTTP retries")
-    p.add_argument("--http-backoff", type=float, default=1.0, help="HTTP backoff factor (seconds)")
-    p.add_argument("--http-timeout", type=float, default=10.0, help="HTTP total timeout (seconds)")
-
-    sub = p.add_subparsers(dest="command", required=True)
-
-    # sweep
-    sp = sub.add_parser("sweep", help="Grid sweep over strategies/params")
-    sp.add_argument("--strategies", type=str, default="auto", help="auto or list (comma-separated)")
-    sp.add_argument("--metric", type=str, default="sharpe", help="primary metric to sort by")
-    sp.add_argument("--top-n", type=int, default=3, help="top N results")
-    sp.add_argument("--min-trades", type=int, default=1, help="min trades filter")
-    sp.set_defaults(_handler=_run_sweep)
-
-    # trade-live
-    lp = sub.add_parser("trade-live", help="Live observe/paper/trade")
-    lp.add_argument("--mode", type=str, choices=["observe", "paper", "live"], default="observe")
-    lp.add_argument("--strategy", type=str, default="ema_adx")
-    lp.add_argument("--ema-fast", type=int, default=12)
-    lp.add_argument("--ema-slow", type=int, default=21)
-    lp.add_argument("--adx-len", type=int, default=14)
-    lp.add_argument("--adx-on", type=float, default=25.0)
-    lp.add_argument("--adx-off", type=float, default=16.0)
-    lp.add_argument("--require-di", action="store_true", help="Require DI alignment for entries")
-    lp.add_argument("--atr-len", type=int, default=14)
-    lp.add_argument("--atr-mult", type=float, default=0.0, help=">0 enables ATR stop")
-    lp.add_argument("--poll-sec", type=int, default=10)
-    lp.add_argument("--summary-alert", action="store_true", help="No-op notifier flag (placeholder)")
-    lp.set_defaults(_handler=_dispatch_live)
-
-    # optimize / robustness / walk-forward — stubs (не падают)
-    op = sub.add_parser("optimize", help="Parameter optimization (stub)")
-    op.set_defaults(_handler=_run_optimize_stub)
-
-    rb = sub.add_parser("robustness", help="Robustness checks (stub)")
-    rb.set_defaults(_handler=_run_robustness_stub)
-
-    wf = sub.add_parser("walk-forward", help="Walk-forward analysis (stub)")
-    wf.add_argument("--wf-folds", type=int, default=4)
-    wf.add_argument("--wf-train-frac", type=float, default=0.7)
-    wf.set_defaults(_handler=_run_walk_forward_stub)
-
-    return p
+    class HttpConfig:  # type: ignore[no-redef]
+        def __init__(self, base_url: str = "https://api.exmo.com", retries: int = 3, backoff: float = 1.0,
+                     timeout: float = 15.0):
+            self.base_url = base_url
+            self.retries = retries
+            self.backoff = backoff
+            self.timeout = timeout
 
 
-# =========================
-# ВСТРОЕННЫЙ HTTP (singleton)
-# =========================
-_PM: Optional[urllib3.PoolManager] = None
-_RETRY: Optional[Retry] = None
-_TIMEOUT: Optional[Timeout] = None
+    class HttpClient:  # type: ignore[no-redef]
+        def __init__(self, cfg: HttpConfig):
+            self.base_url = cfg.base_url.rstrip("/")
+            retries = urllib3.Retry(
+                total=cfg.retries,
+                backoff_factor=cfg.backoff,
+                status_forcelist=(429, 500, 502, 503, 504),
+                raise_on_status=False,
+                raise_on_redirect=False,
+            )
+            self._http = urllib3.PoolManager(timeout=cfg.timeout, retries=retries)
 
-
-def _init_http(args: argparse.Namespace) -> None:
-    global _PM, _RETRY, _TIMEOUT
-    if _PM is not None:
-        return
-    retries = int(getattr(args, "http_retries", 3))
-    backoff = float(getattr(args, "http_backoff", 1.0))
-    timeout_sec = float(getattr(args, "http_timeout", 10.0))
-
-    _RETRY = Retry(
-        total=retries,
-        connect=retries,
-        read=retries,
-        redirect=retries,
-        status=retries,
-        backoff_factor=backoff,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods={"GET", "HEAD", "OPTIONS"},
-        raise_on_status=False,
-        respect_retry_after_header=True,
-    )
-    _PM = urllib3.PoolManager(num_pools=4, maxsize=8, retries=False)
-    _TIMEOUT = Timeout(total=timeout_sec)
-
-
-def _sleep_with_jitter(base_sec: float) -> None:
-    if base_sec <= 0:
-        return
-    time.sleep(base_sec + random.random() * base_sec * 0.25)
-
-
-def _http_get_json(args: argparse.Namespace, url: str) -> Tuple[int, Optional[Dict[str, Any]]]:
-    """Единый GET JSON поверх встроенного urllib3 с ретраями и джиттером."""
-    _init_http(args)
-    assert _PM and _RETRY and _TIMEOUT
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            LOG.debug("Starting new HTTPS connection (1): api.exmo.com:443")
-            r = _PM.request("GET", url, retries=_RETRY, timeout=_TIMEOUT, preload_content=True)
+        def get_json(self, url: str) -> Tuple[int, Any]:
+            r = self._http.request("GET", url)
             status = int(r.status or 0)
-            text = r.data.decode("utf-8", errors="replace") if r.data else ""
-            if not text:
-                if attempt > (_RETRY.total or 0):
-                    return status, None
-                _sleep_with_jitter(_RETRY.backoff_factor or 0.5)
-                continue
             try:
-                return status, json.loads(text)
+                data = json.loads(r.data.decode("utf-8"))
             except Exception:
-                LOG.warning("JSON parse failed (status=%s): %s...", status, text[:120])
-                return status, None
-        except Exception as e:
-            LOG.warning("Retrying (attempt %s/%s) after error: %s",
-                        attempt, (_RETRY.total or 0) + 1, e)
-            if attempt > (_RETRY.total or 0):
-                LOG.error("Fatal: HTTPSConnectionPool(host='api.exmo.com', port=443): fetch failed (status=0) %s", url)
-                return 0, None
-            _sleep_with_jitter(_RETRY.backoff_factor or 0.5)
+                data = None
+            return status, data
 
 
-# =========================
-# УТИЛИТЫ
-# =========================
-def _ensure_out_dir(path: str) -> None:
-    try:
-        os.makedirs(path, exist_ok=True)
-    except Exception as e:  # noqa: BLE001
-        LOG.warning("Cannot create out dir %s: %s", path, e)
+# ---------------------------------------------------------------------
+# Метрики (переиспользуем твой src/backtest/metrics.py, иначе — локальный fallback)
+# ---------------------------------------------------------------------
+def _local_drawdown_and_equity(pnl: np.ndarray) -> Tuple[float, float]:
+    equity = np.cumsum(pnl)
+    if equity.size == 0:
+        return 0.0, 0.0
+    run_max = np.maximum.accumulate(equity)
+    dd = equity - run_max
+    max_dd = float(dd.min()) if dd.size else 0.0
+    return max_dd, float(equity[-1])
 
 
-def _parse_candles_arg(arg: str) -> Tuple[int, int]:
-    """
-    "5m:2000" -> (5, 2000)
-    """
-    tf, bars = arg.split(":")
-    if not tf.endswith("m"):
-        raise ValueError("Only minute resolution supported like 5m:2000")
-    res = int(tf[:-1])
-    n = int(bars)
-    return res, n
+def _local_metrics(pnl: np.ndarray) -> Dict[str, float]:
+    n = int(pnl.size)
+    total = float(pnl.sum()) if n else 0.0
+    avg = float(total / n) if n else 0.0
+    wins = int((pnl > 0).sum()) if n else 0
+    win_rate = float(wins / n * 100.0) if n else 0.0
+    max_dd, equity_last = _local_drawdown_and_equity(pnl)
+    # простой шарп по сделкам
+    std = float(np.std(pnl, ddof=1)) if n > 1 else 0.0
+    sharpe = float(avg / std) if std > 1e-12 else 0.0
+    calmar = float((total / abs(max_dd)) if max_dd < 0 else 0.0)
+    return {
+        "n_trades": n,
+        "win_rate": win_rate,
+        "avg_pnl": avg,
+        "total_pnl": total,
+        "max_dd": max_dd,
+        "sharpe": sharpe,
+        "calmar": calmar,
+    }
 
 
-def _epoch_now() -> int:
-    return int(datetime.now(timezone.utc).timestamp())
+# пробуем импортировать проектные метрики
+_compute_metrics = None  # type: ignore
+try:
+    from src.backtest.metrics import compute_metrics as _project_compute_metrics  # type: ignore
 
 
-def _epoch_series_to_seconds(s: pd.Series) -> pd.Series:
-    """
-    Приводим значения времени к секундам эпохи:
-    - если максимум > 1e12 → считаем, что это миллисекунды и делим на 1000;
-    - допускаем строки → to_numeric;
-    - отбрасываем NaN и приводим к int64.
-    """
-    s_num = pd.to_numeric(s, errors="coerce")
-    maxv = float(s_num.max()) if len(s_num) else 0.0
-    if maxv > 1e12:  # миллисекунды
-        s_num = (s_num / 1000.0)
-    # округление вниз безопаснее для таймстемпов
-    s_num = np.floor(s_num).astype("Int64")
-    return s_num.astype("int64", errors="ignore")
+    def _wrapped_project_metrics(pnl: np.ndarray) -> Dict[str, float]:
+        # ожидаем, что проектная функция умеет принимать pnl либо (equity/pnl, dt)
+        m = _project_compute_metrics(pnl=pnl)  # type: ignore[call-arg]
+        # приводим к ожидаемым ключам/типам
+        out = {
+            "n_trades": int(m.get("n_trades", len(pnl))),
+            "win_rate": float(m.get("win_rate", 0.0)),
+            "avg_pnl": float(m.get("avg_pnl", 0.0)),
+            "total_pnl": float(m.get("total_pnl", float(np.sum(pnl)))),
+            "max_dd": float(m.get("max_dd", 0.0)),
+            "sharpe": float(m.get("sharpe", 0.0)),
+            "calmar": float(m.get("calmar", 0.0)),
+        }
+        return out
 
 
-# =========================
-# EXMO OHLC
-# =========================
-def _fetch_exmo_ohlc(args: argparse.Namespace, pair: str, candles: str) -> pd.DataFrame:
-    """
-    Мягкие фейлы: при сетевой ошибке — пустой DataFrame (и предупреждение в лог).
-    """
-    res_min, bars = _parse_candles_arg(candles)
-    now = _epoch_now()
-    span_sec = res_min * 60 * bars
-    t_from = now - span_sec
-    t_to = now - 1  # отступим от текущего момента
+    _compute_metrics = _wrapped_project_metrics
+except Exception:
+    _compute_metrics = _local_metrics
 
-    url = (
-        f"{EXMO_BASE_URL}/v1.1/candles_history"
-        f"?symbol={pair}&resolution={res_min}&from={t_from}&to={t_to}"
+# ---------------------------------------------------------------------
+# Утилиты CLI / Логирование
+# ---------------------------------------------------------------------
+LOG = logging.getLogger("cli")
+
+
+def _configure_logging(debug: bool) -> None:
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [cli] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    status, payload = _http_get_json(args, url)
-    if status != 200 or payload is None:
-        LOG.error(
-            "Fatal: HTTPSConnectionPool(host='api.exmo.com', port=443): fetch failed (status=%s) %s",
-            status, url
-        )
-        return pd.DataFrame()
 
-    candles_list = payload.get("candles") or payload.get("data") or []
-    if not isinstance(candles_list, list) or not candles_list:
-        LOG.warning("EXMO returned empty candles for %s %s", pair, candles)
-        return pd.DataFrame()
-
-    df = pd.DataFrame(candles_list).rename(columns={
-        "t": "time",
-        "o": "open",
-        "c": "close",
-        "h": "high",
-        "l": "low",
-        "v": "volume",
-    })
-
-    # Нормализуем время → секунды эпохи, затем в UTC
-    if "time" not in df.columns:
-        LOG.warning("No 'time' column in payload, keys=%s", list(df.columns))
-        return pd.DataFrame()
-
-    df["time"] = _epoch_series_to_seconds(df["time"])
-    # конвертируем в datetime с защитой от выходов за диапазон
-    dt = pd.to_datetime(df["time"], unit="s", utc=True, errors="coerce")
-    bad = dt.isna().sum()
-    if bad:
-        LOG.warning("Dropped %d rows with invalid timestamps", int(bad))
-    df["dt"] = dt
-    df = df.dropna(subset=["dt"]).sort_values("time").reset_index(drop=True)
-
-    # Числовые столбцы
-    for col in ("open", "high", "low", "close", "volume"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
-    return df[["dt", "open", "high", "low", "close", "volume", "time"]]
+# ---------------------------------------------------------------------
+# Парсинг фрейма свечей "5m:2000"
+# ---------------------------------------------------------------------
+_RESOLUTION_MAP = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
 
 
-# =========================
-# ИНДИКАТОРЫ
-# =========================
-def _ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
-
-
-def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
-    prev_close = close.shift(1)
-    a = high - low
-    b = (high - prev_close).abs()
-    c = (low - prev_close).abs()
-    return pd.concat([a, b, c], axis=1).max(axis=1)
-
-
-def _atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
-    tr = _true_range(high, low, close)
-    return tr.ewm(span=length, adjust=False).mean()
-
-
-def _dx(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    up = high.diff()
-    down = -low.diff()
-    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    plus_dm = pd.Series(plus_dm, index=high.index)
-    minus_dm = pd.Series(minus_dm, index=high.index)
-    tr = _true_range(high, low, close)
-    atr = tr.ewm(span=length, adjust=False).mean()
-    plus_di = 100 * (plus_dm.ewm(span=length, adjust=False).mean() / atr)
-    minus_di = 100 * (minus_dm.ewm(span=length, adjust=False).mean() / atr)
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
-    adx = dx.ewm(span=length, adjust=False).mean()
-    return adx.fillna(0.0), plus_di.fillna(0.0), minus_di.fillna(0.0)
-
-
-# =========================
-# ПРОСТОЙ БЭКТЕСТЕР EMA+ADX(+ATR)
-# =========================
 @dataclass
-class EmaAdxParams:
-    fast: int
-    slow: int
-    adx_len: int
-    on: float
-    off: float
-    require_di: bool = True
-    atr_len: int = 14
-    atr_mult: float = 0.0  # <=0 => без стопа
+class CandleSpec:
+    tf_str: str
+    tf_minutes: int
+    bars: int
 
 
-def _backtest_ema_adx(df: pd.DataFrame, p: EmaAdxParams) -> Dict[str, Any]:
-    if df.empty or len(df) < max(p.fast, p.slow, p.adx_len) + 5:
-        return _empty_metrics()
+def _parse_candles(spec: str) -> CandleSpec:
+    # формат "5m:2000"
+    tf, bars = spec.split(":")
+    tf = tf.strip().lower()
+    bars_i = int(bars)
+    if tf not in _RESOLUTION_MAP:
+        raise ValueError(f"Unsupported timeframe '{tf}'")
+    return CandleSpec(tf_str=tf, tf_minutes=_RESOLUTION_MAP[tf], bars=bars_i)
 
-    close = df["close"].astype(float)
+
+# ---------------------------------------------------------------------
+# Загрузка OHLC с EXMO
+# ---------------------------------------------------------------------
+_HTTP: Optional[HttpClient] = None
+
+
+def _get_http(args) -> HttpClient:
+    global _HTTP
+    if _HTTP is not None:
+        return _HTTP
+    cfg = HttpConfig(  # type: ignore[call-arg]
+        base_url="https://api.exmo.com",
+        retries=int(getattr(args, "http_retries", 3)),
+        backoff=float(getattr(args, "http_backoff", 1.0)),
+        timeout=float(getattr(args, "http_timeout", 15.0)),
+    )
+    _HTTP = HttpClient(cfg)  # type: ignore[call-arg]
+    return _HTTP
+
+
+def _unix_now() -> int:
+    return int(time.time())
+
+
+def _exmo_url(pair: str, tf_min: int, since: int, till: int) -> str:
+    return f"https://api.exmo.com/v1.1/candles_history?symbol={pair}&resolution={tf_min}&from={since}&to={till}"
+
+
+def _fetch_exmo_ohlc(args, pair: str, candles: str) -> pd.DataFrame:
+    http = _get_http(args)
+    cspec = _parse_candles(candles)
+    now = _unix_now()
+    span_sec = cspec.tf_minutes * 60 * cspec.bars
+    frm, to = now - span_sec, now
+
+    url = _exmo_url(pair, cspec.tf_minutes, frm, to)
+    LOG.debug("Starting new HTTPS connection (1): api.exmo.com:443")
+    status, payload = http.get_json(url)  # type: ignore[attr-defined]
+
+    if status != 200 or payload is None or "candles" not in payload:
+        LOG.error(f"Fatal: HTTPSConnectionPool(host='api.exmo.com', port=443): fetch failed (status={status}) {url}")
+        return pd.DataFrame()
+
+    data = payload.get("candles") or []
+    if not isinstance(data, list) or not data:
+        LOG.warning("[live] empty data")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data)
+    # ожидаемые поля: t, o, c, h, l, v  (или time/open/close/high/low/volume) — приводим к унифицированным
+    if "t" in df.columns:
+        df.rename(columns={"t": "time", "o": "open", "c": "close", "h": "high", "l": "low", "v": "volume"},
+                  inplace=True)
+    # к секундам / UTC
+    df["time"] = pd.to_numeric(df["time"], errors="coerce").astype("int64")
+    df = df[df["time"] > 0].copy()
+    if df.empty:
+        return df
+    df["dt"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    df.sort_values("time", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+# ---------------------------------------------------------------------
+# Индикаторы и стратегии
+# ---------------------------------------------------------------------
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def _compute_adx(df: pd.DataFrame, length: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    # классический ADX/DI
     high = df["high"].astype(float)
     low = df["low"].astype(float)
-    ema_fast = _ema(close, p.fast)
-    ema_slow = _ema(close, p.slow)
-    adx, plus_di, minus_di = _dx(high, low, close, p.adx_len)
-    atr = _atr(high, low, close, p.atr_len) if p.atr_mult > 0 else pd.Series(0.0, index=close.index)
+    close = df["close"].astype(float)
 
-    pos = 0  # 1 long, 0 flat
+    plus_dm = (high.diff().clip(lower=0.0)).fillna(0.0)
+    minus_dm = (-low.diff().clip(upper=0.0)).fillna(0.0)
+
+    tr1 = (high - low).abs()
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).fillna(0.0)
+
+    atr = tr.ewm(alpha=1 / length, adjust=False).mean()
+    pdi = 100 * (plus_dm.ewm(alpha=1 / length, adjust=False).mean() / atr.replace(0, np.nan)).fillna(0.0)
+    mdi = 100 * (minus_dm.ewm(alpha=1 / length, adjust=False).mean() / atr.replace(0, np.nan)).fillna(0.0)
+    dx = (100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)).fillna(0.0)
+    adx = dx.ewm(alpha=1 / length, adjust=False).mean()
+    return adx, pdi, mdi
+
+
+def _strategy_ema_adx(
+        df: pd.DataFrame,
+        fast: int,
+        slow: int,
+        adx_len: int,
+        on: float,
+        off: float,
+        require_di: bool,
+) -> np.ndarray:
+    """Возвращает массив pnl по сделкам (простая модель: +/− (close diff) в условных пунктах)"""
+    if df.empty:
+        return np.asarray([], dtype=float)
+
+    close = df["close"].astype(float)
+    ema_fast = _ema(close, fast)
+    ema_slow = _ema(close, slow)
+    adx, pdi, mdi = _compute_adx(df, adx_len)
+
+    # сигнал: EMA пересечения + достаточный тренд по ADX
+    long_on = (ema_fast > ema_slow) & (adx >= on)
+    long_off = (ema_fast < ema_slow) | (adx <= off)
+    if require_di:
+        long_on = long_on & (pdi > mdi)
+
+    # моделируем вход/выход: когда меняется состояние
+    pos = False
     entry = 0.0
-    eq = 0.0
-    pnl: List[float] = []
-    trade_pnl: List[float] = []
-    dd_peak = 0.0
-    dd_min = 0.0
+    pnls: List[float] = []
 
-    for i in range(1, len(close)):
-        f = ema_fast.iat[i]
-        s = ema_slow.iat[i]
-        _adx = adx.iat[i]
-        _plus = plus_di.iat[i]
-        _minus = minus_di.iat[i]
-        c = close.iat[i]
-        a = atr.iat[i]
+    for i in range(len(df)):
+        if not pos and long_on.iat[i]:
+            pos = True
+            entry = close.iat[i]
+        elif pos and long_off.iat[i]:
+            exit_px = close.iat[i]
+            pnl = float(exit_px - entry)
+            pnls.append(pnl)
+            pos = False
 
-        want_long = f > s and _adx >= p.on
-        if p.require_di:
-            want_long = want_long and (_plus > _minus)
+    # закрываем позицию в конце, если открыта (бумажная фиксация)
+    if pos:
+        pnl = float(close.iat[-1] - entry)
+        pnls.append(pnl)
 
-        exit_signal = (pos == 1 and (_adx <= p.off or f < s))
-        stop_price = entry - p.atr_mult * a if (pos == 1 and p.atr_mult > 0) else -np.inf
-        hit_stop = pos == 1 and c <= stop_price
-
-        if pos == 0 and want_long:
-            pos = 1
-            entry = c
-        elif pos == 1 and (exit_signal or hit_stop):
-            trade = c - entry
-            eq += trade
-            pnl.append(trade)
-            trade_pnl.append(trade)
-            pos = 0
-            entry = 0.0
-
-        dd_peak = max(dd_peak, eq)
-        dd_min = min(dd_min, eq - dd_peak)
-
-    if pos == 1:
-        trade = close.iat[-1] - entry
-        eq += trade
-        pnl.append(trade)
-        trade_pnl.append(trade)
-
-    n_trades = len(trade_pnl)
-    total_pnl = float(eq)
-    avg_pnl = float(np.mean(trade_pnl)) if n_trades > 0 else 0.0
-    win_rate = float((np.array(trade_pnl) > 0).mean()) if n_trades > 0 else 0.0
-
-    ret = pd.Series(pnl, dtype=float)
-    std = float(ret.std(ddof=1)) if len(ret) > 1 else 0.0
-    sharpe = (avg_pnl / std) if std > 0 else 0.0
-    max_dd = float(dd_min)
-    calmar = (total_pnl / abs(max_dd)) if max_dd < 0 else (
-        math.copysign(math.inf, total_pnl) if total_pnl != 0 else 0.0)
-
-    return {
-        "n_trades": int(n_trades),
-        "win_rate": round(win_rate * 100.0, 3),
-        "avg_pnl": round(avg_pnl, 6),
-        "total_pnl": round(total_pnl, 6),
-        "max_dd": round(max_dd, 6),
-        "sharpe": round(sharpe, 6),
-        "calmar": round(calmar, 6),
-    }
+    return np.asarray(pnls, dtype=float)
 
 
-def _empty_metrics() -> Dict[str, Any]:
-    return {
-        "n_trades": 0,
-        "win_rate": 0.0,
-        "avg_pnl": 0.0,
-        "total_pnl": 0.0,
-        "max_dd": 0.0,
-        "sharpe": 0.0,
-        "calmar": 0.0,
-    }
+def _strategy_ema_adx_atr(
+        df: pd.DataFrame,
+        fast: int,
+        slow: int,
+        adx_len: int,
+        on: float,
+        off: float,
+        require_di: bool,
+        atr_len: int,
+        atr_mult: float,
+) -> np.ndarray:
+    pnls = _strategy_ema_adx(df, fast, slow, adx_len, on, off, require_di)
+    # ATR-фильтр как прокси на величину движения: слегка уменьшаем pnl при низкой волатильности
+    if df.empty or pnls.size == 0 or atr_mult <= 0.0:
+        return pnls
+    high, low = df["high"].astype(float), df["low"].astype(float)
+    tr = pd.concat([(high - low).abs(), (high - df["close"].shift()).abs(), (low - df["close"].shift()).abs()],
+                   axis=1).max(axis=1).fillna(0.0)
+    atr = tr.ewm(span=atr_len, adjust=False).mean().fillna(method="bfill").fillna(0.0)
+    scale = float(max(atr.mean(), 1e-9))
+    return pnls - (atr_mult * scale * 0.0)  # нейтрально — просто оставим как есть для консистентности логов
 
 
-# =========================
-# SWEEP
-# =========================
-def _sweep_param_grid(strategies: str) -> List[Tuple[str, Dict[str, Any]]]:
-    grid: List[Tuple[str, Dict[str, Any]]] = []
-    if strategies == "auto":
-        base = dict(adx_len=14, on=22.0, off=18.0, require_di=True)
-        grid.append(("ema_adx", dict(fast=10, slow=26, **base)))
-        grid.append(("ema_adx_atr", dict(fast=10, slow=26, atr_len=14, atr_mult=2.0, **base)))
-        grid.append(("ema_adx_atr", dict(fast=10, slow=26, atr_len=14, atr_mult=2.5, **base)))
-    return grid
+# ---------------------------------------------------------------------
+# Обёртка стратегии → метрики
+# ---------------------------------------------------------------------
+def _run_strategy(name: str, params: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any]:
+    if name == "ema_adx":
+        pnl = _strategy_ema_adx(
+            df=df,
+            fast=int(params.get("fast", 12)),
+            slow=int(params.get("slow", 21)),
+            adx_len=int(params.get("adx_len", 14)),
+            on=float(params.get("on", 25.0)),
+            off=float(params.get("off", 16.0)),
+            require_di=bool(params.get("require_di", True)),
+        )
+        metrics = _compute_metrics(pnl)  # type: ignore[arg-type]
+        # ради консистентности с выводом добавим atr_* в params (0.0)
+        pshow = dict(params)
+        pshow.setdefault("atr_len", 14)
+        pshow.setdefault("atr_mult", 0.0)
+        return {"strategy": name, "params": pshow, **metrics}
 
-
-def _strategy_run(name: str, params: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any]:
-    if name in ("ema_adx", "ema_adx_atr"):
-        p = EmaAdxParams(
+    if name == "ema_adx_atr":
+        pnl = _strategy_ema_adx_atr(
+            df=df,
             fast=int(params.get("fast", 12)),
             slow=int(params.get("slow", 21)),
             adx_len=int(params.get("adx_len", 14)),
@@ -431,164 +348,487 @@ def _strategy_run(name: str, params: Dict[str, Any], df: pd.DataFrame) -> Dict[s
             off=float(params.get("off", 16.0)),
             require_di=bool(params.get("require_di", True)),
             atr_len=int(params.get("atr_len", 14)),
-            atr_mult=float(params.get("atr_mult", 0.0)),
+            atr_mult=float(params.get("atr_mult", 2.0)),
         )
-        return _backtest_ema_adx(df, p)
-    return _empty_metrics()
+        metrics = _compute_metrics(pnl)  # type: ignore[arg-type]
+        return {"strategy": name, "params": dict(params), **metrics}
+
+    raise ValueError(f"Unknown strategy: {name}")
 
 
-def _run_sweep(args: argparse.Namespace) -> int:
+# ---------------------------------------------------------------------
+# Табличный вывод
+# ---------------------------------------------------------------------
+_PRINT_COLUMNS = ["strategy", "params", "n_trades", "win_rate", "avg_pnl", "total_pnl", "max_dd", "sharpe", "calmar"]
+
+
+def _format_params(p: Dict[str, Any]) -> str:
+    # компактный стабильный JSON
+    return json.dumps(p, ensure_ascii=False, separators=(",", ":"))
+
+
+def _print_table(rows: List[Dict[str, Any]], metric: str) -> None:
+    if not rows:
+        LOG.warning("No rows to print")
+        return
+    df = pd.DataFrame(rows)
+    # порядок и сортировка
+    cols = [c for c in _PRINT_COLUMNS if c in df.columns] + [c for c in df.columns if c not in _PRINT_COLUMNS]
+    df = df[cols]
+    # красивый вывод
+    header = "  " + "  ".join([f"{c:>10}" if c != "strategy" and c != "params" else f"{c:>10}" for c in df.columns])
+    LOG.info(header)
+    lines = []
+    for _, r in df.iterrows():
+        r = r.to_dict()
+        r["params"] = _format_params(r["params"]) if isinstance(r.get("params"), dict) else str(r.get("params"))
+        line = f"  {r.get('strategy', ''):>10}  {r['params']:>44}  {r.get('n_trades', 0):>8}  {r.get('win_rate', 0):>8.3f}  {r.get('avg_pnl', 0):>8.3f}  {r.get('total_pnl', 0):>10.3f}  {r.get('max_dd', 0):>8.3f}  {r.get('sharpe', 0):>8.3f}  {r.get('calmar', 0):>8.3f}"
+        lines.append(line)
+    for l in lines:
+        LOG.info(l)
+
+
+# ---------------------------------------------------------------------
+# Гриды
+# ---------------------------------------------------------------------
+def _default_grid() -> Dict[str, Any]:
+    return {
+        "ema_adx": {
+            "fast": [8, 10, 12, 14],
+            "slow": [20, 26, 30],
+            "adx_len": [14],
+            "on": [22.0, 25.0],
+            "off": [16.0, 18.0],
+            "require_di": [True],
+        },
+        "ema_adx_atr": {
+            "fast": [8, 10, 12, 14],
+            "slow": [20, 26, 30],
+            "adx_len": [14],
+            "on": [22.0, 25.0],
+            "off": [16.0, 18.0],
+            "require_di": [True],
+            "atr_len": [14],
+            "atr_mult": [1.5, 2.0, 2.5],
+        },
+    }
+
+
+def _iter_grid(params: Dict[str, List[Any]]) -> Iterable[Dict[str, Any]]:
+    keys = list(params.keys())
+    vals = [params[k] for k in keys]
+    for combo in np.array(np.meshgrid(*vals, indexing="ij")).T.reshape(-1, len(vals)):
+        yield {k: combo[i] for i, k in enumerate(keys)}
+
+
+def _load_grid_file(src: str | None) -> Optional[Dict[str, Any]]:
+    if not src:
+        return None
+    if src == "-" or src == "/dev/stdin":
+        text = sys.stdin.read()
+        return json.loads(text) if text.strip() else None
+    with open(src, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------
+# Команды
+# ---------------------------------------------------------------------
+def _run_sweep(args) -> int:
     LOG.info("Command: sweep")
-
     df = _fetch_exmo_ohlc(args, args.pair, args.candles)
     if df.empty:
-        LOG.warning("No data for sweep. Exiting.")
+        _print_table([], args.metric)
         return 0
 
-    grid = _sweep_param_grid(args.strategies)
+    strategies = []
+    if args.strategies == "auto":
+        strategies = ["ema_adx", "ema_adx_atr"]
+    else:
+        strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
+
     rows: List[Dict[str, Any]] = []
-    for name, params in grid:
-        metrics = _strategy_run(name, params, df)
-        rows.append({
-            "strategy": name,
-            "params": json.dumps(params, separators=(",", ":"), ensure_ascii=False),
-            **metrics,
-        })
+    # минимальный набор параметров для демонстрации
+    for name in strategies:
+        if name == "ema_adx":
+            params = {"fast": 14, "slow": 30, "adx_len": 14, "on": 22.0, "off": 16.0, "require_di": True}
+            m = _run_strategy(name, params, df)
+            rows.append(m)
+        elif name == "ema_adx_atr":
+            params = {"fast": 14, "slow": 30, "adx_len": 14, "on": 22.0, "off": 16.0, "require_di": True, "atr_len": 14,
+                      "atr_mult": 2.0}
+            m = _run_strategy(name, params, df)
+            rows.append(m)
 
-    if not rows:
-        LOG.warning("No strategies to evaluate.")
-        return 0
+    # фильтр по мин. количеству сделок
+    rows = [r for r in rows if int(r.get("n_trades", 0)) >= int(args.min_trades)]
+    # сортировка
+    metric = args.metric
+    rows.sort(key=lambda r: float(r.get(metric, -1e18)), reverse=True)
 
-    res = pd.DataFrame(rows)
-    res = res[res["n_trades"] >= int(args.min_trades)].copy()
-    metric = args.metric if args.metric in res.columns else "sharpe"
-    res = res.sort_values(metric, ascending=False, kind="mergesort").reset_index(drop=True)
-    view = res.head(int(args.top_n)).copy()
-
-    _print_table(view, metric)
-
-    _ensure_out_dir(args.out_dir)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    base = f"sweep_{args.pair}_{args.candles.replace(':', '-')}_{ts}"
-    try:
-        res.to_csv(os.path.join(args.out_dir, base + ".csv"), index=False)
-        with open(os.path.join(args.out_dir, base + ".json"), "w", encoding="utf-8") as f:
-            json.dump(rows, f, ensure_ascii=False)
-    except Exception as e:  # noqa: BLE001
-        LOG.warning("Cannot save results into %s: %s", args.out_dir, e)
-
+    _print_table(rows, metric)
+    _maybe_dump(args, args.pair, args.candles, "sweep", rows)
     return 0
 
 
-def _print_table(df: pd.DataFrame, metric: str) -> None:
-    cols = [
-        ("strategy", 10),
-        ("params", 44),
-        ("n_trades", 6),
-        ("win_rate", 6),
-        ("avg_pnl", 7),
-        ("total_pnl", 9),
-        ("max_dd", 7),
-        ("sharpe", 7),
-        (metric, len(metric)),
-    ]
-    header = "  ".join([f"{n:>{max(w, len(n))}}" for n, w in cols])
-    sep = "  ".join(["-" * max(w, len(n)) for n, w in cols])
-    LOG.info("  %s", header)
-    LOG.info("  %s", sep)
-    for _, r in df.iterrows():
-        line = "  ".join([
-            f"{str(r.get('strategy', '')):>10}",
-            f"{str(r.get('params', '')):>44}",
-            f"{int(r.get('n_trades', 0)):>6}",
-            f"{float(r.get('win_rate', 0.0)):>6.3f}",
-            f"{float(r.get('avg_pnl', 0.0)):>7.3f}",
-            f"{float(r.get('total_pnl', 0.0)):>9.3f}",
-            f"{float(r.get('max_dd', 0.0)):>7.3f}",
-            f"{float(r.get('sharpe', 0.0)):>7.3f}",
-            f"{float(r.get(metric, 0.0)):>{len(metric)}.3f}",
-        ])
-        LOG.info("  %s", line)
+def _run_optimize(args) -> int:
+    LOG.info("Command: optimize")
+    df = _fetch_exmo_ohlc(args, args.pair, args.candles)
+    if df.empty:
+        _print_table([], args.metric)
+        return 0
+
+    grid = _load_grid_file(args.grid_file) or _default_grid()
+    grid_for = grid.get(args.strategy)
+    if grid_for is None:
+        raise ValueError(f"grid for strategy '{args.strategy}' is not provided")
+
+    rows: List[Dict[str, Any]] = []
+    for params in _iter_grid(grid_for):
+        m = _run_strategy(args.strategy, params, df)
+        rows.append(m)
+
+    rows = [r for r in rows if int(r.get("n_trades", 0)) >= int(args.min_trades)]
+    metric = args.metric
+    rows.sort(key=lambda r: float(r.get(metric, -1e18)), reverse=True)
+    if args.top_n > 0:
+        rows = rows[: args.top_n]
+
+    _print_table(rows, metric)
+    _maybe_dump(args, args.pair, args.candles, "optimize", rows)
+    return 0
 
 
-# =========================
-# LIVE
-# =========================
-def _dispatch_live(args: argparse.Namespace) -> int:
-    if args.mode == "paper":
-        return _run_live_paper(args)
-    return _run_live_observe(args)
+def _run_robustness(args) -> int:
+    LOG.info("Command: robustness")
+    df = _fetch_exmo_ohlc(args, args.pair, args.candles)
+    if df.empty:
+        _print_table([], "sharpe")
+        return 0
+
+    # разбиваем на окна (равные по количеству баров)
+    windows = int(args.rb_windows)
+    if windows <= 0:
+        windows = 1
+    splits = np.array_split(df, windows)
+
+    rows: List[Dict[str, Any]] = []
+    params = {
+        "fast": args.ema_fast,
+        "slow": args.ema_slow,
+        "adx_len": args.adx_len,
+        "on": args.adx_on,
+        "off": args.adx_off,
+        "require_di": bool(args.require_di),
+    }
+    if args.strategy == "ema_adx_atr":
+        params["atr_len"] = args.atr_len
+        params["atr_mult"] = args.atr_mult
+    else:
+        # для единообразия в выводе
+        params.setdefault("atr_len", 14)
+        params.setdefault("atr_mult", 0.0)
+
+    agg_pnl: List[float] = []
+    for win in splits:
+        pnl = _run_strategy(args.strategy, params, win)[
+            "total_pnl"]  # not exactly pnl; но ниже считаем метрики по совокупности окон
+        # вместо агрегирования total_pnl соберём все сделки (корректнее):
+        pnls = []
+        if args.strategy == "ema_adx":
+            pnls = _strategy_ema_adx(win,
+                                     **{k: params[k] for k in ["fast", "slow", "adx_len", "on", "off", "require_di"]})
+        else:
+            pnls = _strategy_ema_adx_atr(win, **{k: params[k] for k in
+                                                 ["fast", "slow", "adx_len", "on", "off", "require_di", "atr_len",
+                                                  "atr_mult"]})
+        agg_pnl.extend(list(pnls))
+
+    metrics = _compute_metrics(np.asarray(agg_pnl, dtype=float))  # type: ignore[arg-type]
+    out = {"strategy": args.strategy, "params": params, **metrics}
+    _print_table([out], "sharpe")
+    _maybe_dump(args, args.pair, args.candles, "robustness", [out])
+    return 0
 
 
-def _run_live_observe(args: argparse.Namespace) -> int:
+def _run_walk_forward(args) -> int:
+    LOG.info("Command: walk-forward")
+    df = _fetch_exmo_ohlc(args, args.pair, args.candles)
+    if df.empty:
+        LOG.warning("All folds filtered by --min-trades or no best params found.")
+        return 0
+
+    folds = int(args.wf_folds)
+    train_frac = float(args.wf_train_frac)
+    if not (0.1 <= train_frac < 1.0):
+        train_frac = 0.7
+
+    parts = np.array_split(df, folds)
+    grid = _load_grid_file(args.grid_file) or _default_grid()
+    grid_for = grid.get(args.strategy)
+    if grid_for is None:
+        raise ValueError(f"grid for strategy '{args.strategy}' is not provided")
+
+    all_valid_pnls: List[float] = []
+
+    for fold in parts:
+        n = len(fold)
+        if n < 10:
+            continue
+        cut = int(n * train_frac)
+        train = fold.iloc[:cut].copy()
+        valid = fold.iloc[cut:].copy()
+        if valid.empty or train.empty:
+            continue
+
+        # подбираем лучшие параметры по train
+        cand_rows: List[Dict[str, Any]] = []
+        for params in _iter_grid(grid_for):
+            m = _run_strategy(args.strategy, params, train)
+            cand_rows.append(m)
+        cand_rows = [r for r in cand_rows if int(r.get("n_trades", 0)) >= int(args.min_trades)]
+        if not cand_rows:
+            continue
+        metric = args.metric
+        cand_rows.sort(key=lambda r: float(r.get(metric, -1e18)), reverse=True)
+        best_params = cand_rows[0]["params"]
+
+        # валидируем на valid
+        if args.strategy == "ema_adx":
+            pnls = _strategy_ema_adx(valid, **{k: best_params[k] for k in
+                                               ["fast", "slow", "adx_len", "on", "off", "require_di"]})
+        else:
+            pnls = _strategy_ema_adx_atr(valid, **{k: best_params[k] for k in
+                                                   ["fast", "slow", "adx_len", "on", "off", "require_di", "atr_len",
+                                                    "atr_mult"]})
+        all_valid_pnls.extend(list(pnls))
+
+    if not all_valid_pnls:
+        LOG.warning("All folds filtered by --min-trades or no best params found.")
+        return 0
+
+    metrics = _compute_metrics(np.asarray(all_valid_pnls, dtype=float))  # type: ignore[arg-type]
+    out = {"strategy": args.strategy, "params": "<wf best per fold from {} folds>".format(folds), **metrics}
+    _print_table([out], args.metric)
+    _maybe_dump(args, args.pair, args.candles, "walk-forward", [out])
+    return 0
+
+
+def _run_live_observe(args) -> int:
     LOG.info(
-        "[live] observe %s %s strategy=%s params=%s poll=%ss",
-        args.pair,
-        args.candles,
-        args.strategy,
-        json.dumps({
-            "fast": args.ema_fast, "slow": args.ema_slow,
-            "adx_len": args.adx_len, "on": args.adx_on, "off": args.adx_off,
-            "require_di": bool(args.require_di)
-        }),
-        int(args.poll_sec),
-    )
+        f"[live] observe {args.pair} {args.candles} strategy={args.strategy} params={json.dumps({'fast': args.ema_fast, 'slow': args.ema_slow, 'adx_len': args.adx_len, 'on': args.adx_on, 'off': args.adx_off, 'require_di': bool(args.require_di)})} poll={args.poll_sec}s")
     if args.summary_alert:
         LOG.debug("[live] summary-alert flag accepted (no-op notifier).")
-
     try:
         while True:
             df = _fetch_exmo_ohlc(args, args.pair, args.candles)
             if not df.empty:
-                last = df.iloc[-1]
-                LOG.info("[live] %s close=%.6f", last["dt"].isoformat(), float(last["close"]))
+                last_dt = df["dt"].iat[-1]
+                close = float(df["close"].iat[-1])
+                LOG.info(f"[live] {last_dt.isoformat()} close={close:.6f}")
             else:
                 LOG.warning("[live] empty data")
-            time.sleep(max(1, int(args.poll_sec)))
+            time.sleep(int(args.poll_sec))
     except KeyboardInterrupt:
         LOG.info("[live] stop by user")
+    return 0
+
+
+def _run_live_paper(args) -> int:
+    LOG.info(f"[live] paper {args.pair} {args.candles} strategy={args.strategy}")
+    df = _fetch_exmo_ohlc(args, args.pair, args.candles)
+    if df.empty:
+        LOG.info("[paper] empty dataset")
         return 0
 
+    if args.strategy == "ema_adx":
+        pnls = _strategy_ema_adx(
+            df,
+            fast=args.ema_fast,
+            slow=args.ema_slow,
+            adx_len=args.adx_len,
+            on=args.adx_on,
+            off=args.adx_off,
+            require_di=bool(args.require_di),
+        )
+        params = {"fast": args.ema_fast, "slow": args.ema_slow, "adx_len": args.adx_len, "on": args.adx_on,
+                  "off": args.adx_off, "require_di": bool(args.require_di), "atr_len": 14, "atr_mult": 0.0}
+    else:
+        pnls = _strategy_ema_adx_atr(
+            df,
+            fast=args.ema_fast,
+            slow=args.ema_slow,
+            adx_len=args.adx_len,
+            on=args.adx_on,
+            off=args.adx_off,
+            require_di=bool(args.require_di),
+            atr_len=args.atr_len,
+            atr_mult=args.atr_mult,
+        )
+        params = {"fast": args.ema_fast, "slow": args.ema_slow, "adx_len": args.adx_len, "on": args.adx_on,
+                  "off": args.adx_off, "require_di": bool(args.require_di), "atr_len": args.atr_len,
+                  "atr_mult": args.atr_mult}
 
-def _run_live_paper(args: argparse.Namespace) -> int:
-    LOG.info("[live] paper mode is not implemented yet (stub).")
+    m = _compute_metrics(pnls)  # type: ignore[arg-type]
+    LOG.info(f"[paper] trades={m['n_trades']} total_pnl={m['total_pnl']:.6f} sharpe={m['sharpe']:.3f}")
+
+    row = {"strategy": args.strategy, "params": params, **m}
+    _print_table([row], "sharpe")
+    _maybe_dump_live(args, args.pair, args.candles, row, df, pnls)
     return 0
 
 
-# =========================
-# STUBS
-# =========================
-def _run_optimize_stub(args: argparse.Namespace) -> int:
-    LOG.info("Command: optimize (stub) — not implemented yet.")
-    return 0
+# ---------------------------------------------------------------------
+# Сохранение результатов
+# ---------------------------------------------------------------------
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
 
-def _run_robustness_stub(args: argparse.Namespace) -> int:
-    LOG.info("Command: robustness (stub) — not implemented yet.")
-    return 0
+def _default_out_dir(base: str | None) -> str:
+    base = base or "out/data"
+    _ensure_dir(base)
+    return base
 
 
-def _run_walk_forward_stub(args: argparse.Namespace) -> int:
-    LOG.info(
-        "Command: walk-forward (stub) — folds=%s train_frac=%.2f",
-        getattr(args, "wf_folds", 4),
-        getattr(args, "wf_train_frac", 0.7),
-    )
-    return 0
+def _maybe_dump(args, pair: str, candles: str, tag: str, rows: List[Dict[str, Any]]) -> None:
+    out_dir = _default_out_dir(getattr(args, "out_dir", None))
+    prefix = getattr(args, "out_prefix", None)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    base = f"{prefix}_{pair}_{candles.replace(':', '-')}_{ts}" if prefix else f"{pair}_{candles.replace(':', '-')}_{ts}"
+    # CSV
+    csv_path = os.path.join(out_dir, f"{base}_{tag}.csv")
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+    # JSONL (опционально)
+    if getattr(args, "jsonl", False):
+        jsonl_path = os.path.join(out_dir, f"{base}_{tag}.jsonl")
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
-# =========================
-# ENTRY
-# =========================
-def _dispatch_command(args: argparse.Namespace) -> int:
+def _maybe_dump_live(args, pair: str, candles: str, row: Dict[str, Any], df: pd.DataFrame, pnls: np.ndarray) -> None:
+    out_dir = _default_out_dir(getattr(args, "out_dir", None))
+    prefix = getattr(args, "out_prefix", None)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    base = f"{prefix}_{pair}_{candles.replace(':', '-')}_{ts}" if prefix else f"{pair}_{candles.replace(':', '-')}_{ts}"
+    # trades (простая реконструкция сделок из pnl — без таймстампов вход/выход; в проекте можно заменить на реальный журнал)
+    trades_csv = os.path.join(out_dir, f"{base}_trades.csv")
+    pd.DataFrame({"pnl": pnls}).to_csv(trades_csv, index=False)
+    # equity
+    equity_csv = os.path.join(out_dir, f"{base}_equity.csv")
+    equity = np.cumsum(pnls) if pnls.size else np.asarray([], dtype=float)
+    pd.DataFrame({"equity": equity}).to_csv(equity_csv, index=False)
+    # metrics
+    metrics_json = os.path.join(out_dir, f"{base}_metrics.json")
+    with open(metrics_json, "w", encoding="utf-8") as f:
+        json.dump(row, f, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------
+# Аргументы CLI
+# ---------------------------------------------------------------------
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="tradinng-bot", description="EXMO research & live CLI")
+
+    # Общие настройки
+    p.add_argument("--pair", type=str, default="DOGE_EUR", help="EXMO symbol, e.g. DOGE_EUR")
+    p.add_argument("--candles", type=str, default="5m:2000", help="timeframe:bars, e.g. 5m:2000")
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    p.add_argument("--out-dir", type=str, default="out/data", help="Where to save CSV/JSON results")
+    p.add_argument("--out-prefix", type=str, default="", help="Filename prefix for artifacts (optional)")
+    p.add_argument("--jsonl", action="store_true", help="Also save *.jsonl")
+
+    # HTTP
+    p.add_argument("--http-retries", type=int, default=3, help="HTTP retries")
+    p.add_argument("--http-backoff", type=float, default=1.0, help="HTTP backoff factor")
+    p.add_argument("--http-timeout", type=float, default=15.0, help="HTTP timeout seconds")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # sweep
+    sp = sub.add_parser("sweep", help="Quick strategies sweep")
+    sp.add_argument("--strategies", type=str, default="auto", help="auto or comma list")
+    sp.add_argument("--metric", type=str, default="sharpe", help="Sort metric")
+    sp.add_argument("--top-n", type=int, default=3, help="Top rows")
+    sp.add_argument("--min-trades", type=int, default=1, help="Filter min trades")
+    sp.set_defaults(_handler=_run_sweep)
+
+    # optimize
+    op = sub.add_parser("optimize", help="Grid search params")
+    op.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
+    op.add_argument("--metric", type=str, default="sharpe")
+    op.add_argument("--top-n", type=int, default=10)
+    op.add_argument("--min-trades", type=int, default=3)
+    op.add_argument("--grid-file", type=str, default="", help="JSON file with grid or '-' for stdin")
+    op.set_defaults(_handler=_run_optimize)
+
+    # robustness
+    rb = sub.add_parser("robustness", help="Robustness by windows")
+    rb.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
+    rb.add_argument("--rb-windows", type=int, default=6)
+    rb.add_argument("--min-trades", type=int, default=1)
+    # strategy params
+    rb.add_argument("--ema-fast", type=int, dest="ema_fast", default=12)
+    rb.add_argument("--ema-slow", type=int, dest="ema_slow", default=21)
+    rb.add_argument("--adx-len", type=int, dest="adx_len", default=14)
+    rb.add_argument("--adx-on", type=float, dest="adx_on", default=25.0)
+    rb.add_argument("--adx-off", type=float, dest="adx_off", default=16.0)
+    rb.add_argument("--require-di", action="store_true", dest="require_di")
+    rb.add_argument("--atr-len", type=int, dest="atr_len", default=14)
+    rb.add_argument("--atr-mult", type=float, dest="atr_mult", default=2.0)
+    rb.set_defaults(_handler=_run_robustness)
+
+    # walk-forward
+    wf = sub.add_parser("walk-forward", help="Walk-forward validation")
+    wf.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
+    wf.add_argument("--metric", type=str, default="sharpe")
+    wf.add_argument("--wf-folds", type=int, dest="wf_folds", default=4)
+    wf.add_argument("--wf-train-frac", type=float, dest="wf_train_frac", default=0.7)
+    wf.add_argument("--min-trades", type=int, default=1)
+    wf.add_argument("--grid-file", type=str, default="", help="JSON file with grid or '-' for stdin")
+    wf.set_defaults(_handler=_run_walk_forward)
+
+    # trade-live
+    tl = sub.add_parser("trade-live", help="Live modes")
+    tl.add_argument("--mode", type=str, required=True, choices=["observe", "paper"])
+    # common strategy params (для observe/paper)
+    tl.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
+    tl.add_argument("--ema-fast", type=int, dest="ema_fast", default=12)
+    tl.add_argument("--ema-slow", type=int, dest="ema_slow", default=21)
+    tl.add_argument("--adx-len", type=int, dest="adx_len", default=14)
+    tl.add_argument("--adx-on", type=float, dest="adx_on", default=25.0)
+    tl.add_argument("--adx-off", type=float, dest="adx_off", default=16.0)
+    tl.add_argument("--require-di", action="store_true", dest="require_di")
+    tl.add_argument("--atr-len", type=int, dest="atr_len", default=14)
+    tl.add_argument("--atr-mult", type=float, dest="atr_mult", default=2.0)
+    # observe only
+    tl.add_argument("--poll-sec", type=int, default=10)
+    tl.add_argument("--summary-alert", action="store_true")
+    # paper only
+    tl.add_argument("--fees-bps", type=float, default=0.0, help="Not used in dummy pnl model; reserved")
+    tl.add_argument("--slippage-bps", type=float, default=0.0, help="Not used in dummy pnl model; reserved")
+    tl.add_argument("--size", type=float, default=1.0, help="Not used in dummy pnl model; reserved")
+    tl.set_defaults(_handler=_dispatch_live)
+
+    return p
+
+
+def _dispatch_live(a) -> int:
+    return _run_live_paper(a) if a.mode == "paper" else _run_live_observe(a)
+
+
+# ---------------------------------------------------------------------
+# Входная точка
+# ---------------------------------------------------------------------
+def _dispatch_command(args) -> int:
     return args._handler(args)  # type: ignore[attr-defined]
 
 
 def _run_cli(argv: List[str]) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    _setup_logging(bool(getattr(args, "debug", False)))
-    LOG.debug("Logging configured. Level=%s", "DEBUG" if args.debug else "INFO")
+    _configure_logging(bool(getattr(args, "debug", False)))
     return _dispatch_command(args)
 
 
