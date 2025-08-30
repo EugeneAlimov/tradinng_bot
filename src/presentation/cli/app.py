@@ -12,7 +12,12 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple, cast
 from src.backtest.execution import ExecConfig, enrich_trades_with_costs, pnls_from_trades
 from src.strategies.registry import get_strategy
+from src.backtest.schemas import build_trades_schema
+from src.backtest.reports import summarize_trades
+from src.backtest.manifest import write_manifest
 
+from src.indicators.adx import compute_adx
+from src.strategies.ema_adx import signals as ema_adx_signals
 
 import numpy as np
 import pandas as pd
@@ -105,13 +110,17 @@ def _local_metrics(pnl: np.ndarray) -> Dict[str, float]:
     }
 
 
+# Попытка использовать проектные метрики, если доступны.
 try:
     import src.backtest.metrics as metrics_mod  # type: ignore
 
+    _HAS_COMPUTE_METRICS = hasattr(metrics_mod, "compute_metrics")
+    _HAS_EQUITY_METRICS = hasattr(metrics_mod, "compute_equity_metrics")
 
-    def _compute_metrics(pnl: np.ndarray) -> Dict[str, float]:
-        m = metrics_mod.compute_metrics(pnl=pnl)  # type: ignore[attr-defined, call-arg]
-        return {
+
+    def _normalize_base(m: Dict[str, Any], pnl: np.ndarray) -> Dict[str, float]:
+        # Нормализуем ключи под наш Selector API
+        base = {
             "n_trades": int(m.get("n_trades", len(pnl))),
             "win_rate": float(m.get("win_rate", 0.0)),
             "avg_pnl": float(m.get("avg_pnl", 0.0)),
@@ -120,6 +129,39 @@ try:
             "sharpe": float(m.get("sharpe", 0.0)),
             "calmar": float(m.get("calmar", 0.0)),
         }
+        return base
+
+
+    def _compute_metrics(pnl: np.ndarray) -> Dict[str, float]:
+        # 1) База: проектная compute_metrics, если есть, иначе локальная
+        if _HAS_COMPUTE_METRICS:
+            m = metrics_mod.compute_metrics(pnl=pnl)  # type: ignore[attr-defined]
+            out = _normalize_base(m, pnl)
+        else:
+            out = _local_metrics(pnl)
+
+        # 2) Расширенные метрики от compute_equity_metrics (если есть)
+        if _HAS_EQUITY_METRICS:
+            # Кривая эквити: старт 0.0, шаг — накопленные pnl (net)
+            equity = np.concatenate([[0.0], np.cumsum(pnl)]) if pnl.size else np.asarray([0.0], dtype=float)
+            # n_wins можем оценить по win_rate*n_trades — это опциональный параметр; trade_pnls передадим прямо pnl
+            n_trades = int(out.get("n_trades", len(pnl)))
+            n_wins = int(round(out.get("win_rate", 0.0) * n_trades))
+            adv = metrics_mod.compute_equity_metrics(  # type: ignore[attr-defined]
+                equity=equity,
+                trade_pnls=pnl,
+                n_trades=n_trades,
+                n_wins=n_wins,
+                # bars_per_year/start_equity/exposure_pct можно не указывать — функция умеет без них
+            )
+            # Не переопределяем базовые ключи; добавляем только новые
+            for k, v in adv.items():
+                if k not in out:
+                    try:
+                        out[k] = float(v) if isinstance(v, (int, float)) else v  # аккуратно приводим
+                    except Exception:
+                        out[k] = v
+        return out
 
 except ImportError:
     _compute_metrics = _local_metrics  # type: ignore[assignment]
@@ -137,6 +179,32 @@ def _configure_logging(debug: bool) -> None:
         format="%(asctime)s %(levelname)s [cli] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+
+def _ensure_out_dir(args) -> None:
+    """Проверяем, что out_dir существует и доступен для записи. При проблемах — используем /tmp/exmo_artifacts."""
+    path = getattr(args, "out_dir", "out/data") or "out/data"
+    try:
+        os.makedirs(path, exist_ok=True)
+        test_path = os.path.join(path, ".__write_test__")
+        with open(test_path, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(test_path)
+        return
+    except Exception as e:
+        LOG.error("[artifacts] cannot write to out-dir '%s': %s", path, e)
+
+    fallback = "/tmp/exmo_artifacts"
+    try:
+        os.makedirs(fallback, exist_ok=True)
+        test_path = os.path.join(fallback, ".__write_test__")
+        with open(test_path, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(test_path)
+        setattr(args, "out_dir", fallback)
+        LOG.warning("[artifacts] switched out-dir to %s", fallback)
+    except Exception as e2:
+        LOG.error("[artifacts] fallback out-dir '%s' also not writable: %s", fallback, e2)
 
 
 # ---------------------------------------------------------------------
@@ -198,6 +266,30 @@ def _exmo_url(pair: str, tf_min: int, since: int, till: int) -> str:
     return f"https://api.exmo.com/v1.1/candles_history?symbol={pair}&resolution={tf_min}&from={since}&to={till}"
 
 
+def _normalize_epoch_seconds(ts: pd.Series) -> pd.Series:
+    """
+    Нормализует Unix time к секундам.
+    Поддерживает вход в секундах, миллисекундах, микросекундах.
+    """
+    s = pd.to_numeric(ts, errors="coerce")
+    if s.empty:
+        return s.astype("int64")
+
+    vmax = float(np.nanmax(s.to_numpy()))
+    scale = 1
+    if vmax > 1e14:  # ~микросекунды (сейчас ~1.7e15)
+        scale = 1_000_000
+        LOG.debug("[ohlc] detected microsecond timestamps → ÷1e6")
+    elif vmax > 1e12:  # ~миллисекунды (сейчас ~1.7e12)
+        scale = 1_000
+        LOG.debug("[ohlc] detected millisecond timestamps → ÷1e3")
+
+    if scale != 1:
+        s = (s // scale)
+
+    return s.astype("int64")
+
+
 def _fetch_exmo_ohlc(args, pair: str, candles: str) -> pd.DataFrame:
     cspec = _parse_candles(candles)
     now = _unix_now()
@@ -237,13 +329,13 @@ def _fetch_exmo_ohlc(args, pair: str, candles: str) -> pd.DataFrame:
     elif "time" in df.columns:  # fallback
         df.rename(columns={"time": "timestamp"}, inplace=True)
 
-    # Приведение типов
-    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").astype("int64")
+    # Приведение типов + нормализация единиц времени
+    df["timestamp"] = _normalize_epoch_seconds(df["timestamp"])
     for col in ("open", "high", "low", "close", "volume"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Sanity check + сортировка
+    # Sanity check + сортировка/очистка
     df, warns = sanity_check_ohlc(df)
     for w in warns:
         LOG.warning("[OHLC] %s", w)
@@ -251,6 +343,7 @@ def _fetch_exmo_ohlc(args, pair: str, candles: str) -> pd.DataFrame:
     if df.empty:
         return df
 
+    # Конвертация в datetime (уже в секундах)
     df["dt"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
     df.sort_values("timestamp", inplace=True)
     df.reset_index(drop=True, inplace=True)
@@ -425,7 +518,6 @@ def _strategy_ema_adx_atr_trades(df: pd.DataFrame, **params):
     return get_strategy("ema_adx_atr")(df, **params)
 
 
-
 # ---------------------------------------------------------------------
 # Утилиты печати/сплита
 # ---------------------------------------------------------------------
@@ -449,6 +541,45 @@ def _split_df_into_windows(df: pd.DataFrame, windows: int) -> List[pd.DataFrame]
     return parts
 
 
+def _make_observe_table(df: pd.DataFrame, *, fast: int, slow: int, adx_len: int, on: float, off: float,
+                        require_di: bool) -> pd.DataFrame:
+    """
+    Возвращает компактную табличку последних баров с индикаторами и сигналами.
+    Колонки: [dt, close, ema_fast, ema_slow, adx, pdi, mdi, on, off, crossover, adx_state, di_state]
+    """
+    # сигналы и EMA/ADX
+    long_on, long_off, ema_f, ema_s, adx = ema_adx_signals(
+        df, fast=fast, slow=slow, adx_len=adx_len, on=on, off=off, require_di=require_di
+    )
+    # pdi/mdi для информативности
+    adx2, pdi, mdi = compute_adx(df, adx_len)
+
+    out = pd.DataFrame({
+        "dt": df["dt"].astype("datetime64[ns, UTC]") if "dt" in df.columns else pd.to_datetime(df["timestamp"],
+                                                                                               unit="s", utc=True),
+        "close": df["close"].astype(float),
+        "ema_fast": ema_f.astype(float),
+        "ema_slow": ema_s.astype(float),
+        "adx": adx.astype(float),
+        "pdi": pdi.astype(float),
+        "mdi": mdi.astype(float),
+        "on": long_on.astype(bool),
+        "off": long_off.astype(bool),
+    })
+
+    # производные статусы
+    cross_up = (out["ema_fast"] > out["ema_slow"]) & (out["ema_fast"].shift(1) <= out["ema_slow"].shift(1))
+    cross_dn = (out["ema_fast"] < out["ema_slow"]) & (out["ema_fast"].shift(1) >= out["ema_slow"].shift(1))
+    out["crossover"] = np.select([cross_up, cross_dn], ["up", "down"], default=".")
+    out["adx_state"] = np.select([out["adx"] >= on, out["adx"] <= off], ["on", "off"], default="mid")
+    out["di_state"] = np.select([out["pdi"] > out["mdi"], out["pdi"] < out["mdi"]], ["+DI>", "-DI>"], default="=")
+
+    # чуть округлим для консоли
+    num_cols = ["close", "ema_fast", "ema_slow", "adx", "pdi", "mdi"]
+    out[num_cols] = out[num_cols].round(4)
+    return out
+
+
 # ---------------------------------------------------------------------
 # Гриды
 # ---------------------------------------------------------------------
@@ -463,14 +594,19 @@ def _default_grid() -> Dict[str, Any]:
             "require_di": [True],
         },
         "ema_adx_atr": {
-            "fast": [8, 10, 12, 14],
+            "fast": [8, 12, 14],
             "slow": [20, 26, 30],
             "adx_len": [14],
             "on": [22.0, 25.0],
             "off": [16.0, 18.0],
             "require_di": [True],
             "atr_len": [14],
-            "atr_mult": [1.5, 2.0, 2.5],
+            "sl_mult": [0.0, 1.5, 2.0],
+            "tp_mult": [0.0, 3.0],
+            "trail_mult": [0.0, 1.0, 1.5],
+            "tp1_mult": [0.0, 2.0],
+            "tp1_frac": [0.0, 0.5],
+            "tp2_mult": [0.0, 3.0, 4.0],
         },
     }
 
@@ -493,6 +629,18 @@ def _load_grid_file(src: str | None) -> Optional[Dict[str, Any]]:
         return json.load(f)
 
 
+def _print_observe_table(df: pd.DataFrame, *, last_rows: int = 20) -> None:
+    if df.empty:
+        LOG.info("[observe] empty frame")
+        return
+    tail = df.tail(max(1, int(last_rows)))
+    disp = tail.copy()
+    for bcol in ("on", "off"):
+        if bcol in disp.columns:
+            disp[bcol] = disp[bcol].astype(int)
+    LOG.info("\n%s", disp.to_string(index=False))
+
+
 # ---------------------------------------------------------------------
 # Команды
 # ---------------------------------------------------------------------
@@ -502,15 +650,33 @@ def _rows_to_selected(rows: List[Dict[str, Any]], metric: str, top_n: int, min_t
 
 
 def _dump_tabular(args, pair: str, candles: str, cmd: str, selected_df: pd.DataFrame) -> None:
-    csv_path = make_artifact_path(args.out_dir, args.out_prefix, pair, candles, f"{cmd}", "csv")
-    selected_df.to_csv(csv_path, index=False)
+    entries: List[Dict[str, Any]] = []
+
+    # schema — всегда
+    schema_path = make_artifact_path(args.out_dir, args.out_prefix, pair, candles, f"{cmd}_schema", "json")
+    dump_schema(selected_df, schema_path)
+    entries.append({"kind": "schema", "path": schema_path})
+
+    if getattr(args, "schema_only", False):
+        write_manifest(args.out_dir, args.out_prefix, pair, candles, entries, stem=f"{cmd}_manifest")
+        return
+
+    # csv
+    if not getattr(args, "no_csv", False):
+        csv_path = make_artifact_path(args.out_dir, args.out_prefix, pair, candles, f"{cmd}", "csv")
+        selected_df.to_csv(csv_path, index=False)
+        entries.append({"kind": "csv", "path": csv_path})
+
+    # jsonl
     if getattr(args, "jsonl", False):
         jsonl_path = make_artifact_path(args.out_dir, args.out_prefix, pair, candles, f"{cmd}", "jsonl")
         with open(jsonl_path, "w", encoding="utf-8") as f:
             for _, r in selected_df.iterrows():
                 f.write(json.dumps(r.to_dict(), ensure_ascii=False) + "\n")
-    schema_path = make_artifact_path(args.out_dir, args.out_prefix, pair, candles, f"{cmd}_schema", "json")
-    dump_schema(selected_df, schema_path)
+        entries.append({"kind": "jsonl", "path": jsonl_path})
+
+    # manifest для этой команды
+    write_manifest(args.out_dir, args.out_prefix, pair, candles, entries, stem=f"{cmd}_manifest")
 
 
 def _reorder_result_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -547,8 +713,17 @@ def _run_sweep(args) -> int:
             params = {"fast": 12, "slow": 21, "adx_len": 14, "on": 25.0, "off": 16.0, "require_di": True}
             trades, _ = _strategy_ema_adx_trades(df, **params)
         else:
-            params = {"fast": 12, "slow": 21, "adx_len": 14, "on": 25.0, "off": 16.0, "require_di": True,
-                      "atr_len": 14, "atr_mult": 2.0}
+            params = {
+                "fast": 12, "slow": 21, "adx_len": 14, "on": 25.0, "off": 16.0, "require_di": True,
+                "atr_len": 14,
+                "sl_mult": getattr(args, "sl_mult", 0.0),
+                "tp_mult": getattr(args, "tp_mult", 0.0),
+                "trail_mult": getattr(args, "trail_mult", 0.0),
+                "tp1_mult": getattr(args, "tp1_mult", 0.0),
+                "tp1_frac": getattr(args, "tp1_frac", 0.0),
+                "tp2_mult": getattr(args, "tp2_mult", 0.0),
+            }
+
             trades, _ = _strategy_ema_adx_atr_trades(df, **params)
 
         trades = enrich_trades_with_costs(trades, cfg)
@@ -634,7 +809,9 @@ def _run_robustness(args) -> int:
     }
     if strat == "ema_adx_atr":
         base_params["atr_len"] = args.atr_len
-        base_params["atr_mult"] = args.atr_mult
+        base_params["sl_mult"] = getattr(args, "sl_mult", 0.0)
+        base_params["tp_mult"] = getattr(args, "tp_mult", 0.0)
+        base_params["trail_mult"] = getattr(args, "trail_mult", 0.0)
 
     cfg = ExecConfig(
         size=getattr(args, "size", 1.0),
@@ -762,28 +939,126 @@ def _run_walk_forward(args) -> int:
 
 
 def _run_live_observe(args) -> int:
-    LOG.info(
-        "[live] observe %s %s strategy=%s poll=%ss",
-        args.pair,
-        args.candles,
-        args.strategy,
-        args.poll_sec,
-    )
-    if args.summary_alert:
-        LOG.debug("[live] summary-alert flag accepted (no-op notifier).")
+    """
+    Живое наблюдение: печатаем компактную табличку индикаторов,
+    детектим события ENTER/EXIT и при --summary-alert шлём краткие алёрты.
+    На события сохраняем JSON-артефакт observe_event.
+    """
+    LOG.info("[live] observe %s %s strategy=ema_adx", args.pair, args.candles)
+
+    # параметры наблюдения берём из ema_adx
+    base_params: Dict[str, Any] = {
+        "fast": args.ema_fast,
+        "slow": args.ema_slow,
+        "adx_len": args.adx_len,
+        "on": args.adx_on,
+        "off": args.adx_off,
+        "require_di": bool(args.require_di),
+    }
+
+    # состояние позиции в рамках observe (виртуально)
+    pos = False
+    last_bar_ts: int | None = None
+
+    poll_sec = max(1, int(getattr(args, "poll_sec", 10)))
+    LOG.info("[observe] poll every %ss; summary_alert=%s", poll_sec, bool(getattr(args, "summary_alert", False)))
+
     try:
         while True:
             df = _fetch_exmo_ohlc(args, args.pair, args.candles)
-            if not df.empty:
-                last_dt = df["dt"].iat[-1]
-                close = float(df["close"].iat[-1])
-                LOG.info("[live] %s close=%.6f", last_dt.isoformat(), close)
-            else:
-                LOG.warning("[live] empty data")
-            time.sleep(int(args.poll_sec))
+            if df.empty:
+                LOG.warning("[observe] no data")
+                time.sleep(poll_sec)
+                continue
+
+            tab = _make_observe_table(
+                df,
+                fast=base_params["fast"],
+                slow=base_params["slow"],
+                adx_len=base_params["adx_len"],
+                on=base_params["on"],
+                off=base_params["off"],
+                require_di=base_params["require_di"],
+            )
+
+            # печать таблицы последних строк
+            _print_observe_table(tab, last_rows=int(getattr(args, "observe_rows", 20)))
+
+            # анализ последнего бара
+            r = tab.iloc[-1]
+            now_ts = int(df["timestamp"].iloc[-1])
+            on_sig = bool(r["on"])
+            off_sig = bool(r["off"])
+
+            event: str | None = None
+            if not pos and on_sig:
+                pos = True
+                event = "ENTER"
+            elif pos and off_sig:
+                pos = False
+                event = "EXIT"
+
+            # алёрт и артефакт только если новый бар/сигнал
+            if getattr(args, "summary_alert", False):
+                # не спамим несколько раз на одном и том же баре без изменений
+                if event is not None and (last_bar_ts is None or now_ts != last_bar_ts):
+                    LOG.info(
+                        "[observe] %s @ %s close=%.6f emaF=%.6f emaS=%.6f adx=%.2f (%s %s)",
+                        event,
+                        pd.to_datetime(now_ts, unit="s", utc=True).isoformat(),
+                        float(r["close"]),
+                        float(r["ema_fast"]),
+                        float(r["ema_slow"]),
+                        float(r["adx"]),
+                        str(r["crossover"]),
+                        str(r["di_state"]),
+                    )
+                    # сохраняем событие + опционально снапшот
+                    entries: List[Dict[str, Any]] = []
+
+                    evt = {
+                        "event": event,
+                        "pair": args.pair,
+                        "candles": args.candles,
+                        "params": base_params,
+                        "bar": {
+                            "timestamp": now_ts,
+                            "dt": pd.to_datetime(now_ts, unit="s", utc=True).isoformat(),
+                            "close": float(r["close"]),
+                            "ema_fast": float(r["ema_fast"]),
+                            "ema_slow": float(r["ema_slow"]),
+                            "adx": float(r["adx"]),
+                            "pdi": float(r["pdi"]),
+                            "mdi": float(r["mdi"]),
+                            "crossover": str(r["crossover"]),
+                            "adx_state": str(r["adx_state"]),
+                            "di_state": str(r["di_state"]),
+                            "on": bool(r["on"]),
+                            "off": bool(r["off"]),
+                        },
+                    }
+                    event_json = make_artifact_path(args.out_dir, args.out_prefix, args.pair, args.candles,
+                                                    "observe_event", "json")
+                    with open(event_json, "w", encoding="utf-8") as f:
+                        f.write(json.dumps(evt, ensure_ascii=False, indent=2))
+                    entries.append({"kind": "observe_event", "path": event_json})
+
+                    if getattr(args, "observe_save_snapshots", False):
+                        rows = max(1, int(getattr(args, "observe_rows", 20)))
+                        snap_csv = make_artifact_path(args.out_dir, args.out_prefix, args.pair, args.candles,
+                                                      "observe_snapshot", "csv")
+                        tab.tail(rows).to_csv(snap_csv, index=False)
+                        entries.append({"kind": "observe_snapshot", "path": snap_csv})
+
+                    # manifest для события
+                    write_manifest(args.out_dir, args.out_prefix, args.pair, args.candles, entries,
+                                   stem="observe_manifest")
+
+            last_bar_ts = now_ts
+            time.sleep(poll_sec)
     except KeyboardInterrupt:
-        LOG.info("[live] stop by user")
-    return 0
+        LOG.info("[observe] stopped by user")
+        return 0
 
 
 def _run_live_paper(args) -> int:
@@ -793,6 +1068,7 @@ def _run_live_paper(args) -> int:
         LOG.info("[paper] empty dataset")
         return 0
 
+    # Параметры стратегии (общие)
     base_params: Dict[str, Any] = {
         "fast": args.ema_fast,
         "slow": args.ema_slow,
@@ -801,19 +1077,23 @@ def _run_live_paper(args) -> int:
         "off": args.adx_off,
         "require_di": bool(args.require_di),
     }
+    # Специфика ema_adx_atr: ATR + SL/TP
     if args.strategy == "ema_adx_atr":
         base_params["atr_len"] = args.atr_len
-        base_params["atr_mult"] = args.atr_mult
+        base_params["sl_mult"] = getattr(args, "sl_mult", 0.0)
+        base_params["trail_mult"] = getattr(args, "trail_mult", 0.0)
+        base_params["tp_mult"] = getattr(args, "tp_mult", 0.0)
+        base_params["tp1_mult"] = getattr(args, "tp1_mult", 0.0)
+        base_params["tp1_frac"] = getattr(args, "tp1_frac", 0.0)
+        base_params["tp2_mult"] = getattr(args, "tp2_mult", 0.0)
 
-    # строим сделки по стратегии
+    # Сделки + pnl
     if args.strategy == "ema_adx":
         trades, _ = _strategy_ema_adx_trades(df, **base_params)
-        params_for_log = {**base_params, "atr_len": 14, "atr_mult": 0.0}
     else:
         trades, _ = _strategy_ema_adx_atr_trades(df, **base_params)
-        params_for_log = dict(base_params)
 
-    # применяем исполнение (fees/slippage/size)
+    # Учёт исполнения (fees/slippage/size)
     cfg = ExecConfig(size=args.size, fees_bps=args.fees_bps, slippage_bps=args.slippage_bps)
     trades = enrich_trades_with_costs(trades, cfg)
     pnls = pnls_from_trades(trades, use_net=True)
@@ -821,13 +1101,21 @@ def _run_live_paper(args) -> int:
     met = _compute_metrics(pnls)
     row = {
         "strategy": args.strategy,
-        "params": params_for_log,
+        "params": dict(base_params),  # логируем фактические параметры
         "size": cfg.size,
         "fees_bps": cfg.fees_bps,
         "slippage_bps": cfg.slippage_bps,
         **met
     }
     LOG.info("[paper] trades=%s total_pnl=%.6f sharpe=%.3f", met["n_trades"], met["total_pnl"], met["sharpe"])
+
+    if "profit_factor" in met:
+        LOG.info(
+            "[paper] extra: pf=%.3f maxDD%%=%.2f cagr%%=%.2f",
+            float(met.get("profit_factor", 0.0)),
+            float(met.get("max_drawdown_pct", 0.0)),
+            float(met.get("cagr_pct", 0.0)),
+        )
 
     _dump_live_artifacts(args, args.pair, args.candles, row, trades, pnls)
     return 0
@@ -844,23 +1132,65 @@ def _dump_live_artifacts(
         trades: List[Dict[str, Any]],
         pnls: np.ndarray,
 ) -> None:
+    entries: List[Dict[str, Any]] = []
+
+    # trades_schema.json — всегда
+    trades_schema_json = make_artifact_path(args.out_dir, args.out_prefix, pair, candles, "trades_schema", "json")
+    schema = build_trades_schema(trades)
+    with open(trades_schema_json, "w", encoding="utf-8") as f:
+        f.write(json.dumps(schema, ensure_ascii=False, indent=2))
+    entries.append({"kind": "trades_schema", "path": trades_schema_json})
+
+    # trades_summary.json — всегда
+    summary = summarize_trades(trades)
+    trades_summary_json = make_artifact_path(args.out_dir, args.out_prefix, pair, candles, "trades_summary", "json")
+    with open(trades_summary_json, "w", encoding="utf-8") as f:
+        f.write(json.dumps(summary, ensure_ascii=False, indent=2))
+    entries.append({"kind": "trades_summary", "path": trades_summary_json})
+
+    # печать в консоль (опция)
+    if getattr(args, "print_trade_summary", False):
+        LOG.info(
+            "[paper] summary: closed=%s win_rate=%.2f%% pf=%.3f avg_pnl=%.6f",
+            summary.get("closed_trades", 0),
+            100.0 * float(summary.get("win_rate", 0.0)),
+            float(summary.get("profit_factor", 0.0)),
+            float(summary.get("avg_pnl", 0.0)),
+        )
+
+    if getattr(args, "schema_only", False):
+        write_manifest(args.out_dir, args.out_prefix, pair, candles, entries, stem="paper_manifest")
+        return
+
+    # trades.json
     trades_json = make_artifact_path(args.out_dir, args.out_prefix, pair, candles, "trades", "json")
     with open(trades_json, "w", encoding="utf-8") as f:
         f.write(json.dumps(trades, ensure_ascii=False, indent=2))
+    entries.append({"kind": "trades_json", "path": trades_json})
 
-    equity_csv = make_artifact_path(args.out_dir, args.out_prefix, pair, candles, "equity", "csv")
-    equity = np.cumsum(pnls) if pnls.size else np.asarray([], dtype=float)
-    pd.DataFrame({"equity": equity}).to_csv(equity_csv, index=False)
+    # equity.csv (если не отключён CSV)
+    if not getattr(args, "no_csv", False):
+        equity_csv = make_artifact_path(args.out_dir, args.out_prefix, pair, candles, "equity", "csv")
+        equity = np.cumsum(pnls) if pnls.size else np.asarray([], dtype=float)
+        pd.DataFrame({"equity": equity}).to_csv(equity_csv, index=False)
+        entries.append({"kind": "equity_csv", "path": equity_csv})
 
+    # metrics.json
     metrics_json = make_artifact_path(args.out_dir, args.out_prefix, pair, candles, "metrics", "json")
     with open(metrics_json, "w", encoding="utf-8") as f:
         f.write(json.dumps(metrics_row, ensure_ascii=False, indent=2))
+    entries.append({"kind": "metrics_json", "path": metrics_json})
 
+    # trades.jsonl (опционально)
     if getattr(args, "jsonl", False):
         trades_jsonl = make_artifact_path(args.out_dir, args.out_prefix, pair, candles, "trades", "jsonl")
         with open(trades_jsonl, "w", encoding="utf-8") as f:
             for t in trades:
                 f.write(json.dumps(t, ensure_ascii=False) + "\n")
+        entries.append({"kind": "trades_jsonl", "path": trades_jsonl})
+
+    # manifest для paper-сеанса
+    write_manifest(args.out_dir, args.out_prefix, pair, candles, entries, stem="paper_manifest")
 
 
 # ---------------------------------------------------------------------
@@ -869,44 +1199,57 @@ def _dump_live_artifacts(
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="tradinng-bot", description="EXMO research & live CLI")
 
-    # === Глобальные настройки (идут ДО подкоманды) ===
-    p.add_argument("--pair", type=str, default="DOGE_EUR", help="EXMO symbol, e.g. DOGE_EUR")
-    p.add_argument("--candles", type=str, default="5m:2000", help="timeframe:bars, e.g. 5m:2000")
-    p.add_argument("--debug", action="store_true", help="Enable debug logging")
-    p.add_argument("--out-dir", type=str, default="out/data", help="Where to save artifacts")
-    p.add_argument("--out-prefix", type=str, default="", help="Filename prefix for artifacts (optional)")
-    p.add_argument("--jsonl", action="store_true", help="Also save JSONL where applicable")
+    # === Глобальные ===
+    p.add_argument("--pair", type=str, default="DOGE_EUR")
+    p.add_argument("--candles", type=str, default="5m:2000")
+    p.add_argument("--debug", action="store_true")
+    p.add_argument("--out-dir", type=str, default="out/data")
+    p.add_argument("--out-prefix", type=str, default="")
+    p.add_argument("--jsonl", action="store_true")
+    p.add_argument("--print-trade-summary", action="store_true", help="Print trades summary to console (paper mode)")
+    p.add_argument("--tp1-mult", type=float, default=0.0, help="ATR multiplier for partial TP1 (0 disables)")
+    p.add_argument("--tp1-frac", type=float, default=0.0, help="Fraction to close at TP1 (0..1)")
+    p.add_argument("--tp2-mult", type=float, default=0.0, help="ATR multiplier for TP2 (0 disables)")
 
     # HTTP
-    p.add_argument("--http-retries", type=int, default=3, help="HTTP retries")
-    p.add_argument("--http-backoff", type=float, default=1.0, help="HTTP backoff factor")
-    p.add_argument("--http-timeout", type=float, default=15.0, help="HTTP timeout seconds")
+    p.add_argument("--http-retries", type=int, default=3)
+    p.add_argument("--http-backoff", type=float, default=1.0)
+    p.add_argument("--http-timeout", type=float, default=15.0)
 
-    # Execution (глобально для единообразия расчётов во всех командах)
-    p.add_argument("--fees-bps", type=float, default=0.0, help="Fee in basis points (e.g., 25 = 0.25%)")
-    p.add_argument("--slippage-bps", type=float, default=0.0, help="Slippage in basis points per side")
-    p.add_argument("--size", type=float, default=1.0, help="Position size in base units")
+    # Execution
+    p.add_argument("--fees-bps", type=float, default=0.0)
+    p.add_argument("--slippage-bps", type=float, default=0.0)
+    p.add_argument("--size", type=float, default=1.0)
+
+    # ATR SL/TP/Trailing (глобально)
+    p.add_argument("--sl-mult", type=float, default=0.0, help="ATR multiplier for stop-loss (0 disables)")
+    p.add_argument("--tp-mult", type=float, default=0.0, help="ATR multiplier for take-profit (0 disables)")
+    p.add_argument("--trail-mult", type=float, default=0.0, help="ATR multiplier for trailing stop (0 disables)")
+
+    # Артефакты
+    p.add_argument("--schema-only", action="store_true", help="Write only *_schema.json artifacts")
+    p.add_argument("--no-csv", action="store_true", help="Skip CSV artifacts")
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # === sweep ===
+    # sweep
     sp = sub.add_parser("sweep", help="Quick strategies sweep")
-    sp.add_argument("--strategies", type=str, default="auto", help="auto or comma list")
-    sp.add_argument("--metric", type=str, default="sharpe", help="Sort metric")
-    sp.add_argument("--top-n", type=int, default=3, help="Top rows")
-    sp.add_argument("--min-trades", type=int, default=1, help="Filter min trades")
+    sp.add_argument("--strategies", type=str, default="auto")
+    sp.add_argument("--metric", type=str, default="sharpe")
+    sp.add_argument("--top-n", type=int, default=3)
+    sp.add_argument("--min-trades", type=int, default=1)
     sp.set_defaults(_handler=_run_sweep)
 
-    # === optimize ===
+    # optimize
     op = sub.add_parser("optimize", help="Grid search params")
     op.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
     op.add_argument("--metric", type=str, default="sharpe")
     op.add_argument("--top-n", type=int, dest="top_n", default=10)
     op.add_argument("--min-trades", type=int, dest="min_trades", default=3)
-    op.add_argument("--grid-file", type=str, default="", help="JSON file with grid or '-' for stdin")
+    op.add_argument("--grid-file", type=str, default="")
     op.set_defaults(_handler=_run_optimize)
 
-    # === robustness ===
+    # robustness
     rb = sub.add_parser("robustness", help="Robustness by windows")
     rb.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
     rb.add_argument("--rb-windows", type=int, default=6)
@@ -918,20 +1261,19 @@ def _build_parser() -> argparse.ArgumentParser:
     rb.add_argument("--adx-off", type=float, dest="adx_off", default=16.0)
     rb.add_argument("--require-di", action="store_true", dest="require_di")
     rb.add_argument("--atr-len", type=int, dest="atr_len", default=14)
-    rb.add_argument("--atr-mult", type=float, dest="atr_mult", default=2.0)
     rb.set_defaults(_handler=_run_robustness)
 
-    # === walk-forward ===
+    # walk-forward
     wf = sub.add_parser("walk-forward", help="Walk-forward validation")
     wf.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
     wf.add_argument("--metric", type=str, default="sharpe")
     wf.add_argument("--wf-folds", type=int, dest="wf_folds", default=4)
     wf.add_argument("--wf-train-frac", type=float, dest="wf_train_frac", default=0.7)
     wf.add_argument("--min-trades", type=int, default=1)
-    wf.add_argument("--grid-file", type=str, default="", help="JSON file with grid or '-' for stdin")
+    wf.add_argument("--grid-file", type=str, default="")
     wf.set_defaults(_handler=_run_walk_forward)
 
-    # === trade-live ===
+    # trade-live
     tl = sub.add_parser("trade-live", help="Live modes")
     tl.add_argument("--mode", type=str, required=True, choices=["observe", "paper"])
     tl.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
@@ -942,11 +1284,11 @@ def _build_parser() -> argparse.ArgumentParser:
     tl.add_argument("--adx-off", type=float, dest="adx_off", default=16.0)
     tl.add_argument("--require-di", action="store_true", dest="require_di")
     tl.add_argument("--atr-len", type=int, dest="atr_len", default=14)
-    tl.add_argument("--atr-mult", type=float, dest="atr_mult", default=2.0)
-    # observe only
     tl.add_argument("--poll-sec", type=int, default=10)
     tl.add_argument("--summary-alert", action="store_true")
-    # ВАЖНО: fees/slippage/size теперь глобальные — не дублируем в подкоманде
+    tl.add_argument("--observe-rows", type=int, default=20, help="How many recent rows to print in observe table")
+    tl.add_argument("--observe-save-snapshots", action="store_true",
+                    help="Save table snapshot CSV on ENTER/EXIT events")
     tl.set_defaults(_handler=_dispatch_live)
 
     return p
@@ -965,6 +1307,7 @@ def _run_cli(argv: List[str]) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     _configure_logging(bool(getattr(args, "debug", False)))
+    _ensure_out_dir(args)
     return _dispatch_command(args)
 
 
