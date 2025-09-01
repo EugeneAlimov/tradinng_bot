@@ -15,12 +15,13 @@ from src.strategies.registry import get_strategy
 from src.backtest.schemas import build_trades_schema
 from src.backtest.reports import summarize_trades
 from src.backtest.manifest import write_manifest
+from src.infrastructure.ohlc.sanity import clean_ohlc
 
 from src.indicators.adx import compute_adx
 from src.strategies.ema_adx import signals as ema_adx_signals
 
-import numpy as np
 import pandas as pd
+import numpy as np
 
 # Унификация метрик/артефактов + sanity для OHLC
 from src.backtest.selector import (
@@ -29,7 +30,14 @@ from src.backtest.selector import (
     dump_schema,
     make_artifact_path,
 )
-from src.backtest.ohlc_sanity import sanity_check_ohlc
+
+# from src.backtest.ohlc_sanity import sanity_check_ohlc
+
+
+try:
+    from src.infrastructure.ohlc.sanity import clean_ohlc as _clean_ohlc
+except Exception:
+    _clean_ohlc = None
 
 # ---------------------------------------------------------------------
 # HTTP клиент (инфраструктура проекта) + fallback
@@ -290,63 +298,162 @@ def _normalize_epoch_seconds(ts: pd.Series) -> pd.Series:
     return s.astype("int64")
 
 
-def _fetch_exmo_ohlc(args, pair: str, candles: str) -> pd.DataFrame:
-    cspec = _parse_candles(candles)
-    now = _unix_now()
-    span_sec = cspec.tf_minutes * 60 * cspec.bars
-    frm, to = now - span_sec, now
+EXMO_CANDLES_URL = "https://api.exmo.com/v1.1/candles_history"  # важно: .com, не .me
 
-    url = _exmo_url(pair, cspec.tf_minutes, frm, to)
-    if os.getenv("EXMO_DEBUG"):
-        LOG.debug("Starting new HTTPS connection (1): api.exmo.com:443")
-        LOG.debug("[EXMO] → GET %s", url)
 
-    status, payload = _get_http(args).get_json(url)  # type: ignore[attr-defined]
-    if os.getenv("EXMO_DEBUG"):
-        keys = list(payload.keys()) if isinstance(payload, dict) else None
-        LOG.debug("[EXMO] ← status=%s keys=%s", status, keys)
+def _exmo_res_and_step_secs(tf: str) -> Tuple[str, int, Optional[str]]:
+    """
+    Возвращает (resolution для EXMO, секунд в шаге, код ресемплинга pandas или None).
+    Для 3m EXMO прямого резолюшена нет -> берём 1m и потом делаем ресемплинг 3T.
+    """
+    tf = tf.lower()
+    if tf == "1m":
+        return "1", 60, None
+    if tf == "3m":
+        return "1", 60, "3T"  # fetch 1m, resample to 3m
+    if tf == "5m":
+        return "5", 300, None
+    if tf == "15m":
+        return "15", 900, None
+    if tf == "30m":
+        return "30", 1800, None
+    if tf == "1h":
+        return "60", 3600, None
+    if tf == "4h":
+        return "240", 14400, None
+    if tf == "1d":
+        return "D", 86400, None
+    raise ValueError(f"Unsupported timeframe: {tf}")
 
-    if status != 200 or payload is None or "candles" not in payload:
-        LOG.error(
-            "HTTPSConnectionPool(host='api.exmo.com', port=443): fetch failed (status=%s) %s",
-            status,
-            url,
-        )
+
+def _fetch_exmo_ohlc(args, pair: str, candles_arg: str) -> pd.DataFrame:
+    """
+    Загружает свечи EXMO и возвращает DataFrame с колонками:
+    ['dt','timestamp','open','high','low','close','volume'] (UTC).
+    Поддерживает форматы: 1m/3m/5m/15m/30m/1h/4h/1d и вид '--candles TF:COUNT'.
+    """
+    try:
+        tf_part, count_part = candles_arg.split(":", 1)
+        tf = tf_part.strip()
+        count = int(count_part.strip())
+        if count <= 0:
+            LOG.warning("[http] non-positive candles count requested: %s", count)
+            return pd.DataFrame()
+    except Exception as e:
+        LOG.error("[cli] invalid --candles format '%s' (expected TF:COUNT): %s", candles_arg, e)
         return pd.DataFrame()
 
-    data = payload.get("candles") or []
-    if not isinstance(data, list) or not data:
-        LOG.warning("[ohlc] empty payload")
+    try:
+        resolution, step_secs, resample_code = _exmo_res_and_step_secs(tf)
+    except ValueError as e:
+        LOG.error("[cli] %s", e)
         return pd.DataFrame()
 
-    df = pd.DataFrame(data)
-    # Возможные поля EXMO: {t,o,c,h,l,v}
-    if "t" in df.columns:
-        df.rename(
-            columns={"t": "timestamp", "o": "open", "c": "close", "h": "high", "l": "low", "v": "volume"},
-            inplace=True,
+    # Если нужен ресемплинг (3m), подтянем больше 1m-свечей
+    fetch_multiplier = 3 if resample_code == "3T" else 1
+    need_points = max(count * fetch_multiplier, 50)  # минимум чуть побольше, чтобы индикаторы сошлись
+
+    now_s = int(time.time())
+    period_secs = need_points * step_secs
+    from_s = max(0, now_s - period_secs)
+    to_s = now_s
+
+    # Сборка URL: только допустимые параметры
+    # symbol=PAIR&resolution=...&from=...&to=...
+    params = (
+        f"symbol={pair}"
+        f"&resolution={resolution}"
+        f"&from={from_s}"
+        f"&to={to_s}"
+    )
+    url = f"{EXMO_CANDLES_URL}?{params}"
+
+    # HTTP клиент и запрос
+    http_cfg = HttpConfig(
+        retries=getattr(args, "http_retries", 0) or 0,
+        backoff=getattr(args, "http_backoff", 0.0) or 0.0,
+        timeout=getattr(args, "http_timeout", None),
+    )
+    http = HttpClient(http_cfg)
+
+    status, payload = http.get_json(url)
+    if status != 200:
+        LOG.warning("[http] non-200: status=%s", status)
+        return pd.DataFrame()
+
+    # Ответ об ошибке от EXMO (часто приходит с 200)
+    if isinstance(payload, dict) and "error" in payload and payload.get("error"):
+        LOG.warning("[http] exmo error: %s", payload.get("error"))
+        return pd.DataFrame()
+
+    candles = (payload or {}).get("candles") if isinstance(payload, dict) else None
+    if not candles:
+        LOG.warning("[http] no candles in response (status=200)")
+        return pd.DataFrame()
+
+    # Сборка DataFrame: t в миллисекундах
+    df = pd.DataFrame.from_records(
+        (
+            {
+                "t_ms": int(c["t"]),
+                "open": float(c["o"]),
+                "high": float(c["h"]),
+                "low": float(c["l"]),
+                "close": float(c["c"]),
+                "volume": float(c["v"]),
+            }
+            for c in candles
+            if {"t", "o", "h", "l", "c", "v"}.issubset(c.keys())
         )
-    elif "time" in df.columns:  # fallback
-        df.rename(columns={"time": "timestamp"}, inplace=True)
-
-    # Приведение типов + нормализация единиц времени
-    df["timestamp"] = _normalize_epoch_seconds(df["timestamp"])
-    for col in ("open", "high", "low", "close", "volume"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Sanity check + сортировка/очистка
-    df, warns = sanity_check_ohlc(df)
-    for w in warns:
-        LOG.warning("[OHLC] %s", w)
-
+    )
     if df.empty:
         return df
 
-    # Конвертация в datetime (уже в секундах)
-    df["dt"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
-    df.sort_values("timestamp", inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    # Временные колонки
+    df["dt"] = pd.to_datetime(df["t_ms"], unit="ms", utc=True)
+    df["timestamp"] = (df["t_ms"] // 1000).astype("int64")
+    df = df.drop(columns=["t_ms"]).sort_values("dt").reset_index(drop=True)
+
+    # Локальная агрегация 3m из 1m при необходимости
+    if resample_code:
+        # Используем стандартный OHLC ресемплинг с суммой объёма
+        df = (
+            df.set_index("dt")
+            .resample(resample_code, label="right", closed="right")
+            .agg({
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+                "timestamp": "last",
+            })
+            .dropna(subset=["open", "high", "low", "close"])
+            .reset_index()
+        )
+
+    # Оставим последние `count` баров нужного ТФ
+    if len(df) > count:
+        df = df.iloc[-count:].reset_index(drop=True)
+
+    # Санити-чек структуры
+    expected_cols = ["dt", "timestamp", "open", "high", "low", "close", "volume"]
+    missing = [c for c in expected_cols if c not in df.columns]
+    if missing:
+        LOG.warning("[cli] fetched candles missing columns: %s", missing)
+
+    if _clean_ohlc is not None:
+        df, rep = _clean_ohlc(df)
+        if getattr(args, "debug", False):
+            LOG.debug("[ohlc_sanity] %s", rep)
+    else:
+        # минимальный локальный чек
+        df = (df
+              .dropna(subset=["open", "high", "low", "close", "volume"])
+              .drop_duplicates(subset=["dt"])
+              .sort_values("dt")
+              .reset_index(drop=True))
+
     return df
 
 
@@ -940,13 +1047,13 @@ def _run_walk_forward(args) -> int:
 
 def _run_live_observe(args) -> int:
     """
-    Живое наблюдение: печатаем компактную табличку индикаторов,
-    детектим события ENTER/EXIT и при --summary-alert шлём краткие алёрты.
-    На события сохраняем JSON-артефакт observe_event.
+    Живое наблюдение:
+      - печатаем табличку только при новом баре (или всегда при --observe-always-print);
+      - автостоп по времени (--observe-max-mins) или итерациям (--observe-max-iter);
+      - алёрты + артефакты на ENTER/EXIT; снапшоты по флагу.
     """
     LOG.info("[live] observe %s %s strategy=ema_adx", args.pair, args.candles)
 
-    # параметры наблюдения берём из ema_adx
     base_params: Dict[str, Any] = {
         "fast": args.ema_fast,
         "slow": args.ema_slow,
@@ -956,12 +1063,26 @@ def _run_live_observe(args) -> int:
         "require_di": bool(args.require_di),
     }
 
-    # состояние позиции в рамках observe (виртуально)
     pos = False
     last_bar_ts: int | None = None
 
     poll_sec = max(1, int(getattr(args, "poll_sec", 10)))
-    LOG.info("[observe] poll every %ss; summary_alert=%s", poll_sec, bool(getattr(args, "summary_alert", False)))
+    rows_to_print = int(getattr(args, "observe_rows", 20))
+    always_print = bool(getattr(args, "observe_always_print", False))
+    max_mins = int(getattr(args, "observe_max_mins", 0))
+    max_iter = int(getattr(args, "observe_max_iter", 0))
+
+    LOG.info(
+        "[observe] poll every %ss; summary_alert=%s; print=%s; max_mins=%s max_iter=%s",
+        poll_sec,
+        bool(getattr(args, "summary_alert", False)),
+        "always" if always_print else "on-new-bar",
+        max_mins,
+        max_iter,
+    )
+
+    start_ts = time.time()
+    iters = 0
 
     try:
         while True:
@@ -969,6 +1090,14 @@ def _run_live_observe(args) -> int:
             if df.empty:
                 LOG.warning("[observe] no data")
                 time.sleep(poll_sec)
+                # чек автостоп даже при пустых данных
+                iters += 1
+                if max_iter and iters >= max_iter:
+                    LOG.info("[observe] stop: max_iter reached")
+                    return 0
+                if max_mins and (time.time() - start_ts) >= max_mins * 60:
+                    LOG.info("[observe] stop: max_mins reached")
+                    return 0
                 continue
 
             tab = _make_observe_table(
@@ -981,12 +1110,14 @@ def _run_live_observe(args) -> int:
                 require_di=base_params["require_di"],
             )
 
-            # печать таблицы последних строк
-            _print_observe_table(tab, last_rows=int(getattr(args, "observe_rows", 20)))
+            now_ts = int(df["timestamp"].iloc[-1])
+
+            # печать — либо всегда, либо только при новом баре
+            if always_print or last_bar_ts is None or now_ts != last_bar_ts:
+                _print_observe_table(tab, last_rows=rows_to_print)
 
             # анализ последнего бара
             r = tab.iloc[-1]
-            now_ts = int(df["timestamp"].iloc[-1])
             on_sig = bool(r["on"])
             off_sig = bool(r["off"])
 
@@ -998,63 +1129,69 @@ def _run_live_observe(args) -> int:
                 pos = False
                 event = "EXIT"
 
-            # алёрт и артефакт только если новый бар/сигнал
-            if getattr(args, "summary_alert", False):
-                # не спамим несколько раз на одном и том же баре без изменений
-                if event is not None and (last_bar_ts is None or now_ts != last_bar_ts):
-                    LOG.info(
-                        "[observe] %s @ %s close=%.6f emaF=%.6f emaS=%.6f adx=%.2f (%s %s)",
-                        event,
-                        pd.to_datetime(now_ts, unit="s", utc=True).isoformat(),
-                        float(r["close"]),
-                        float(r["ema_fast"]),
-                        float(r["ema_slow"]),
-                        float(r["adx"]),
-                        str(r["crossover"]),
-                        str(r["di_state"]),
-                    )
-                    # сохраняем событие + опционально снапшот
-                    entries: List[Dict[str, Any]] = []
+            # алёрт/артефакты — только если реальный новый бар и есть событие
+            if getattr(args, "summary_alert", False) and event is not None and (
+                    last_bar_ts is None or now_ts != last_bar_ts):
+                LOG.info(
+                    "[observe] %s @ %s close=%.6f emaF=%.6f emaS=%.6f adx=%.2f (%s %s)",
+                    event,
+                    pd.to_datetime(now_ts, unit="s", utc=True).isoformat(),
+                    float(r["close"]),
+                    float(r["ema_fast"]),
+                    float(r["ema_slow"]),
+                    float(r["adx"]),
+                    str(r["crossover"]),
+                    str(r["di_state"]),
+                )
+                # сохраняем событие + опционально снапшот
+                entries: List[Dict[str, Any]] = []
 
-                    evt = {
-                        "event": event,
-                        "pair": args.pair,
-                        "candles": args.candles,
-                        "params": base_params,
-                        "bar": {
-                            "timestamp": now_ts,
-                            "dt": pd.to_datetime(now_ts, unit="s", utc=True).isoformat(),
-                            "close": float(r["close"]),
-                            "ema_fast": float(r["ema_fast"]),
-                            "ema_slow": float(r["ema_slow"]),
-                            "adx": float(r["adx"]),
-                            "pdi": float(r["pdi"]),
-                            "mdi": float(r["mdi"]),
-                            "crossover": str(r["crossover"]),
-                            "adx_state": str(r["adx_state"]),
-                            "di_state": str(r["di_state"]),
-                            "on": bool(r["on"]),
-                            "off": bool(r["off"]),
-                        },
-                    }
-                    event_json = make_artifact_path(args.out_dir, args.out_prefix, args.pair, args.candles,
-                                                    "observe_event", "json")
-                    with open(event_json, "w", encoding="utf-8") as f:
-                        f.write(json.dumps(evt, ensure_ascii=False, indent=2))
-                    entries.append({"kind": "observe_event", "path": event_json})
+                evt = {
+                    "event": event,
+                    "pair": args.pair,
+                    "candles": args.candles,
+                    "params": base_params,
+                    "bar": {
+                        "timestamp": now_ts,
+                        "dt": pd.to_datetime(now_ts, unit="s", utc=True).isoformat(),
+                        "close": float(r["close"]),
+                        "ema_fast": float(r["ema_fast"]),
+                        "ema_slow": float(r["ema_slow"]),
+                        "adx": float(r["adx"]),
+                        "pdi": float(r["pdi"]),
+                        "mdi": float(r["mdi"]),
+                        "crossover": str(r["crossover"]),
+                        "adx_state": str(r["adx_state"]),
+                        "di_state": str(r["di_state"]),
+                        "on": bool(r["on"]),
+                        "off": bool(r["off"]),
+                    },
+                }
+                event_json = make_artifact_path(args.out_dir, args.out_prefix, args.pair, args.candles, "observe_event",
+                                                "json")
+                with open(event_json, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(evt, ensure_ascii=False, indent=2))
+                entries.append({"kind": "observe_event", "path": event_json})
 
-                    if getattr(args, "observe_save_snapshots", False):
-                        rows = max(1, int(getattr(args, "observe_rows", 20)))
-                        snap_csv = make_artifact_path(args.out_dir, args.out_prefix, args.pair, args.candles,
-                                                      "observe_snapshot", "csv")
-                        tab.tail(rows).to_csv(snap_csv, index=False)
-                        entries.append({"kind": "observe_snapshot", "path": snap_csv})
+                if getattr(args, "observe_save_snapshots", False):
+                    snap_csv = make_artifact_path(args.out_dir, args.out_prefix, args.pair, args.candles,
+                                                  "observe_snapshot", "csv")
+                    tab.tail(rows_to_print).to_csv(snap_csv, index=False)
+                    entries.append({"kind": "observe_snapshot", "path": snap_csv})
 
-                    # manifest для события
-                    write_manifest(args.out_dir, args.out_prefix, args.pair, args.candles, entries,
-                                   stem="observe_manifest")
+                write_manifest(args.out_dir, args.out_prefix, args.pair, args.candles, entries, stem="observe_manifest")
 
             last_bar_ts = now_ts
+
+            # счётчики/автостоп
+            iters += 1
+            if max_iter and iters >= max_iter:
+                LOG.info("[observe] stop: max_iter reached")
+                return 0
+            if max_mins and (time.time() - start_ts) >= max_mins * 60:
+                LOG.info("[observe] stop: max_mins reached")
+                return 0
+
             time.sleep(poll_sec)
     except KeyboardInterrupt:
         LOG.info("[observe] stopped by user")
@@ -1197,101 +1334,134 @@ def _dump_live_artifacts(
 # Аргументы CLI
 # ---------------------------------------------------------------------
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="tradinng-bot", description="EXMO research & live CLI")
+    parser = argparse.ArgumentParser(prog="tradinng-bot")
 
-    # === Глобальные ===
-    p.add_argument("--pair", type=str, default="DOGE_EUR")
-    p.add_argument("--candles", type=str, default="5m:2000")
-    p.add_argument("--debug", action="store_true")
-    p.add_argument("--out-dir", type=str, default="out/data")
-    p.add_argument("--out-prefix", type=str, default="")
-    p.add_argument("--jsonl", action="store_true")
-    p.add_argument("--print-trade-summary", action="store_true", help="Print trades summary to console (paper mode)")
-    p.add_argument("--tp1-mult", type=float, default=0.0, help="ATR multiplier for partial TP1 (0 disables)")
-    p.add_argument("--tp1-frac", type=float, default=0.0, help="Fraction to close at TP1 (0..1)")
-    p.add_argument("--tp2-mult", type=float, default=0.0, help="ATR multiplier for TP2 (0 disables)")
+    # -----------------------
+    # Глобальные флаги
+    # -----------------------
+    parser.add_argument("--pair", type=str, default="BTC_USD", help="Trading pair, e.g. DOGE_EUR")
+    parser.add_argument("--candles", type=str, default="5m:500", help="Timeframe:count, e.g. 5m:2500")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
-    # HTTP
-    p.add_argument("--http-retries", type=int, default=3)
-    p.add_argument("--http-backoff", type=float, default=1.0)
-    p.add_argument("--http-timeout", type=float, default=15.0)
+    parser.add_argument("--out-dir", type=str, default="out/data", help="Artifacts output dir")
+    parser.add_argument("--out-prefix", type=str, default="", help="Artifacts filename prefix")
+    parser.add_argument("--jsonl", action="store_true", help="Write JSONL alongside CSV/JSON where applicable")
+    parser.add_argument("--print-trade-summary", action="store_true", help="Print trades summary in paper mode")
 
-    # Execution
-    p.add_argument("--fees-bps", type=float, default=0.0)
-    p.add_argument("--slippage-bps", type=float, default=0.0)
-    p.add_argument("--size", type=float, default=1.0)
+    parser.add_argument("--fees-bps", type=float, default=0.0, help="Fees, basis points")
+    parser.add_argument("--slippage-bps", type=float, default=0.0, help="Slippage, basis points")
+    parser.add_argument("--size", type=float, default=100.0, help="Position nominal size")
 
-    # ATR SL/TP/Trailing (глобально)
-    p.add_argument("--sl-mult", type=float, default=0.0, help="ATR multiplier for stop-loss (0 disables)")
-    p.add_argument("--tp-mult", type=float, default=0.0, help="ATR multiplier for take-profit (0 disables)")
-    p.add_argument("--trail-mult", type=float, default=0.0, help="ATR multiplier for trailing stop (0 disables)")
+    parser.add_argument("--sl-mult", type=float, default=0.0, help="StopLoss multiple of ATR or entry ref")
+    parser.add_argument("--tp-mult", type=float, default=0.0, help="TakeProfit multiple (single TP)")
+    parser.add_argument("--trail-mult", type=float, default=0.0, help="Trailing multiple (0 = off)")
 
-    # Артефакты
-    p.add_argument("--schema-only", action="store_true", help="Write only *_schema.json artifacts")
-    p.add_argument("--no-csv", action="store_true", help="Skip CSV artifacts")
+    parser.add_argument("--tp1-mult", type=float, default=0.0, help="First partial TP multiple (0=off)")
+    parser.add_argument("--tp1-frac", type=float, default=0.0, help="First partial TP fraction of position")
+    parser.add_argument("--tp2-mult", type=float, default=0.0, help="Second partial TP multiple (0=off)")
 
-    sub = p.add_subparsers(dest="cmd", required=True)
+    parser.add_argument("--http-retries", type=int, default=0, help="HTTP retry attempts")
+    parser.add_argument("--http-backoff", type=float, default=0.0, help="HTTP backoff, seconds")
+    parser.add_argument("--http-timeout", type=float, default=0.0, help="HTTP timeout, seconds (0=default)")
 
-    # sweep
-    sp = sub.add_parser("sweep", help="Quick strategies sweep")
-    sp.add_argument("--strategies", type=str, default="auto")
-    sp.add_argument("--metric", type=str, default="sharpe")
-    sp.add_argument("--top-n", type=int, default=3)
-    sp.add_argument("--min-trades", type=int, default=1)
-    sp.set_defaults(_handler=_run_sweep)
+    parser.add_argument("--schema-only", action="store_true", help="Write schema/summary only, skip heavy outputs")
+    parser.add_argument("--no-csv", action="store_true", help="Do not write CSV artifacts")
 
-    # optimize
-    op = sub.add_parser("optimize", help="Grid search params")
-    op.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
-    op.add_argument("--metric", type=str, default="sharpe")
-    op.add_argument("--top-n", type=int, dest="top_n", default=10)
-    op.add_argument("--min-trades", type=int, dest="min_trades", default=3)
-    op.add_argument("--grid-file", type=str, default="")
-    op.set_defaults(_handler=_run_optimize)
+    # -----------------------
+    # Подкоманды
+    # -----------------------
+    subparsers = parser.add_subparsers(dest="cmd", required=True)
 
-    # robustness
-    rb = sub.add_parser("robustness", help="Robustness by windows")
-    rb.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
-    rb.add_argument("--rb-windows", type=int, default=6)
-    rb.add_argument("--min-trades", type=int, default=1)
-    rb.add_argument("--ema-fast", type=int, dest="ema_fast", default=12)
-    rb.add_argument("--ema-slow", type=int, dest="ema_slow", default=21)
-    rb.add_argument("--adx-len", type=int, dest="adx_len", default=14)
-    rb.add_argument("--adx-on", type=float, dest="adx_on", default=25.0)
-    rb.add_argument("--adx-off", type=float, dest="adx_off", default=16.0)
-    rb.add_argument("--require-di", action="store_true", dest="require_di")
-    rb.add_argument("--atr-len", type=int, dest="atr_len", default=14)
-    rb.set_defaults(_handler=_run_robustness)
+    # ---- sweep ----
+    sp_sweep = subparsers.add_parser("sweep", help="Quick sweep over strategies")
+    sp_sweep.set_defaults(_handler=_run_sweep)
+    sp_sweep.add_argument("--strategies", type=str, default="auto", help="Comma list or 'auto'")
+    sp_sweep.add_argument("--metric", type=str, default="sharpe", help="Selector metric")
+    sp_sweep.add_argument("--top-n", type=int, default=3, help="How many rows to keep")
+    sp_sweep.add_argument("--min-trades", type=int, default=1, help="Filter by minimum number of trades")
 
-    # walk-forward
-    wf = sub.add_parser("walk-forward", help="Walk-forward validation")
-    wf.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
-    wf.add_argument("--metric", type=str, default="sharpe")
-    wf.add_argument("--wf-folds", type=int, dest="wf_folds", default=4)
-    wf.add_argument("--wf-train-frac", type=float, dest="wf_train_frac", default=0.7)
-    wf.add_argument("--min-trades", type=int, default=1)
-    wf.add_argument("--grid-file", type=str, default="")
-    wf.set_defaults(_handler=_run_walk_forward)
+    # ---- optimize ----
+    sp_opt = subparsers.add_parser("optimize", help="Grid or local optimize of a single strategy")
+    sp_opt.set_defaults(_handler=_run_optimize)
+    sp_opt.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
+    sp_opt.add_argument("--metric", type=str, default="sharpe")
+    sp_opt.add_argument("--top-n", type=int, default=10)
+    sp_opt.add_argument("--min-trades", type=int, default=10)
+    sp_opt.add_argument("--grid-file", type=str, default=None, help="Path to JSON grid or '-' for stdin")
 
-    # trade-live
-    tl = sub.add_parser("trade-live", help="Live modes")
+    for sp in (sp_opt,):
+        sp.add_argument("--ema-fast", type=int, default=12)
+        sp.add_argument("--ema-slow", type=int, default=21)
+        sp.add_argument("--adx-len", type=int, default=14)
+        sp.add_argument("--adx-on", type=float, default=25.0)
+        sp.add_argument("--adx-off", type=float, default=16.0)
+        sp.add_argument("--require-di", action="store_true")
+        sp.add_argument("--atr-len", type=int, default=14, help="ATR length (ema_adx_atr)")
+        sp.add_argument("--atr-mult", type=float, default=2.0, help="ATR multiple (ema_adx_atr)")
+
+    # ---- robustness ----
+    sp_rb = subparsers.add_parser("robustness", help="Robustness check for fixed params")
+    sp_rb.set_defaults(_handler=_run_robustness)
+    sp_rb.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
+    sp_rb.add_argument("--rb-windows", type=int, default=8)
+    sp_rb.add_argument("--min-trades", type=int, default=5)
+
+    for sp in (sp_rb,):
+        sp.add_argument("--ema-fast", type=int, default=12)
+        sp.add_argument("--ema-slow", type=int, default=21)
+        sp.add_argument("--adx-len", type=int, default=14)
+        sp.add_argument("--adx-on", type=float, default=25.0)
+        sp.add_argument("--adx-off", type=float, default=16.0)
+        sp.add_argument("--require-di", action="store_true")
+        sp.add_argument("--atr-len", type=int, default=14)
+        sp.add_argument("--atr-mult", type=float, default=2.0)
+
+    # ---- walk-forward ----
+    sp_wf = subparsers.add_parser("walk-forward", help="Walk-forward validation")
+    sp_wf.set_defaults(_handler=_run_walk_forward)
+    sp_wf.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
+    sp_wf.add_argument("--metric", type=str, default="sharpe")
+    sp_wf.add_argument("--wf-folds", type=int, default=6)
+    sp_wf.add_argument("--wf-train-frac", type=float, default=0.7)
+    sp_wf.add_argument("--min-trades", type=int, default=2)
+    sp_wf.add_argument("--grid-file", type=str, default=None)
+
+    for sp in (sp_wf,):
+        sp.add_argument("--ema-fast", type=int, default=12)
+        sp.add_argument("--ema-slow", type=int, default=21)
+        sp.add_argument("--adx-len", type=int, default=14)
+        sp.add_argument("--adx-on", type=float, default=25.0)
+        sp.add_argument("--adx-off", type=float, default=16.0)
+        sp.add_argument("--require-di", action="store_true")
+        sp.add_argument("--atr-len", type=int, default=14)
+        sp.add_argument("--atr-mult", type=float, default=2.0)
+
+    # ---- trade-live ----
+    tl = subparsers.add_parser("trade-live", help="Live trading modes")
+    tl.set_defaults(_handler=_dispatch_live)
     tl.add_argument("--mode", type=str, required=True, choices=["observe", "paper"])
     tl.add_argument("--strategy", type=str, required=True, choices=["ema_adx", "ema_adx_atr"])
-    tl.add_argument("--ema-fast", type=int, dest="ema_fast", default=12)
-    tl.add_argument("--ema-slow", type=int, dest="ema_slow", default=21)
-    tl.add_argument("--adx-len", type=int, dest="adx_len", default=14)
-    tl.add_argument("--adx-on", type=float, dest="adx_on", default=25.0)
-    tl.add_argument("--adx-off", type=float, dest="adx_off", default=16.0)
-    tl.add_argument("--require-di", action="store_true", dest="require_di")
-    tl.add_argument("--atr-len", type=int, dest="atr_len", default=14)
-    tl.add_argument("--poll-sec", type=int, default=10)
-    tl.add_argument("--summary-alert", action="store_true")
+
+    tl.add_argument("--ema-fast", type=int, default=12)
+    tl.add_argument("--ema-slow", type=int, default=21)
+    tl.add_argument("--adx-len", type=int, default=14)
+    tl.add_argument("--adx-on", type=float, default=25.0)
+    tl.add_argument("--adx-off", type=float, default=16.0)
+    tl.add_argument("--require-di", action="store_true")
+    tl.add_argument("--atr-len", type=int, default=14)
+    tl.add_argument("--atr-mult", type=float, default=2.0)
+
+    tl.add_argument("--poll-sec", type=int, default=10, help="Polling period in seconds")
+    tl.add_argument("--summary-alert", action="store_true", help="Print short alerts on ENTER/EXIT")
+
     tl.add_argument("--observe-rows", type=int, default=20, help="How many recent rows to print in observe table")
     tl.add_argument("--observe-save-snapshots", action="store_true",
                     help="Save table snapshot CSV on ENTER/EXIT events")
-    tl.set_defaults(_handler=_dispatch_live)
+    tl.add_argument("--observe-always-print", action="store_true", help="Print table every poll (not only on new bar)")
+    tl.add_argument("--observe-max-mins", type=int, default=0, help="Auto-stop after N minutes (0=forever)")
+    tl.add_argument("--observe-max-iter", type=int, default=0, help="Auto-stop after N iterations (0=forever)")
 
-    return p
+    return parser
 
 
 def _dispatch_live(a) -> int:
