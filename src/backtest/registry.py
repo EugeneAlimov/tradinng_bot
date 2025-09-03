@@ -1,106 +1,107 @@
 # src/backtest/registry.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import product
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
-import numpy as np
-import pandas as pd
+# Мы делегируем логику стратегиям из src/strategies/*
+try:
+    from src.strategies.ema_adx import build_trades as _ema_adx_build
+except Exception:  # pragma: no cover
+    _ema_adx_build = None  # type: ignore
 
-BuildTrades = Tuple[List[Dict[str, Any]], np.ndarray]
+try:
+    from src.strategies.ema_adx_atr import build_trades as _ema_adx_atr_build
+except Exception:  # pragma: no cover
+    _ema_adx_atr_build = None  # type: ignore
 
 
 @dataclass(frozen=True)
-class Strategy:
-    key: str
-    build: Callable[..., Any]          # build(df, Params, **kwargs) -> (trades, pnl) | (trades, pnl, extra)
-    params_type: type                  # dataclass Params
-    default_grid: Optional[Callable[[], Dict[str, List[Any]]]] = None
+class StrategyBuilder:
+    name: str
+    build: Callable[[Any, Dict[str, Any]], Tuple[Any, Any]]  # (trades_df, equity_like)
 
 
-_REGISTRY: Dict[str, Strategy] = {}
+def _wrap(build_fn):
+    """Унифицируем сигнатуру билдеров: (df, params) -> (trades, equity)."""
+    def _builder(df, params):
+        return build_fn(df, params=params)
+    return _builder
 
 
-def _register(key: str, build: Callable[..., Any], params_type: type,
-              default_grid: Optional[Callable[[], Dict[str, List[Any]]]] = None) -> None:
-    _REGISTRY[key] = Strategy(key=key, build=build, params_type=params_type, default_grid=default_grid)
-
-
-def _try_register(module_path: str, key: str) -> None:
+def get_registry_builder() -> Dict[str, StrategyBuilder]:
     """
-    Унифицированная загрузка стратегий из src.strategies.*
-    Ожидаем, что в модуле есть: build, Params (dataclass), default_grid (опционально).
+    Возвращает доступные стратегии {name: StrategyBuilder}.
+    Подключаем только то, что реально импортируется без ошибок.
     """
-    try:
-        mod = __import__(module_path, fromlist=["build", "Params", "default_grid"])
-        build = getattr(mod, "build")
-        params_type = getattr(mod, "Params")
-        default_grid = getattr(mod, "default_grid", None)
-        _register(key, build, params_type, default_grid)
-    except Exception:
-        # Тихо пропускаем — стратегия необязательная.
-        pass
+    builders: Dict[str, StrategyBuilder] = {}
+
+    if _ema_adx_build is not None:
+        builders["ema_adx"] = StrategyBuilder(
+            name="ema_adx",
+            build=_wrap(_ema_adx_build),
+        )
+
+    if _ema_adx_atr_build is not None:
+        builders["ema_adx_atr"] = StrategyBuilder(
+            name="ema_adx_atr",
+            build=_wrap(_ema_adx_atr_build),
+        )
+
+    return builders
 
 
-# --- регистрируем доступные стратегии из src/strategies/* ---
-_try_register("src.strategies.ema_adx", "ema_adx")
-_try_register("src.strategies.ema_adx_atr", "ema_adx_atr")
-_try_register("src.strategies.rsi2", "rsi2")
-_try_register("src.strategies.bbands", "bb_breakout")
-_try_register("src.strategies.donchian", "donchian")
-_try_register("src.strategies.macd_cross", "macd_cross")
+def _grid_product(options: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
+    """Декартово произведение словаря списков -> список dict'ов параметров."""
+    keys = list(options.keys())
+    if not keys:
+        return []
+    result: List[Dict[str, Any]] = []
+
+    def rec(i: int, cur: Dict[str, Any]):
+        if i == len(keys):
+            result.append(dict(cur))
+            return
+        k = keys[i]
+        for v in options[k]:
+            cur[k] = v
+            rec(i + 1, cur)
+
+    rec(0, {})
+    return result
 
 
-def _expand_grid(spec: Dict[str, List[Any]] | None) -> List[Dict[str, Any]]:
+def get_default_grid(strategy: str) -> List[Dict[str, Any]]:
     """
-    Преобразует сетку вида {"a":[1,2], "b":[10,20]} в список комбинаций:
-    [{"a":1,"b":10}, {"a":1,"b":20}, {"a":2,"b":10}, {"a":2,"b":20}]
+    Разумные сетки по умолчанию для стратегий.
+    Используются в optimize/robustness/walk-forward, если пользователь сам не задал свою сетку.
     """
-    if not spec:
-        return [{}]
-    keys = list(spec.keys())
-    values_lists = [v if isinstance(v, (list, tuple)) else [v] for v in (spec[k] for k in keys)]
-    combos: List[Dict[str, Any]] = []
-    for vals in product(*values_lists):
-        combos.append(dict(zip(keys, vals)))
-    return combos
+    s = strategy.lower()
 
+    if s == "ema_adx":
+        # То, что у тебя реально работает по логам optimize
+        return _grid_product({
+            "fast": [8, 12, 16],
+            "slow": [21, 34, 55],
+            "adx_len": [14],
+            "on": [20.0, 25.0, 30.0],
+            "off": [14.0, 16.0, 18.0],
+            "require_di": [False, True],
+        })
 
-def get_registry_builder() -> Dict[str, Callable[[pd.DataFrame, Dict[str, Any]], BuildTrades]]:
-    """
-    Возвращает mapping: strategy_key -> builder(df, params_dict) -> (trades, pnl)
-    Унифицируем вызов всех стратегий: dict -> dataclass Params.
-    """
-    out: Dict[str, Callable[[pd.DataFrame, Dict[str, Any]], BuildTrades]] = {}
+    if s == "ema_adx_atr":
+        # Та же сетка + параметры ATR-менеджмента
+        return _grid_product({
+            "fast": [8, 12, 16],
+            "slow": [21, 34, 55],
+            "adx_len": [14],
+            "on": [20.0, 25.0, 30.0],
+            "off": [14.0, 16.0, 18.0],
+            "require_di": [False, True],
+            "atr_len": [14],
+            "sl_mult": [1.0, 1.5],
+            "tp_mult": [2.0, 3.0],
+            "trail_mult": [0.0, 1.0],
+        })
 
-    for s in _REGISTRY.values():
-        def make_builder(build_fn: Callable[..., Any], P: type) -> Callable[[pd.DataFrame, Dict[str, Any]], BuildTrades]:
-            def builder(df: pd.DataFrame, params: Dict[str, Any]) -> BuildTrades:
-                p = P(**params)  # преобразуем dict в dataclass Params
-                result = build_fn(df, p)  # допускаем (trades, pnl) или (trades, pnl, extra)
-                if not isinstance(result, tuple) or len(result) < 2:
-                    raise RuntimeError(f"Strategy '{s.key}' build() must return at least (trades, pnl)")
-                trades, pnl = result[0], result[1]
-                return trades, pnl
-            return builder
-
-        out[s.key] = make_builder(s.build, s.params_type)
-
-    return out
-
-
-def get_default_grid() -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Возвращает mapping: strategy_key -> list[params_dict]
-    """
-    grids: Dict[str, List[Dict[str, Any]]] = {}
-    for s in _REGISTRY.values():
-        if s.default_grid:
-            try:
-                grids[s.key] = _expand_grid(s.default_grid())
-            except Exception:
-                # Если дефолтная сетка сломана — пропустим стратегию
-                continue
-    return grids
+    raise ValueError(f"Unknown strategy for default grid: {strategy}")
