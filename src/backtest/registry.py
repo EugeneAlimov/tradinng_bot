@@ -1,107 +1,115 @@
-# src/backtest/registry.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple, Optional
 
-# Мы делегируем логику стратегиям из src/strategies/*
-try:
-    from src.strategies.ema_adx import build_trades as _ema_adx_build
-except Exception:  # pragma: no cover
-    _ema_adx_build = None  # type: ignore
-
-try:
-    from src.strategies.ema_adx_atr import build_trades as _ema_adx_atr_build
-except Exception:  # pragma: no cover
-    _ema_adx_atr_build = None  # type: ignore
+import numpy as np
+import pandas as pd
 
 
-@dataclass(frozen=True)
+# Тип билда стратегии
+BuildFn = Callable[[pd.DataFrame, Dict[str, Any]],
+                   Tuple[List[Dict[str, Any]], np.ndarray, Dict[str, Any]]]
+
+
+@dataclass
 class StrategyBuilder:
     name: str
-    build: Callable[[Any, Dict[str, Any]], Tuple[Any, Any]]  # (trades_df, equity_like)
+    build: BuildFn
+    default_grid: Optional[Callable[[], List[Dict[str, Any]]]] = None
 
 
-def _wrap(build_fn):
-    """Унифицируем сигнатуру билдеров: (df, params) -> (trades, equity)."""
-    def _builder(df, params):
-        return build_fn(df, params=params)
-    return _builder
+# Локальный реестр
+_builders: Dict[str, StrategyBuilder] = {}
 
+
+def _safe_register(mod_path: str, name: Optional[str] = None,
+                   grid_fn: Optional[Callable[[], List[Dict[str, Any]]]] = None) -> None:
+    """
+    Импортирует модуль стратегии и регистрирует её,
+    но не падает, если модуль отсутствует.
+    """
+    try:
+        module = __import__(mod_path, fromlist=["*"])
+        build_fn: BuildFn = getattr(module, "build")
+        strat_name: str = getattr(module, "name", name or mod_path.rsplit(".", 1)[-1])
+        _builders[strat_name] = StrategyBuilder(strat_name, build_fn, grid_fn)
+    except Exception:  # noqa: BLE001 – реестр не должен падать от частных ошибок
+        pass
+
+
+# === default grids ==============================================================
+
+def _grid_ema_adx() -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for fast in (8, 12, 16):
+        for slow in (21, 34, 55):
+            for on in (20.0, 25.0, 30.0):
+                for off in (14.0, 16.0, 18.0):
+                    for require_di in (False, True):
+                        out.append(
+                            {"fast": fast, "slow": slow, "adx_len": 14,
+                             "on": on, "off": off, "require_di": require_di}
+                        )
+    return out
+
+
+def _grid_macd() -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for fast in (8, 12):
+        for slow in (21, 26):
+            for signal in (9, 12):
+                out.append({"fast": fast, "slow": slow, "signal": signal})
+    return out
+
+
+def _grid_donchian() -> List[Dict[str, Any]]:
+    return [{"ch_len": n} for n in (20, 30, 55)]
+
+
+# === наполнение реестра =========================================================
+
+def _init_registry() -> None:
+    # базовые стратегии (есть в проекте)
+    _safe_register("src.strategies.ema_adx", name="ema_adx", grid_fn=_grid_ema_adx)
+    _safe_register("src.strategies.ema_adx_atr", name="ema_adx_atr")  # билдер уже есть
+    _safe_register("src.strategies.macd_cross", name="macd_cross", grid_fn=_grid_macd)
+    _safe_register("src.strategies.donchian", name="donchian", grid_fn=_grid_donchian)
+
+    # подключим, если присутствуют в репо
+    _safe_register("src.strategies.rsi2", name="rsi2")
+    _safe_register("src.strategies.bbands", name="bb_breakout")
+
+
+# инициализируем один раз при импорте
+_init_registry()
+
+
+# === публичный API ==============================================================
 
 def get_registry_builder() -> Dict[str, StrategyBuilder]:
     """
-    Возвращает доступные стратегии {name: StrategyBuilder}.
-    Подключаем только то, что реально импортируется без ошибок.
+    Вернёт карту: strategy_name -> StrategyBuilder(build, default_grid)
     """
-    builders: Dict[str, StrategyBuilder] = {}
-
-    if _ema_adx_build is not None:
-        builders["ema_adx"] = StrategyBuilder(
-            name="ema_adx",
-            build=_wrap(_ema_adx_build),
-        )
-
-    if _ema_adx_atr_build is not None:
-        builders["ema_adx_atr"] = StrategyBuilder(
-            name="ema_adx_atr",
-            build=_wrap(_ema_adx_atr_build),
-        )
-
-    return builders
+    return dict(_builders)
 
 
-def _grid_product(options: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
-    """Декартово произведение словаря списков -> список dict'ов параметров."""
-    keys = list(options.keys())
-    if not keys:
-        return []
-    result: List[Dict[str, Any]] = []
-
-    def rec(i: int, cur: Dict[str, Any]):
-        if i == len(keys):
-            result.append(dict(cur))
-            return
-        k = keys[i]
-        for v in options[k]:
-            cur[k] = v
-            rec(i + 1, cur)
-
-    rec(0, {})
-    return result
-
-
-def get_default_grid(strategy: str) -> List[Dict[str, Any]]:
+def get_default_grid(strategy: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]] | List[Dict[str, Any]]:
     """
-    Разумные сетки по умолчанию для стратегий.
-    Используются в optimize/robustness/walk-forward, если пользователь сам не задал свою сетку.
+    Если strategy is None -> вернёт карту strategy -> grid.
+    Если указано имя стратегии -> вернёт список её сетки (или [] если не найдено).
     """
-    s = strategy.lower()
+    grid_map: Dict[str, List[Dict[str, Any]]] = {}
+    for k, b in _builders.items():
+        if b.default_grid is not None:
+            try:
+                grid_map[k] = list(b.default_grid())
+            except Exception:
+                grid_map[k] = []
+        else:
+            grid_map[k] = []
 
-    if s == "ema_adx":
-        # То, что у тебя реально работает по логам optimize
-        return _grid_product({
-            "fast": [8, 12, 16],
-            "slow": [21, 34, 55],
-            "adx_len": [14],
-            "on": [20.0, 25.0, 30.0],
-            "off": [14.0, 16.0, 18.0],
-            "require_di": [False, True],
-        })
-
-    if s == "ema_adx_atr":
-        # Та же сетка + параметры ATR-менеджмента
-        return _grid_product({
-            "fast": [8, 12, 16],
-            "slow": [21, 34, 55],
-            "adx_len": [14],
-            "on": [20.0, 25.0, 30.0],
-            "off": [14.0, 16.0, 18.0],
-            "require_di": [False, True],
-            "atr_len": [14],
-            "sl_mult": [1.0, 1.5],
-            "tp_mult": [2.0, 3.0],
-            "trail_mult": [0.0, 1.0],
-        })
-
-    raise ValueError(f"Unknown strategy for default grid: {strategy}")
+    if strategy is None:
+        return grid_map
+    return grid_map.get(strategy, [])
