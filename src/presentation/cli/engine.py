@@ -26,7 +26,7 @@ def _parse_candles(flag: str) -> Tuple[str, int]:
     return tf.strip(), int(n)
 
 
-# ===== HTTP small client =====
+# ===== HTTP client =====
 
 class _HttpClient:
     def __init__(self, base_url: str, timeout: float, retries: int, backoff: float):
@@ -41,7 +41,7 @@ class _HttpClient:
         return f"{self.base_url}/{path.lstrip('/')}"
 
     def get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
-        import requests  # lazy import
+        import requests
         url = self._url(path)
         last_err: Optional[str] = None
         for i in range(self.retries + 1):
@@ -54,7 +54,7 @@ class _HttpClient:
                 except Exception:
                     js = r.text
                 return st, js
-            except Exception as ex:
+            except requests.exceptions.RequestException as ex:
                 last_err = f"{type(ex).__name__}: {ex}"
                 if i < self.retries:
                     time.sleep(self.backoff * (2 ** i))
@@ -65,34 +65,42 @@ class _HttpClient:
 
 
 def _fetch_exmo_ohlc(args, pair: str, candles: str) -> pd.DataFrame:
-    tf, n = _parse_candles(candles)
-    period = _PERIODS.get(tf, 300)
-    now = int(time.time())
-    params = {"symbol": pair, "resolution": int(period / 60), "from": now - n * period, "to": now}
-    base_url = "https://api.exmo.com/v1.1"
-    client = _HttpClient(base_url, args.http_timeout, args.http_retries, args.http_backoff)
-    st, js = client.get_json("/candles_history", params=params)
+    try:
+        tf, n = _parse_candles(candles)
+    except Exception as e:
+        LOG.error("bad --candles: %s", e)
+        return pd.DataFrame()
+    if tf not in _PERIODS:
+        LOG.error("Unsupported timeframe '%s'", tf)
+        return pd.DataFrame()
+
+    period = _PERIODS[tf]
+    t_to = int(time.time())
+    t_from = t_to - n * period
+    client = _HttpClient("https://api.exmo.com/v1.1", args.http_timeout, args.http_retries, args.http_backoff)
+    st, js = client.get_json("/candles_history",
+                             params={"symbol": pair, "resolution": int(period / 60), "from": t_from, "to": t_to})
     if st != 200 or not isinstance(js, dict) or "candles" not in js:
         LOG.warning("[exmo] bad response status=%s body=%s", st, str(js)[:200])
         return pd.DataFrame()
+
     rows = js.get("candles", [])
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
-    # normalize
     df = df.rename(columns={"t": "timestamp", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
     for c in ("open", "high", "low", "close", "volume"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+
     ts = pd.to_numeric(df["timestamp"], errors="coerce").astype("Int64").to_numpy(dtype="float64")
-    # some APIs return ms
-    if np.nanmean(ts) > 10_000_000_000:
+    if np.nanmean(ts) > 10_000_000_000:  # ms → s
         ts = ts / 1000.0
     df["timestamp"] = ts.astype("int64", copy=False)
     df["dt"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
     df = df.sort_values("dt").drop_duplicates(subset=["dt"]).reset_index(drop=True)
 
-    # high/low sanity
+    # sanity high/low
     if {"open", "high", "low", "close"}.issubset(df.columns):
         hi = df[["open", "close"]].max(axis=1)
         lo = df[["open", "close"]].min(axis=1)
@@ -111,7 +119,7 @@ def _registry_get_builder() -> Dict[str, Any]:
 
 def _registry_get_grid(strategy: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
     from src.backtest.registry import get_default_grid as _get_grid
-    # support both signatures (get_default_grid() vs get_default_grid(name))
+    # поддерживаем сигнатуры get_default_grid() и get_default_grid(name)
     try:
         grid_map = _get_grid()  # type: ignore[misc]
         if isinstance(grid_map, dict):
@@ -156,31 +164,7 @@ def _build_trades(strategy: str, df: pd.DataFrame, params: Dict[str, Any]):
     return trades, np.asarray(pnls, dtype=float)
 
 
-# ===== Helpers for auto-escalation =====
-
-def _auto_expand_history(args) -> bool:
-    step = int(getattr(args, "auto_candles_step", 400) or 400)
-    cap = int(getattr(args, "auto_candles_max", 4000) or 4000)
-    tf, n = args.candles.split(":")
-    n = int(n)
-    if n >= cap:
-        return False
-    args.candles = f"{tf}:{min(cap, n + step)}"
-    LOG.info("[auto] увеличиваю историю: %s -> %s", f"{tf}:{n}", args.candles)
-    return True
-
-
-def _auto_relax_min_trades(args) -> bool:
-    if not hasattr(args, "min_trades"):
-        return False
-    floor = int(getattr(args, "auto_min_trades_min", 1) or 1)
-    cur = int(getattr(args, "min_trades", 1) or 1)
-    if cur <= floor:
-        return False
-    args.min_trades = max(floor, cur - 1)
-    LOG.info("[auto] ослабляю min_trades: -> %d", args.min_trades)
-    return True
-
+# ===== CSV out =====
 
 def _save_csv(args, df: pd.DataFrame, suffix: str) -> None:
     os.makedirs(args.out_dir, exist_ok=True)
@@ -329,11 +313,10 @@ def run_walk_forward(args) -> int:
     return 0
 
 
-# ===== LIVE (observe/paper) =====
+# ===== LIVE (observe) =====
 
 def _live_params_from_args(args) -> Dict[str, Any]:
     params: Dict[str, Any] = {}
-    # ema_adx
     if hasattr(args, "ema_fast"):
         params["fast"] = int(args.ema_fast)
     if hasattr(args, "ema_slow"):
@@ -346,31 +329,21 @@ def _live_params_from_args(args) -> Dict[str, Any]:
         params["off"] = float(args.adx_off)
     if hasattr(args, "require_di"):
         params["require_di"] = bool(args.require_di)
-
-    # fees/slip (если билдер их учитывает — передадим)
     if hasattr(args, "fee_bps"):
         params["fees_bps"] = float(args.fee_bps)
     if hasattr(args, "slip_bps"):
         params["slippage_bps"] = float(args.slip_bps)
-
     return params
 
 
 def _evaluate_last_signal(strategy: str, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Строим сигналы на полной истории и читаем последнюю точку.
-    """
     builders = _registry_get_builder()
     if strategy not in builders:
         return {"ok": False, "msg": f"strategy not registered: {strategy}"}
-
     build_fn = builders[strategy].build
     try:
-        # билдер возвращает (trades, pnls, extra); нам нужны extra, чтобы понять EMA/ADX и пр.,
-        # но для простоты прочитаем по косвенным признакам (или расширим extra — на твой вкус).
         trades, pnls, extra = build_fn(df, params)
         last_row = df.iloc[-1]
-        # простое резюме
         status = {
             "ok": True,
             "ts": int(last_row["timestamp"]),
@@ -378,7 +351,6 @@ def _evaluate_last_signal(strategy: str, df: pd.DataFrame, params: Dict[str, Any
             "close": float(last_row["close"]),
             "n_trades_alltime": int(len(trades)),
         }
-        # добавим из extra, если есть
         if isinstance(extra, dict):
             for k in ("ema_fast", "ema_slow", "adx"):
                 if k in extra:
@@ -394,26 +366,21 @@ def _evaluate_last_signal(strategy: str, df: pd.DataFrame, params: Dict[str, Any
 
 def run_trade_live(args) -> int:
     LOG.info("Command: trade-live mode=%s strategy=%s", args.mode, args.strategy)
-
-    # Начальная загрузка истории
     df = _fetch_exmo_ohlc(args, args.pair, args.candles)
     if df.empty:
         print("(no data)")
         return 0
-
     print(f"[live] {args.mode} {args.pair} {args.candles} strategy={args.strategy} rows={len(df)}")
 
     poll = int(getattr(args, "poll_sec", 10))
     summary = bool(getattr(args, "summary_alert", False))
     params = _live_params_from_args(args)
 
-    # внутреннее состояние наблюдения (без реальной торговли)
     last_print_ts: Optional[int] = None
-    simulated_in_pos = False  # просто отображение (можно расширить до paper)
+    simulated_in_pos = False
 
     try:
         while True:
-            # обновим последний кусок истории (оставим ту же глубину, это быстрее и воспроизводимо)
             df = _fetch_exmo_ohlc(args, args.pair, args.candles)
             if df.empty:
                 LOG.warning("[live] empty data on refresh")
@@ -424,13 +391,7 @@ def run_trade_live(args) -> int:
             last_ts = int(last["timestamp"])
             close = float(last["close"])
 
-            # оценим сигнал на последней свече
             sig = _evaluate_last_signal(args.strategy, df, params)
-            if not sig.get("ok"):
-                LOG.debug("[live] eval error: %s", sig.get("msg"))
-
-            # простая симуляция статуса: если EMAfast>EMAslow и ADX>on — считаем вход, иначе выход
-            # (это консистентно с ema_adx.signals)
             fast = sig.get("ema_fast")
             slow = sig.get("ema_slow")
             adx = sig.get("adx")
@@ -445,9 +406,7 @@ def run_trade_live(args) -> int:
                     simulated_in_pos = False
                     exited = True
 
-            # Вывод
             if summary:
-                # печатаем только на изменениях свэчи/сигнала, чтобы не сыпать логами
                 if last_print_ts != last_ts or entered or exited:
                     state = "IN" if simulated_in_pos else "OUT"
                     bits = [
@@ -466,7 +425,6 @@ def run_trade_live(args) -> int:
                     print("  ".join(bits))
                     last_print_ts = last_ts
             else:
-                # лаконичный heartbeat
                 print(f"[live] {last['dt']} close={close:.6f} rows={len(df)}", flush=True)
 
             time.sleep(poll)

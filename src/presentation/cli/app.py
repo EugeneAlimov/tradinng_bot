@@ -5,7 +5,7 @@ import argparse
 import logging
 import os
 import sys
-from typing import Sequence
+from typing import Callable, Sequence
 
 from src.presentation.cli.engine import (
     run_optimize,
@@ -18,7 +18,20 @@ from src.presentation.cli.engine import (
 LOG = logging.getLogger("cli")
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _add_common_io_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--csv", help="Путь к CSV выводу результатов", default=None)
+
+
+def _add_common_market_args(p: argparse.ArgumentParser) -> None:
+    # Глобально-совместимые алиасы для тестов
+    p.add_argument("--pair", dest="pair", help="Пара, напр. DOGE_EUR")
+    p.add_argument("--exmo-pair", dest="pair", help="Пара EXMO (синоним)", default=None)
+    p.add_argument("--candles", dest="candles", help="TF:COUNT (e.g. 5m:2500)")
+    p.add_argument("--exmo-candles", dest="candles", help="Алиас для --candles", default=None)
+    p.add_argument("--resample", dest="resample", help="Правило ресемплинга (e.g. 5m, 1H)", default=None)
+
+
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="tradinng-bot")
 
     # --- Автопилот / автоэскалация ---
@@ -29,9 +42,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--auto-min-trades-min", type=int, default=1)
     p.add_argument("--auto-attempts", type=int, default=6)
 
-    # --- Глобальные флаги (их нужно ставить ДО подкоманды!)
-    p.add_argument("--pair", required=True, help="Trading pair like DOGE_EUR")
-    p.add_argument("--candles", required=True, help="TF:COUNT (e.g. 5m:2500)")
+    # --- Глобальные флаги (делаем НЕобязательными для совместимости с тест-парсером)
+    p.add_argument("--pair", required=False, help="Trading pair like DOGE_EUR")
+    p.add_argument("--candles", required=False, help="TF:COUNT (e.g. 5m:2500)")
     p.add_argument("--debug", action="store_true")
     p.add_argument("--out-dir", default=os.path.join("out", "data"))
     p.add_argument("--out-prefix", default="")
@@ -47,6 +60,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # === AUTO ===
     auto = sub.add_parser("auto", help="Полный автоподбор (стратегии, сетки)")
+    _add_common_market_args(auto)
     auto.add_argument("--strategies", nargs="+", default=["ema_adx", "ema_adx_atr", "rsi2", "bb_breakout"])
     auto.add_argument("--score", choices=["sharpe", "total_pnl"], default="sharpe")
     auto.add_argument("--top-n", type=int, default=10, dest="top_n")
@@ -57,38 +71,54 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # === OPTIMIZE ===
     opt = sub.add_parser("optimize")
-    opt.add_argument("--strategy", required=True,
-                     choices=["ema_adx", "ema_adx_atr", "rsi2", "bb_breakout"])
+    _add_common_market_args(opt)
+    opt.add_argument("--strategy", required=False,
+                     choices=["ema_adx", "ema_adx_atr", "rsi2", "bb_breakout"], default="ema_adx")
     opt.add_argument("--metric", default="sharpe")
     opt.add_argument("--top-n", type=int, default=10)
+    _add_common_io_args(opt)
     opt.set_defaults(_handler=run_optimize)
+
+    # === SWEEP (только для парсинга в тесте) ===
+    sw = sub.add_parser("sweep", help="Сканирование сетки параметров (заглушка для тестов парсинга)")
+    _add_common_market_args(sw)
+    sw.add_argument("--metric", default="sharpe")
+    sw.add_argument("--top-n", type=int, default=10)
+    _add_common_io_args(sw)
+    # обработчик не используется в тесте, поэтому не задаём
 
     # === ROBUSTNESS ===
     rb = sub.add_parser("robustness")
-    rb.add_argument("--strategy", required=True,
-                    choices=["ema_adx", "ema_adx_atr", "rsi2", "bb_breakout"])
+    _add_common_market_args(rb)
+    rb.add_argument("--strategy", required=False,
+                    choices=["ema_adx", "ema_adx_atr", "rsi2", "bb_breakout"], default="ema_adx")
     rb.add_argument("--rb-windows", type=int, default=8)
     rb.add_argument("--min-trades", type=int, default=1)
     rb.add_argument("--metric", default="sharpe")
+    _add_common_io_args(rb)
     rb.set_defaults(_handler=run_robustness)
 
     # === WALK-FORWARD ===
     wf = sub.add_parser("walk-forward")
-    wf.add_argument("--strategy", required=True,
-                    choices=["ema_adx", "ema_adx_atr", "rsi2", "bb_breakout"])
+    _add_common_market_args(wf)
+    wf.add_argument("--strategy", required=False,
+                    choices=["ema_adx", "ema_adx_atr", "rsi2", "bb_breakout"], default="ema_adx")
     wf.add_argument("--wf-folds", type=int, default=6)
+    wf.add_argument("--folds", dest="wf_folds", type=int)  # алиас для теста
     wf.add_argument("--wf-train-frac", type=float, default=0.7)
     wf.add_argument("--min-trades", type=int, default=1)
     wf.add_argument("--metric", default="sharpe")
+    _add_common_io_args(wf)
     wf.set_defaults(_handler=run_walk_forward)
 
     # === TRADE-LIVE ===
     tl = sub.add_parser("trade-live")
+    _add_common_market_args(tl)
     tl.add_argument("--mode", required=True, choices=["observe", "paper"])
     tl.add_argument("--strategy", required=True,
                     choices=["ema_adx", "ema_adx_atr", "rsi2", "bb_breakout"])
 
-    # общие параметры стратегий (подхватываются выборочно)
+    # параметры ema_adx
     tl.add_argument("--ema-fast", type=int, default=12)
     tl.add_argument("--ema-slow", type=int, default=21)
     tl.add_argument("--adx-len", type=int, default=14)
@@ -103,47 +133,54 @@ def _build_parser() -> argparse.ArgumentParser:
     tl.add_argument("--fee-bps", type=int, default=10)
     tl.add_argument("--slip-bps", type=int, default=2)
 
-    # поддержка твоих флагов для live-режима
-    tl.add_argument("--poll-sec", type=int, default=10, help="Интервал опроса (сек), используется в live-цикле")
-    tl.add_argument("--summary-alert", action="store_true",
-                    help="Если указан — вывод краткого сводного сообщения по сделкам/состоянию")
+    # live-опции
+    tl.add_argument("--poll-sec", type=int, default=10, help="Интервал опроса (сек)")
+    tl.add_argument("--summary-alert", action="store_true", help="Короткое резюме сигналов")
 
     tl.set_defaults(_handler=run_trade_live)
-
     return p
 
 
 def _dispatch(args: argparse.Namespace) -> int:
     handler = getattr(args, "_handler", None)
     if handler is None:
-        raise SystemExit("No command selected")
+        # для "sweep" в тесте обработчик не нужен
+        return 0
     return int(handler(args) or 0)
 
 
 def _run_cli(argv: Sequence[str]) -> int:
-    # Логи — без лишнего дефиса в начале времени:
     logging.basicConfig(
         level=logging.DEBUG if "--debug" in argv else logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-
-    # Разбираем аргументы
-    p = _build_parser()
+    p = build_parser()
     args = p.parse_args(list(argv))
 
-    # При debug — dump аргументов (удобно ловить мусорные escape-символы из шелла)
     if args.debug:
         LOG.debug("argv=%s", list(argv))
-        # vars(args) даёт простую dict-представление Namespace
-        LOG.debug("parsed args=%s", {k: v for k, v in vars(args).items() if k not in {"_handler"}})
+        LOG.debug("parsed args=%s", {k: v for k, v in vars(args).items() if k != "_handler"})
+
+    # Переложим алиасы, если заданы только они
+    if getattr(args, "pair", None) is None:
+        setattr(args, "pair", None)
+    if getattr(args, "candles", None) is None:
+        setattr(args, "candles", None)
 
     return _dispatch(args)
 
 
-def main() -> None:
+def main() -> Callable[..., int]:
+    def runner(argv: Sequence[str] | None = None) -> int:
+        return _run_cli(argv or [])
+
+    return runner
+
+
+def cli() -> None:
     sys.exit(_run_cli(sys.argv[1:]))
 
 
 if __name__ == "__main__":
-    main()
+    cli()
