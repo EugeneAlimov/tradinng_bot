@@ -7,10 +7,9 @@ from typing import Any, Callable, Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 
-
 # Тип билда стратегии
 BuildFn = Callable[[pd.DataFrame, Dict[str, Any]],
-                   Tuple[List[Dict[str, Any]], np.ndarray, Dict[str, Any]]]
+Tuple[List[Dict[str, Any]], np.ndarray, Dict[str, Any]]]
 
 
 @dataclass
@@ -20,11 +19,10 @@ class StrategyBuilder:
     default_grid: Optional[Callable[[], List[Dict[str, Any]]]] = None
 
 
-# Локальный реестр
 _builders: Dict[str, StrategyBuilder] = {}
 
 
-def _safe_register(mod_path: str, name: Optional[str] = None,
+def _safe_register(mod_path: str, *, name: Optional[str] = None,
                    grid_fn: Optional[Callable[[], List[Dict[str, Any]]]] = None) -> None:
     """
     Импортирует модуль стратегии и регистрирует её,
@@ -35,7 +33,7 @@ def _safe_register(mod_path: str, name: Optional[str] = None,
         build_fn: BuildFn = getattr(module, "build")
         strat_name: str = getattr(module, "name", name or mod_path.rsplit(".", 1)[-1])
         _builders[strat_name] = StrategyBuilder(strat_name, build_fn, grid_fn)
-    except Exception:  # noqa: BLE001 – реестр не должен падать от частных ошибок
+    except Exception:
         pass
 
 
@@ -44,8 +42,8 @@ def _safe_register(mod_path: str, name: Optional[str] = None,
 def _grid_ema_adx() -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for fast in (8, 12, 16):
-        for slow in (21, 34, 55):
-            for on in (20.0, 25.0, 30.0):
+        for slow in (21, 26, 34, 55):
+            for on in (20.0, 23.0, 25.0, 30.0):
                 for off in (14.0, 16.0, 18.0):
                     for require_di in (False, True):
                         out.append(
@@ -58,7 +56,7 @@ def _grid_ema_adx() -> List[Dict[str, Any]]:
 def _grid_macd() -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for fast in (8, 12):
-        for slow in (21, 26):
+        for slow in (17, 26):
             for signal in (9, 12):
                 out.append({"fast": fast, "slow": slow, "signal": signal})
     return out
@@ -73,7 +71,7 @@ def _grid_donchian() -> List[Dict[str, Any]]:
 def _init_registry() -> None:
     # базовые стратегии (есть в проекте)
     _safe_register("src.strategies.ema_adx", name="ema_adx", grid_fn=_grid_ema_adx)
-    _safe_register("src.strategies.ema_adx_atr", name="ema_adx_atr")  # билдер уже есть
+    _safe_register("src.strategies.ema_adx_atr", name="ema_adx_atr")  # опционально
     _safe_register("src.strategies.macd_cross", name="macd_cross", grid_fn=_grid_macd)
     _safe_register("src.strategies.donchian", name="donchian", grid_fn=_grid_donchian)
 
@@ -89,16 +87,12 @@ _init_registry()
 # === публичный API ==============================================================
 
 def get_registry_builder() -> Dict[str, StrategyBuilder]:
-    """
-    Вернёт карту: strategy_name -> StrategyBuilder(build, default_grid)
-    """
     return dict(_builders)
 
 
-def get_default_grid(strategy: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]] | List[Dict[str, Any]]:
+def get_default_grid(strategy: Optional[str] = None):
     """
-    Если strategy is None -> вернёт карту strategy -> grid.
-    Если указано имя стратегии -> вернёт список её сетки (или [] если не найдено).
+    Если strategy=None — вернём карту {name: grid[]}, иначе — список grid для стратегии.
     """
     grid_map: Dict[str, List[Dict[str, Any]]] = {}
     for k, b in _builders.items():

@@ -14,73 +14,11 @@ import pandas as pd
 
 LOG = logging.getLogger("cli")
 
-# ===========================
-# --- HTTP / EXMO OHLC
-# ===========================
-
-try:
-    # если в инфраструктуре есть HttpClient — аккуратно используем
-    from src.infrastructure.http.http_utils import HttpClient as _ExternalHttpClient  # type: ignore
-except Exception:  # noqa: BLE001
-    _ExternalHttpClient = None
-
-
-class CompatHttpClient:
-    """Мини-клиент: старается взять внешний HttpClient, иначе падает на requests."""
-
-    def __init__(self, base_url: str, timeout: float, retries: int, backoff: float):
-        self.base_url = base_url.rstrip("/")
-        self.timeout = float(timeout)
-        self.retries = max(0, int(retries))
-        self.backoff = max(0.0, float(backoff))
-        self._client = None
-        if _ExternalHttpClient is not None:
-            try:
-                self._client = _ExternalHttpClient(base_url=self.base_url,
-                                                   timeout=self.timeout)  # type: ignore[call-arg]
-            except Exception:  # noqa: BLE001
-                try:
-                    self._client = _ExternalHttpClient()  # type: ignore[call-arg]
-                except Exception:  # noqa: BLE001
-                    self._client = None
-
-    def _url(self, path: str) -> str:
-        if path.startswith(("http://", "https://")):
-            return path
-        return f"{self.base_url}/{path.lstrip('/')}"
-
-    def get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
-        url = self._url(path)
-        last_error = None
-        for i in range(self.retries + 1):
-            t0 = time.perf_counter()
-            try:
-                if self._client is not None and hasattr(self._client, "get"):
-                    r = self._client.get(url, params=params)  # type: ignore[attr-defined]
-                    st = int(getattr(r, "status_code", 0) or 0)
-                    try:
-                        return st, r.json()
-                    except Exception:  # noqa: BLE001
-                        return st, getattr(r, "text", "")
-                # fallback — обычный requests
-                import requests  # lazy import
-                r = requests.get(url, params=params, timeout=self.timeout)
-                st = int(r.status_code)
-                try:
-                    return st, r.json()
-                except Exception:  # noqa: BLE001
-                    return st, r.text
-            except Exception as ex:  # noqa: BLE001
-                last_error = f"{type(ex).__name__}: {ex}"
-                if i < self.retries:
-                    time.sleep(self.backoff * (2 ** i))
-            finally:
-                dt_ms = (time.perf_counter() - t0) * 1000.0
-                LOG.debug("[http] GET %s in %.1fms (try %d/%d)", url, dt_ms, i + 1, self.retries + 1)
-        return 0, {"error": last_error or "HTTP error"}
-
-
 _PERIODS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
+
+
+def _utc_stamp() -> str:
+    return _dt.now(_UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
 def _parse_candles(flag: str) -> Tuple[str, int]:
@@ -88,143 +26,92 @@ def _parse_candles(flag: str) -> Tuple[str, int]:
     return tf.strip(), int(n)
 
 
+# ===== HTTP small client =====
+
+class _HttpClient:
+    def __init__(self, base_url: str, timeout: float, retries: int, backoff: float):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = float(timeout)
+        self.retries = max(0, int(retries))
+        self.backoff = max(0.0, float(backoff))
+
+    def _url(self, path: str) -> str:
+        if path.startswith(("http://", "https://")):
+            return path
+        return f"{self.base_url}/{path.lstrip('/')}"
+
+    def get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
+        import requests  # lazy import
+        url = self._url(path)
+        last_err: Optional[str] = None
+        for i in range(self.retries + 1):
+            t0 = time.perf_counter()
+            try:
+                r = requests.get(url, params=params, timeout=self.timeout)
+                st = int(r.status_code)
+                try:
+                    js = r.json()
+                except Exception:
+                    js = r.text
+                return st, js
+            except Exception as ex:
+                last_err = f"{type(ex).__name__}: {ex}"
+                if i < self.retries:
+                    time.sleep(self.backoff * (2 ** i))
+            finally:
+                dt_ms = (time.perf_counter() - t0) * 1000.0
+                LOG.debug("[http] GET %s in %.1fms (try %d/%d)", url, dt_ms, i + 1, self.retries + 1)
+        return 0, {"error": last_err or "HTTP error"}
+
+
 def _fetch_exmo_ohlc(args, pair: str, candles: str) -> pd.DataFrame:
-    """Тянем OHLC из EXMO; приводим к DataFrame с колонками:
-    ['dt','timestamp','open','high','low','close','volume'].
-    """
-    try:
-        tf, n = _parse_candles(candles)
-    except Exception as e:  # noqa: BLE001
-        LOG.error("bad --candles: %s", e)
+    tf, n = _parse_candles(candles)
+    period = _PERIODS.get(tf, 300)
+    now = int(time.time())
+    params = {"symbol": pair, "resolution": int(period / 60), "from": now - n * period, "to": now}
+    base_url = "https://api.exmo.com/v1.1"
+    client = _HttpClient(base_url, args.http_timeout, args.http_retries, args.http_backoff)
+    st, js = client.get_json("/candles_history", params=params)
+    if st != 200 or not isinstance(js, dict) or "candles" not in js:
+        LOG.warning("[exmo] bad response status=%s body=%s", st, str(js)[:200])
         return pd.DataFrame()
-    if tf not in _PERIODS:
-        LOG.error("Unsupported timeframe '%s'", tf)
+    rows = js.get("candles", [])
+    if not rows:
         return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    # normalize
+    df = df.rename(columns={"t": "timestamp", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
+    for c in ("open", "high", "low", "close", "volume"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    ts = pd.to_numeric(df["timestamp"], errors="coerce").astype("Int64").to_numpy(dtype="float64")
+    # some APIs return ms
+    if np.nanmean(ts) > 10_000_000_000:
+        ts = ts / 1000.0
+    df["timestamp"] = ts.astype("int64", copy=False)
+    df["dt"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+    df = df.sort_values("dt").drop_duplicates(subset=["dt"]).reset_index(drop=True)
 
-    period = _PERIODS[tf]
-    t_to = int(time.time())
-    t_from = t_to - n * period
-    http = CompatHttpClient(
-        base_url="https://api.exmo.com/v1.1",
-        timeout=float(getattr(args, "http_timeout", 15.0)),
-        retries=int(getattr(args, "http_retries", 0)),
-        backoff=float(getattr(args, "http_backoff", 0.0)),
-    )
-    st, payload = http.get_json("candles_history", params={
-        "symbol": pair, "resolution": tf, "from": t_from, "to": t_to
-    })
-    if st != 200:
-        LOG.warning("[http] non-200 or no candles: status=%s", st)
-        return pd.DataFrame()
+    # high/low sanity
+    if {"open", "high", "low", "close"}.issubset(df.columns):
+        hi = df[["open", "close"]].max(axis=1)
+        lo = df[["open", "close"]].min(axis=1)
+        df["high"] = df["high"].fillna(hi).where(df["high"] >= hi, hi)
+        df["low"] = df["low"].fillna(lo).where(df["low"] <= lo, lo)
 
-    try:
-        candles_payload = None
-        if isinstance(payload, dict):
-            if "candles" in payload:
-                candles_payload = payload["candles"]
-            elif isinstance(payload.get("result"), dict) and "candles" in payload["result"]:
-                candles_payload = payload["result"]["candles"]
-        if candles_payload is None:
-            LOG.warning("[http] unexpected payload: %s", list(payload) if isinstance(payload, dict) else type(payload))
-            return pd.DataFrame()
-
-        df = pd.DataFrame(candles_payload)
-        if df.empty:
-            return df
-
-        df = df.rename(columns={"t": "timestamp", "time": "timestamp",
-                                "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
-        for c in ("open", "high", "low", "close", "volume"):
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-
-        ts_col = "timestamp" if "timestamp" in df.columns else None
-        if ts_col is None:
-            for c in ("ts", "date"):
-                if c in df.columns:
-                    ts_col = c
-                    break
-        if ts_col is None:
-            LOG.warning("[http] no timestamp in payload")
-            return pd.DataFrame()
-
-        ts = pd.to_numeric(df[ts_col], errors="coerce").astype("Int64").to_numpy(dtype="float64")
-        # детект мс
-        if np.nanmean(ts) > 10_000_000_000:
-            ts = ts / 1000.0
-        df["timestamp"] = ts.astype("int64", copy=False)
-        df["dt"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
-        df = df.sort_values("dt").drop_duplicates(subset=["dt"]).reset_index(drop=True)
-
-        # sanity: high/low должны покрывать open/close
-        if {"open", "high", "low", "close"}.issubset(df.columns):
-            hi = df[["open", "close"]].max(axis=1)
-            lo = df[["open", "close"]].min(axis=1)
-            df["high"] = np.maximum(df["high"], hi)
-            df["low"] = np.minimum(df["low"], lo)
-
-        for w in ("ok", "dropped_nonfinite", "duplicates_removed", "was_sorted", "ts_unit_detected"):
-            LOG.warning("[ohlc] %s", w)  # ради совместимости с твоими логами
-
-        return df[["dt", "timestamp", "open", "high", "low", "close", "volume"]].copy()
-    except Exception as e:  # noqa: BLE001
-        LOG.warning("[http] parse error: %s", e)
-        return pd.DataFrame()
+    return df[["dt", "timestamp", "open", "high", "low", "close", "volume"]]
 
 
-# ===========================
-# --- Метрики / утилиты
-# ===========================
-
-def _utc_stamp() -> str:
-    return _dt.now(_UTC).strftime("%Y%m%d_%H%M%S")
-
-
-def _metrics_fast(pnls: np.ndarray) -> Dict[str, float]:
-    n = int(len(pnls))
-    if n == 0:
-        return dict(n_trades=0, win_rate=0.0, avg_pnl=0.0, total_pnl=0.0,
-                    max_dd=0.0, sharpe=float("-inf"), calmar=float("-inf"))
-    total = float(np.nansum(pnls))
-    avg = float(np.nanmean(pnls))
-    std = float(np.nanstd(pnls, ddof=1)) if n > 1 else 0.0
-    sharpe = (avg / std) if std > 0 else (float("inf") if avg > 0 else float("-inf"))
-    eq = np.cumsum(pnls)
-    dd = np.maximum.accumulate(eq) - eq
-    max_dd = float(np.nanmax(dd)) if len(dd) else 0.0
-    calmar = (total / max_dd) if max_dd > 0 else (float("inf") if total > 0 else float("-inf"))
-    win_rate = float(np.mean(pnls > 0))
-    return dict(n_trades=n, win_rate=win_rate, avg_pnl=avg, total_pnl=total,
-                max_dd=max_dd, sharpe=sharpe, calmar=calmar)
-
-
-# ===========================
-# --- Работа с реестром стратегий
-# ===========================
-
-BuildTrades = Tuple[List[Dict[str, Any]], np.ndarray]
-
+# ===== Registry bridges =====
 
 def _registry_get_builder() -> Dict[str, Any]:
-    from src.backtest.registry import get_registry_builder  # type: ignore
+    from src.backtest.registry import get_registry_builder
     return get_registry_builder()
 
 
 def _registry_get_grid(strategy: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
-    """Вернёт карту параметрических сеток.
-
-    Поддерживает оба API:
-      * get_default_grid() -> Dict[str, List[Dict]]
-      * get_default_grid(strategy) -> List[Dict]
-    Если strategy=None и доступна только новая сигнатура — соберём карту
-    по всем стратегиям из реестра.
-    """
-    try:
-        from src.backtest.registry import get_default_grid as _get_grid
-    except Exception:  # noqa: BLE001
-        return {}
-
-    # 1) старая сигнатура: без аргументов возвращает dict
+    from src.backtest.registry import get_default_grid as _get_grid
+    # support both signatures (get_default_grid() vs get_default_grid(name))
     try:
         grid_map = _get_grid()  # type: ignore[misc]
         if isinstance(grid_map, dict):
@@ -232,65 +119,44 @@ def _registry_get_grid(strategy: Optional[str] = None) -> Dict[str, List[Dict[st
                 return grid_map
             return {strategy: list(grid_map.get(strategy, []))}
     except TypeError:
-        pass  # значит новая сигнатура
-
-    # 2) новая сигнатура
-    try:
-        if strategy is not None:
-            grid_list = _get_grid(strategy)  # type: ignore[misc]
-            if isinstance(grid_list, list):
-                return {strategy: grid_list}
-            return {strategy: []}
-        # strategy не указан — соберём по всем билдерам
+        pass
+    if strategy is None:
+        names = list(_registry_get_builder().keys())
         out: Dict[str, List[Dict[str, Any]]] = {}
-        for s in _registry_get_builder().keys():
+        for n in names:
             try:
-                out[s] = list(_get_grid(s))  # type: ignore[misc]
-            except Exception:  # noqa: BLE001
-                out[s] = []
+                out[n] = list(_get_grid(n))  # type: ignore[misc]
+            except Exception:
+                out[n] = []
         return out
-    except Exception:  # noqa: BLE001
-        return {}
+    return {strategy: list(_get_grid(strategy))}  # type: ignore[misc]
 
 
-def _build_trades(strategy: str, df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], np.ndarray]:
-    """Единообразный вызов билдера стратегии.
+def _metrics_fast(pnls: np.ndarray) -> Dict[str, float]:
+    pnls = np.asarray(pnls, dtype=float)
+    n = len(pnls)
+    if n == 0:
+        return {"n_trades": 0, "total_pnl": 0.0, "sharpe": -float("inf"), "winrate": 0.0}
+    total = float(pnls.sum())
+    wins = float((pnls > 0.0).sum()) / float(n)
+    mean = float(pnls.mean())
+    std = float(pnls.std(ddof=1)) if n > 1 else 0.0
+    sharpe = mean / std if std > 0 else (math.copysign(float("inf"), mean) if mean != 0 else 0.0)
+    return {"n_trades": int(n), "total_pnl": total, "winrate": wins, "sharpe": sharpe}
 
-    Всегда используем builder.build(...).
-    Возвращаем (trades, pnls) и приводим pnls к np.ndarray.
-    """
+
+def _build_trades(strategy: str, df: pd.DataFrame, params: Dict[str, Any]):
     builders = _registry_get_builder()
     if strategy not in builders:
-        raise RuntimeError(f"Неизвестная стратегия: {strategy!r}. Доступны: {list(builders)}")
-
-    builder = builders[strategy]
-    if not hasattr(builder, "build"):
-        raise RuntimeError(f"StrategyBuilder для {strategy!r} не имеет метода build(df=..., params=...).")
-
-    try:
-        res = builder.build(df=df, params=params)
-    except TypeError:
-        # fallback — вдруг сигнатура позиционная
-        res = builder.build(df, params)
-
-    if not isinstance(res, tuple) or len(res) < 2:
-        raise RuntimeError("builder.build(...) должен вернуть кортеж (trades, pnls[, extra]).")
-
-    trades, pnls = res[0], res[1]
-    if not isinstance(trades, list):
-        raise TypeError("trades должен быть list[dict].")
-
-    # приведём pnls
-    if hasattr(pnls, "to_numpy"):
-        pnls = pnls.to_numpy()  # type: ignore[attr-defined]
-    pnls = np.asarray(pnls)
-
-    return trades, pnls
+        raise KeyError(f"strategy not registered: {strategy}")
+    build_fn = builders[strategy].build
+    trades, pnls, _extra = build_fn(df, params)
+    if isinstance(pnls, pd.Series):
+        pnls = pnls.to_numpy()
+    return trades, np.asarray(pnls, dtype=float)
 
 
-# ===========================
-# --- Автоэскалация параметров
-# ===========================
+# ===== Helpers for auto-escalation =====
 
 def _auto_expand_history(args) -> bool:
     step = int(getattr(args, "auto_candles_step", 400) or 400)
@@ -312,62 +178,14 @@ def _auto_relax_min_trades(args) -> bool:
     if cur <= floor:
         return False
     args.min_trades = max(floor, cur - 1)
-    LOG.info("[auto] ослабляю фильтр: --min-trades -> %d", args.min_trades)
+    LOG.info("[auto] ослабляю min_trades: -> %d", args.min_trades)
     return True
 
 
-def _auto_guard_init(args) -> None:
-    if getattr(args, "_auto_attempts_left", None) is None:
-        args._auto_attempts_left = int(getattr(args, "auto_attempts", 6) or 6)
-
-
-# ===========================
-# --- Общие хелперы CLI
-# ===========================
-
-def _strategy_params_from_args(args) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    # EMA/ADX
-    for a, k in (("ema_fast", "fast"), ("ema_slow", "slow"),
-                 ("adx_len", "adx_len"), ("adx_on", "on"), ("adx_off", "off")):
-        if hasattr(args, a):
-            v = getattr(args, a)
-            if v is not None:
-                out[k] = int(v) if isinstance(v, int) else float(v)
-    if hasattr(args, "require_di"):
-        out["require_di"] = bool(args.require_di)
-
-    # ATR (для расширенной версии)
-    if hasattr(args, "atr_len") and args.atr_len:
-        out["atr_len"] = int(args.atr_len)
-    if hasattr(args, "atr_mult") and args.atr_mult is not None:
-        out["atr_mult"] = float(args.atr_mult)
-
-    # RSI2
-    if hasattr(args, "rsi_len"):
-        out["rsi_len"] = int(args.rsi_len)
-    if hasattr(args, "rsi_buy_below"):
-        out["buy_below"] = float(args.rsi_buy_below)
-    if hasattr(args, "rsi_sell_above"):
-        out["sell_above"] = float(args.rsi_sell_above)
-
-    # Bollinger breakout
-    if hasattr(args, "bb_len"):
-        out["bb_len"] = int(args.bb_len)
-    if hasattr(args, "bb_k"):
-        out["bb_k"] = float(args.bb_k)
-
-    # fees / size / exits
-    for a in ("fees_bps", "slippage_bps", "size", "sl_mult", "tp_mult", "trail_mult"):
-        if hasattr(args, a):
-            out[a] = float(getattr(args, a))
-    return out
-
-
-def _dump_table(args, pair: str, candles: str, suffix: str, df: pd.DataFrame) -> None:
-    if df.empty:
-        return
+def _save_csv(args, df: pd.DataFrame, suffix: str) -> None:
     os.makedirs(args.out_dir, exist_ok=True)
+    pair = args.pair
+    candles = args.candles
     path = os.path.join(
         args.out_dir,
         f"{(args.out_prefix + '_') if args.out_prefix else ''}"
@@ -377,19 +195,12 @@ def _dump_table(args, pair: str, candles: str, suffix: str, df: pd.DataFrame) ->
     LOG.info("[out] saved %s rows=%d", path, len(df))
 
 
-# ===========================
-# --- Команды: OPT / RB / WF / LIVE / AUTO
-# ===========================
+# ===== Commands =====
 
 def run_optimize(args) -> int:
     LOG.info("Command: optimize strategy=%s", args.strategy)
-    _auto_guard_init(args)
-
     df = _fetch_exmo_ohlc(args, args.pair, args.candles)
     if df.empty:
-        if args.auto and args._auto_attempts_left > 0 and _auto_expand_history(args):
-            args._auto_attempts_left -= 1
-            return run_optimize(args)
         print("(no data)")
         return 0
 
@@ -397,62 +208,43 @@ def run_optimize(args) -> int:
     grid = list(grid_map.get(args.strategy, []))
     if not grid:
         LOG.warning("Empty param grid for %s", args.strategy)
-        print("(no rows)")
         return 0
 
     rows: List[Dict[str, Any]] = []
     for p in grid:
         try:
             _, pnls = _build_trades(args.strategy, df, p)
-            rows.append(dict(strategy=args.strategy, params=p, **_metrics_fast(pnls)))
-        except Exception as e:  # noqa: BLE001
-            LOG.debug("optimize: skip %s -> %s", p, e)
+            m = _metrics_fast(pnls)
+            m["params"] = p
+            rows.append(m)
+        except Exception as e:
+            LOG.debug("optimize: skip params %s: %s", p, e)
 
     if not rows:
-        if args.auto and args._auto_attempts_left > 0 and (_auto_expand_history(args) or _auto_relax_min_trades(args)):
-            args._auto_attempts_left -= 1
-            return run_optimize(args)
-        print("(no rows)")
-        return 0
-
-    res = pd.DataFrame(rows)
-    if getattr(args, "min_trades", 0):
-        res = res[res["n_trades"] >= int(args.min_trades)]
-    if res.empty:
-        if args.auto and args._auto_attempts_left > 0 and (_auto_expand_history(args) or _auto_relax_min_trades(args)):
-            args._auto_attempts_left -= 1
-            return run_optimize(args)
         print("(no rows)")
         return 0
 
     metric = getattr(args, "metric", "sharpe")
-    res = res.sort_values(by=metric, ascending=(metric == "max_dd"))
-    res = res.iloc[::-1] if metric != "max_dd" else res
-    shown = res.head(int(getattr(args, "top_n", 10) or 10))
+    rows.sort(key=lambda r: r.get(metric, -math.inf), reverse=True)
+    if getattr(args, "top_n", None):
+        rows = rows[: int(args.top_n)]
 
-    with pd.option_context("display.max_colwidth", 120, "display.width", 1000):
-        print(shown.to_string(index=False))
-
-    _dump_table(args, args.pair, args.candles, "optimize", shown)
+    out = pd.DataFrame(rows)
+    _save_csv(args, out, "optimize")
     return 0
 
 
 def run_robustness(args) -> int:
     LOG.info("Command: robustness strategy=%s", args.strategy)
-    _auto_guard_init(args)
-
     df = _fetch_exmo_ohlc(args, args.pair, args.candles)
     if df.empty:
-        if args.auto and args._auto_attempts_left > 0 and _auto_expand_history(args):
-            args._auto_attempts_left -= 1
-            return run_robustness(args)
-        print("(no rows)")
+        print("(no data)")
         return 0
+    params = getattr(args, "params", None)
+    if not params:
+        grid = _registry_get_grid(args.strategy).get(args.strategy, [])
+        params = grid[0] if grid else {}
 
-    params = _strategy_params_from_args(args) or next(
-        iter(_registry_get_grid(args.strategy).get(args.strategy, [{}])),
-        {}
-    )
     windows = max(1, int(getattr(args, "rb_windows", 8)))
     n = len(df)
     rows: List[Dict[str, Any]] = []
@@ -464,64 +256,35 @@ def run_robustness(args) -> int:
         try:
             _, pnls = _build_trades(args.strategy, part, params)
             m = _metrics_fast(pnls)
-            row: Dict[str, Any] = dict(strategy=args.strategy, params=params, **m)
-            row["window"] = f"{i + 1}/{windows}"
-            rows.append(row)
-        except Exception as e:  # noqa: BLE001
+            m["window"] = f"{i + 1}/{windows}"
+            m["params"] = params
+            rows.append(m)
+        except Exception as e:
             LOG.debug("robustness: skip fold %s: %s", f"{i + 1}/{windows}", e)
 
     if not rows:
-        if args.auto and args._auto_attempts_left > 0 and (_auto_expand_history(args) or _auto_relax_min_trades(args)):
-            args._auto_attempts_left -= 1
-            return run_robustness(args)
         print("(no rows)")
         return 0
 
-    res = pd.DataFrame(rows)
-    if getattr(args, "min_trades", 0):
-        res = res[res["n_trades"] >= int(args.min_trades)]
-    if res.empty:
-        if args.auto and args._auto_attempts_left > 0 and (_auto_expand_history(args) or _auto_relax_min_trades(args)):
-            args._auto_attempts_left -= 1
-            return run_robustness(args)
-        print("(no rows)")
-        return 0
-
-    metric = getattr(args, "metric", "sharpe")
-    res = res.sort_values(by=metric, ascending=(metric == "max_dd"))
-    with pd.option_context("display.max_colwidth", 120, "display.width", 1000):
-        print(res.to_string(index=False))
-
-    _dump_table(args, args.pair, args.candles, "robustness", res)
+    out = pd.DataFrame(rows)
+    _save_csv(args, out, "robustness")
     return 0
 
 
 def run_walk_forward(args) -> int:
     LOG.info("Command: walk-forward strategy=%s", args.strategy)
-    _auto_guard_init(args)
-
     df = _fetch_exmo_ohlc(args, args.pair, args.candles)
     if df.empty:
-        if args.auto and args._auto_attempts_left > 0 and _auto_expand_history(args):
-            args._auto_attempts_left -= 1
-            return run_walk_forward(args)
-        print("(no rows)")
+        print("(no data)")
         return 0
-
-    grid = list(_registry_get_grid(args.strategy).get(args.strategy, []))
-    if not grid:
-        LOG.warning("Empty param grid for %s", args.strategy)
-        print("(no rows)")
-        return 0
-
-    folds = max(1, int(getattr(args, "wf_folds", 6)))
-    train_frac = min(max(float(getattr(args, "wf_train_frac", 0.7)), 0.1), 0.95)
+    folds = max(2, int(getattr(args, "wf_folds", 6)))
+    train_frac = float(getattr(args, "wf_train_frac", 0.7))
+    grid = _registry_get_grid(args.strategy).get(args.strategy, [])
+    min_tr = int(getattr(args, "min_trades", 1))
     metric = getattr(args, "metric", "sharpe")
-    min_tr = int(getattr(args, "min_trades", 0) or 0)
 
     n = len(df)
     rows: List[Dict[str, Any]] = []
-
     for i in range(folds):
         s, e = int(i * n / folds), int((i + 1) * n / folds)
         seg = df.iloc[s:e]
@@ -542,7 +305,7 @@ def run_walk_forward(args) -> int:
                 val = mt.get(metric, -math.inf)
                 if (best is None) or (val > best["val"]):
                     best = dict(params=p, mt=mt, val=val)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 LOG.debug("wf: train skip params %s: %s", p, e)
         if best is None:
             continue
@@ -554,145 +317,197 @@ def run_walk_forward(args) -> int:
             row.update({f"train_{k}": v for k, v in best["mt"].items()})
             row.update({f"test_{k}": v for k, v in ms.items()})
             rows.append(row)
-        except Exception as e:  # noqa: BLE001
-            LOG.debug("wf: test failed for %s: %s", best["params"], e)
+        except Exception as e:
+            LOG.debug("wf: test skip params %s: %s", best["params"], e)
 
     if not rows:
-        if args.auto and args._auto_attempts_left > 0 and (_auto_expand_history(args) or _auto_relax_min_trades(args)):
-            args._auto_attempts_left -= 1
-            return run_walk_forward(args)
         print("(no rows)")
         return 0
 
-    res = pd.DataFrame(rows).sort_values(by=f"test_{metric}", ascending=(metric == "max_dd"))
-    print(f"<wf best per fold from {folds} folds>")
-    with pd.option_context("display.max_colwidth", 120, "display.width", 1000):
-        print(res.to_string(index=False))
-
-    _dump_table(args, args.pair, args.candles, "walkforward", res)
+    out = pd.DataFrame(rows)
+    _save_csv(args, out, "walk_forward")
     return 0
+
+
+# ===== LIVE (observe/paper) =====
+
+def _live_params_from_args(args) -> Dict[str, Any]:
+    params: Dict[str, Any] = {}
+    # ema_adx
+    if hasattr(args, "ema_fast"):
+        params["fast"] = int(args.ema_fast)
+    if hasattr(args, "ema_slow"):
+        params["slow"] = int(args.ema_slow)
+    if hasattr(args, "adx_len"):
+        params["adx_len"] = int(args.adx_len)
+    if hasattr(args, "adx_on"):
+        params["on"] = float(args.adx_on)
+    if hasattr(args, "adx_off"):
+        params["off"] = float(args.adx_off)
+    if hasattr(args, "require_di"):
+        params["require_di"] = bool(args.require_di)
+
+    # fees/slip (если билдер их учитывает — передадим)
+    if hasattr(args, "fee_bps"):
+        params["fees_bps"] = float(args.fee_bps)
+    if hasattr(args, "slip_bps"):
+        params["slippage_bps"] = float(args.slip_bps)
+
+    return params
+
+
+def _evaluate_last_signal(strategy: str, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Строим сигналы на полной истории и читаем последнюю точку.
+    """
+    builders = _registry_get_builder()
+    if strategy not in builders:
+        return {"ok": False, "msg": f"strategy not registered: {strategy}"}
+
+    build_fn = builders[strategy].build
+    try:
+        # билдер возвращает (trades, pnls, extra); нам нужны extra, чтобы понять EMA/ADX и пр.,
+        # но для простоты прочитаем по косвенным признакам (или расширим extra — на твой вкус).
+        trades, pnls, extra = build_fn(df, params)
+        last_row = df.iloc[-1]
+        # простое резюме
+        status = {
+            "ok": True,
+            "ts": int(last_row["timestamp"]),
+            "dt": str(last_row["dt"]),
+            "close": float(last_row["close"]),
+            "n_trades_alltime": int(len(trades)),
+        }
+        # добавим из extra, если есть
+        if isinstance(extra, dict):
+            for k in ("ema_fast", "ema_slow", "adx"):
+                if k in extra:
+                    ser = extra[k]
+                    try:
+                        status[k] = float(pd.to_numeric(ser.iloc[-1], errors="coerce"))
+                    except Exception:
+                        pass
+        return status
+    except Exception as e:
+        return {"ok": False, "msg": f"build failed: {e}"}
 
 
 def run_trade_live(args) -> int:
-    mode = args.mode
-    LOG.info("[live] %s %s %s strategy=%s", mode, args.pair, args.candles, args.strategy)
+    LOG.info("Command: trade-live mode=%s strategy=%s", args.mode, args.strategy)
+
+    # Начальная загрузка истории
     df = _fetch_exmo_ohlc(args, args.pair, args.candles)
     if df.empty:
-        LOG.warning("[live] no candles")
+        print("(no data)")
         return 0
 
-    params = _strategy_params_from_args(args)
-    trades, pnls = _build_trades(args.strategy, df, params)
-    met = _metrics_fast(pnls)
+    print(f"[live] {args.mode} {args.pair} {args.candles} strategy={args.strategy} rows={len(df)}")
 
-    LOG.info("[live/%s] using params: %s", mode, params)
-    LOG.info("[live/%s] trades=%d total_pnl=%.6f sharpe=%.3f",
-             mode, int(met["n_trades"]), float(met["total_pnl"]), float(met["sharpe"]))
-    return 0
+    poll = int(getattr(args, "poll_sec", 10))
+    summary = bool(getattr(args, "summary_alert", False))
+    params = _live_params_from_args(args)
+
+    # внутреннее состояние наблюдения (без реальной торговли)
+    last_print_ts: Optional[int] = None
+    simulated_in_pos = False  # просто отображение (можно расширить до paper)
+
+    try:
+        while True:
+            # обновим последний кусок истории (оставим ту же глубину, это быстрее и воспроизводимо)
+            df = _fetch_exmo_ohlc(args, args.pair, args.candles)
+            if df.empty:
+                LOG.warning("[live] empty data on refresh")
+                time.sleep(poll)
+                continue
+
+            last = df.iloc[-1]
+            last_ts = int(last["timestamp"])
+            close = float(last["close"])
+
+            # оценим сигнал на последней свече
+            sig = _evaluate_last_signal(args.strategy, df, params)
+            if not sig.get("ok"):
+                LOG.debug("[live] eval error: %s", sig.get("msg"))
+
+            # простая симуляция статуса: если EMAfast>EMAslow и ADX>on — считаем вход, иначе выход
+            # (это консистентно с ema_adx.signals)
+            fast = sig.get("ema_fast")
+            slow = sig.get("ema_slow")
+            adx = sig.get("adx")
+            entered = exited = False
+            if fast is not None and slow is not None and adx is not None:
+                long_cond = (fast > slow) and (adx >= float(params.get("on", 20.0)))
+                off_cond = (adx <= float(params.get("off", 14.0))) or (fast <= slow)
+                if long_cond and not simulated_in_pos:
+                    simulated_in_pos = True
+                    entered = True
+                elif simulated_in_pos and off_cond:
+                    simulated_in_pos = False
+                    exited = True
+
+            # Вывод
+            if summary:
+                # печатаем только на изменениях свэчи/сигнала, чтобы не сыпать логами
+                if last_print_ts != last_ts or entered or exited:
+                    state = "IN" if simulated_in_pos else "OUT"
+                    bits = [
+                        f"[tick] {args.pair} {args.candles} {args.strategy}",
+                        f"dt={last['dt']} close={close:.6f}",
+                        f"state={state}",
+                    ]
+                    if fast is not None and slow is not None:
+                        bits.append(f"ema_f={fast:.6f} ema_s={slow:.6f}")
+                    if adx is not None:
+                        bits.append(f"adx={adx:.3f} on={params.get('on', 20.0)} off={params.get('off', 14.0)}")
+                    if entered:
+                        bits.append("SIG=ENTER")
+                    if exited:
+                        bits.append("SIG=EXIT")
+                    print("  ".join(bits))
+                    last_print_ts = last_ts
+            else:
+                # лаконичный heartbeat
+                print(f"[live] {last['dt']} close={close:.6f} rows={len(df)}", flush=True)
+
+            time.sleep(poll)
+
+    except KeyboardInterrupt:
+        print("\n[live] stopped by user")
+        return 0
+    except Exception as e:
+        LOG.exception("[live] failure: %s", e)
+        return 1
 
 
 def run_auto(args) -> int:
     LOG.info("Command: auto (strategies=%s, score=%s)", ",".join(args.strategies), args.score)
-    _auto_guard_init(args)
+    df = _fetch_exmo_ohlc(args, args.pair, args.candles)
+    if df.empty:
+        print("(no data)")
+        return 0
+    score = getattr(args, "score", "sharpe")
     best: Optional[Dict[str, Any]] = None
-    best_df: Optional[pd.DataFrame] = None
+    for strat in args.strategies:
+        grid = _registry_get_grid(strat).get(strat, [])
+        for p in grid:
+            try:
+                _, pnls = _build_trades(strat, df, p)
+                m = _metrics_fast(pnls)
+                val = m.get(score, -math.inf)
+                if (best is None) or (val > best["val"]):
+                    best = {"strategy": strat, "params": p, "metrics": m, "val": val}
+            except Exception as e:
+                LOG.debug("auto: skip %s %s: %s", strat, p, e)
+    if not best:
+        print("(no rows)")
+        return 0
 
-    # шаги: растим историю; если не вышло — ослабляем min_trades
-    base_tf, base_n = _parse_candles(args.candles)
-    steps = list(range(base_n, int(args.auto_candles_max) + 1, int(args.auto_candles_step)))
-    if steps[-1] != int(args.auto_candles_max):
-        steps.append(int(args.auto_candles_max))
-
-    for n in steps + [steps[-1]]:  # повтор с последним шагом, если дальше ослабляем min_trades
-        args.candles = f"{base_tf}:{n}"
-        df = _fetch_exmo_ohlc(args, args.pair, args.candles)
-        if df.empty:
-            continue
-
-        all_rows: List[pd.DataFrame] = []
-        grid_map = _registry_get_grid()  # можно без strategy
-
-        for strat in args.strategies:
-            grid = grid_map.get(strat, [])
-            if not grid:
-                continue
-            rows: List[Dict[str, Any]] = []
-            for p in grid:
-                try:
-                    _, pnls = _build_trades(strat, df, p)
-                    rows.append(dict(strategy=strat, params=p, **_metrics_fast(pnls)))
-                except Exception as e:  # noqa: BLE001
-                    LOG.debug("[auto] %s skip %s -> %s", strat, p, e)
-            if rows:
-                all_rows.append(pd.DataFrame(rows))
-
-        if not all_rows:
-            continue
-
-        cand = pd.concat(all_rows, ignore_index=True)
-        if getattr(args, "min_trades", 0):
-            cand = cand[cand["n_trades"] >= int(args.min_trades)]
-        if cand.empty:
-            continue
-
-        metric = args.score
-        cand = cand.sort_values([metric, "total_pnl"], ascending=[False, False]).reset_index(drop=True)
-        top = cand.iloc[0].to_dict()
-        LOG.info("[auto] prelim best: %s %s %s=%.6f n_trades=%d",
-                 top["strategy"], top["params"], metric, float(top[metric]), int(top["n_trades"]))
-        best, best_df = top, cand
-        break
-
-    if best is None:
-        if _auto_relax_min_trades(args) and args._auto_attempts_left > 0:
-            args._auto_attempts_left -= 1
-            return run_auto(args)
-        LOG.error("[auto] no viable configuration found")
-        return 2
-
-    # сохраняем артефакты
-    os.makedirs(os.path.join("out", "auto"), exist_ok=True)
     stamp = _utc_stamp()
-    if best_df is not None and not best_df.empty:
-        path = os.path.join("out", "auto",
-                            f"{args.pair.replace('/', '_')}_{args.candles.replace(':', '_')}_auto_candidates_{stamp}.csv")
-        best_df.to_csv(path, index=False)
-        LOG.info("[out] saved %s rows=%d", path, len(best_df))
-
-    final = dict(pair=args.pair, candles=args.candles,
-                 strategy=best["strategy"], params=best["params"],
-                 metric=args.score, score=float(best[args.score]))
     out_json = os.path.join("out", "auto",
                             f"{args.pair.replace('/', '_')}_{args.candles.replace(':', '_')}_auto_best_{stamp}.json")
+    os.makedirs(os.path.dirname(out_json), exist_ok=True)
     with open(out_json, "w", encoding="utf-8") as f:
-        f.write(json.dumps(final, ensure_ascii=False, indent=2))
+        json.dump(best, f, ensure_ascii=False, indent=2)
         f.write("\n")
-
     LOG.info("[out] saved %s", out_json)
-
-    # подсказка запуска (paper)
-    p = final["params"]
-    strat = final["strategy"]
-    extra: List[str] = []
-    if strat in ("ema_adx", "ema_adx_atr"):
-        extra += [f"--ema-fast {p['fast']}", f"--ema-slow {p['slow']}",
-                  f"--adx-len {p['adx_len']}", f"--adx-on {p['on']}", f"--adx-off {p['off']}"]
-        if p.get("require_di"):
-            extra.append("--require-di")
-        if strat == "ema_adx_atr" and "atr_len" in p:
-            extra.append(f"--atr-len {p['atr_len']}")
-    elif strat == "rsi2":
-        extra += [f"--rsi-len {p['rsi_len']}", f"--rsi-buy-below {p['buy_below']}",
-                  f"--rsi-sell-above {p['sell_above']}"]
-    elif strat == "bb_breakout":
-        extra += [f"--bb-len {p['bb_len']}", f"--bb-k {p['bb_k']}"]
-
-    LOG.info("")
-    LOG.info("▶ Рекомендуемый запуск (paper):")
-    LOG.info("PYTHONPATH=. python -m src.presentation.cli.app \\")
-    LOG.info("  --pair %s --candles %s \\", args.pair, args.candles)
-    LOG.info("  --print-trade-summary \\")
-    LOG.info("  trade-live --mode paper --strategy %s \\", strat)
-    LOG.info("  %s", " ".join(extra))
-    LOG.info("")
     return 0

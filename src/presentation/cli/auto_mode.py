@@ -6,24 +6,97 @@ import os
 import sys
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
-# Ожидаем, что у тебя уже есть CLI/engine функции:
-# - optimize(..) -> List[Dict] с полями {"params": {...}, "metrics": {...}}
-# - robustness(..) -> List[Dict]
-# - walk_forward(..) -> List[Dict]
-# Если они называются иначе — поправь импорты ниже.
+# --- engine hooks (оставляем как было)
 from src.presentation.cli.engine import (
     run_optimize,
     run_robustness,
     run_walk_forward,
 )
 
-from src.domain.strategy.registry import get_default_grid
-
 log = logging.getLogger("auto_mode")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
+
+# ===== Grid resolver (совместимость по расположению и имени функции) ==========
+
+def _import_registry_module():
+    """
+    Пытаемся найти модуль реестра стратегий:
+      1) src.backtest.registry
+      2) src.domain.strategy.registry
+    """
+    try:
+        import importlib
+        return importlib.import_module("src.backtest.registry")
+    except Exception:
+        pass
+    try:
+        import importlib
+        return importlib.import_module("src.domain.strategy.registry")
+    except Exception:
+        pass
+    raise ImportError("Cannot import strategy registry from either "
+                      "`src.backtest.registry` or `src.domain.strategy.registry`")
+
+
+def _get_default_grid(strategy_name: str) -> List[Dict[str, Any]]:
+    """
+    Поддерживаем разные API:
+      - get_default_grid() -> {name: grid[]}
+      - get_default_grid(name) -> grid[]
+      - get_default_param_grid(name) -> grid[]
+      - default_grid(name) -> grid[]   ИЛИ  default_grid() -> {name: grid[]}
+    """
+    reg = _import_registry_module()
+
+    # 1) get_default_grid
+    if hasattr(reg, "get_default_grid"):
+        fn = getattr(reg, "get_default_grid")
+        try:
+            grid_map = fn()  # вариант без аргументов, вернёт dict
+            if isinstance(grid_map, dict):
+                return list(grid_map.get(strategy_name, []))
+        except TypeError:
+            # вариант с именем стратегии
+            try:
+                res = fn(strategy_name)
+                if isinstance(res, list):
+                    return list(res)
+            except Exception:
+                pass
+
+    # 2) get_default_param_grid
+    if hasattr(reg, "get_default_param_grid"):
+        fn = getattr(reg, "get_default_param_grid")
+        try:
+            res = fn(strategy_name)
+            if isinstance(res, list):
+                return list(res)
+        except Exception:
+            pass
+
+    # 3) default_grid
+    if hasattr(reg, "default_grid"):
+        fn = getattr(reg, "default_grid")
+        try:
+            res = fn(strategy_name)  # вариант с именем
+            if isinstance(res, list):
+                return list(res)
+        except TypeError:
+            # вариант без аргументов -> dict
+            try:
+                grid_map = fn()
+                if isinstance(grid_map, dict):
+                    return list(grid_map.get(strategy_name, []))
+            except Exception:
+                pass
+
+    raise ImportError(f"Default grid function not found/unsupported in registry for '{strategy_name}'")
+
+
+# ===== Параметры CLI авто-пайплайна ===========================================
 
 @dataclass
 class AutoArgs:
@@ -36,7 +109,7 @@ class AutoArgs:
     wf_folds: int  # 6
     wf_train_frac: float  # 0.7
     out_dir: str  # "runs/auto"
-    preset_path: str  # f"{out_dir}/preset.json"
+    preset_path: str  # path to preset.json
 
 
 def _ensure_dir(path: str) -> None:
@@ -44,11 +117,6 @@ def _ensure_dir(path: str) -> None:
 
 
 def _sort_by_primary_metrics(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Сортировка по приоритетам:
-    1) sharpe (desc), 2) cagr (desc), 3) winrate (desc), 4) trades (desc)
-    """
-
     def key(r: Dict[str, Any]):
         m = r.get("metrics", {})
         return (
@@ -62,7 +130,7 @@ def _sort_by_primary_metrics(results: List[Dict[str, Any]]) -> List[Dict[str, An
 
 
 def _filter_min_trades(results: List[Dict[str, Any]], min_trades: int) -> List[Dict[str, Any]]:
-    keep = []
+    keep: List[Dict[str, Any]] = []
     for r in results:
         trades = int(r.get("metrics", {}).get("trades", 0))
         if trades >= min_trades:
@@ -71,13 +139,12 @@ def _filter_min_trades(results: List[Dict[str, Any]], min_trades: int) -> List[D
 
 
 def _take_top_params(results: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
-    out = []
+    out: List[Dict[str, Any]] = []
     for r in results[:n]:
         p = dict(r.get("params", {}))
-        # Нормализация float → int там где нужно (если оптимайзер отдал float)
-        for k, v in list(p.items()):
-            if isinstance(v, float) and k in ("fast", "slow", "adx_len"):
-                p[k] = int(round(v))
+        for k in ("fast", "slow", "adx_len"):
+            if isinstance(p.get(k), float):
+                p[k] = int(round(p[k]))
         out.append({"params": p, "metrics": r.get("metrics", {})})
     return out
 
@@ -88,12 +155,11 @@ def _save_preset(path: str, pair: str, candles: str, strategy: str, params: Dict
         "timeframe": candles.split(":")[0],
         "strategy": strategy,
         "params": params,
-        # дефолтный безопасный риск; при желании подменим из settings/config
         "risk": {"max_position_pct": 0.25, "stop_loss_bps": 250, "cooldown_bars": 3},
         "fees": {"fee_bps": 10, "slip_bps": 2},
     }
-    with open(path, "w", encoding="utf-8") as fp:
-        json.dump(preset, fp, ensure_ascii=False, indent=2)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(preset, f, ensure_ascii=False, indent=2)
 
 
 def _print_ready_command(pair: str, candles: str, strategy: str, params: Dict[str, Any]) -> None:
@@ -106,12 +172,13 @@ def _print_ready_command(pair: str, candles: str, strategy: str, params: Dict[st
     require_di = params.get("require_di", True)
 
     cmd = [
-        "PYTHONPATH=. python -m src.presentation.cli.app trade-live",
+        "PYTHONPATH=. python -m src.presentation.cli.app",
+        f"--pair {pair} --candles {tf}:2500",
+        "trade-live",
         "--mode observe",
         f"--strategy {strategy}",
         f"--ema-fast {fast} --ema-slow {slow}",
         f"--adx-len {adx_len} --adx-on {on} --adx-off {off}" + (" --require-di" if require_di else ""),
-        f"--pair {pair} --candles {tf}:2500",
         "--poll-sec 10 --summary-alert",
         "--risk-max-position-pct 25",
         "--risk-stop-loss-bps 250",
@@ -122,16 +189,16 @@ def _print_ready_command(pair: str, candles: str, strategy: str, params: Dict[st
     print("\nReady-to-trade:\n" + " \\\n  ".join(cmd) + "\n")
 
 
+# ===== Основной авто-пайплайн ==================================================
+
 def run_auto_pipeline(a: AutoArgs) -> Dict[str, Any]:
     """
-    Полный авто-проход:
-      optimize → robustness → walk-forward → best → save preset → print command
-    Возвращает лучший элемент (params+metrics).
+    optimize → robustness → walk-forward → best → save preset → print command
     """
     _ensure_dir(a.out_dir)
 
-    # 1) Grid
-    grid = get_default_grid(a.strategy)
+    # 1) GRID
+    grid = _get_default_grid(a.strategy)
     if not grid:
         raise RuntimeError(f"Empty param grid for strategy={a.strategy}")
 
@@ -144,7 +211,6 @@ def run_auto_pipeline(a: AutoArgs) -> Dict[str, Any]:
         grid=grid,
         top_n=a.top_n,
     )
-
     opt_results = _filter_min_trades(opt_results, a.min_trades)
     opt_results = _sort_by_primary_metrics(opt_results)
     top = _take_top_params(opt_results, a.top_n)
@@ -181,18 +247,19 @@ def run_auto_pipeline(a: AutoArgs) -> Dict[str, Any]:
     best = wf_results[0] if wf_results else rb_top[0]
 
     params = dict(best.get("params", {}))
-    # safety normalization
     for k in ("fast", "slow", "adx_len"):
         if k in params:
             params[k] = int(round(params[k]))
 
-    # 5) SAVE PRESET + PRINT CMD
+    # 5) SAVE + PRINT
     _save_preset(a.preset_path, a.pair, a.candles, a.strategy, params)
     log.info(f"Preset saved to: {a.preset_path}")
     _print_ready_command(a.pair, a.candles, a.strategy, params)
 
     return best
 
+
+# ===== CLI-обёртка =============================================================
 
 def _parse_cli(argv: List[str]) -> AutoArgs:
     import argparse
@@ -209,8 +276,9 @@ def _parse_cli(argv: List[str]) -> AutoArgs:
     p.add_argument("--preset-path", default=None)
     args = p.parse_args(argv)
 
-    preset_path = args.preset_path or os.path.join(args.out_dir,
-                                                   f"preset_{args.strategy}_{args.pair}_{args.candles.split(':')[0]}.json")
+    preset_path = args.preset_path or os.path.join(
+        args.out_dir, f"preset_{args.strategy}_{args.pair}_{args.candles.split(':')[0]}.json"
+    )
     return AutoArgs(
         pair=args.pair,
         candles=args.candles,
@@ -230,7 +298,9 @@ def main():
     best = run_auto_pipeline(a)
     m = best.get("metrics", {})
     log.info(
-        f"BEST — sharpe={m.get('sharpe')} cagr={m.get('cagr')} winrate={m.get('winrate')} trades={m.get('trades')}")
+        f"BEST — sharpe={m.get('sharpe')} cagr={m.get('cagr')} "
+        f"winrate={m.get('winrate')} trades={m.get('trades')}"
+    )
 
 
 if __name__ == "__main__":
