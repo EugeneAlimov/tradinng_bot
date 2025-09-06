@@ -57,133 +57,110 @@ class CircuitBreaker:
     def _transition(self, new_state: CircuitState) -> None:
         if self.state != new_state:
             logger.info("circuit %s: %s -> %s", self.name, self.state.value, new_state.value)
+        
         self.state = new_state
         self._state_changed_at = datetime.now()
+        
         if new_state == CircuitState.CLOSED:
             self._errors.clear()
             self._success_in_half_open = 0
+            self._failures_in_window = 0
         elif new_state == CircuitState.HALF_OPEN:
             self._success_in_half_open = 0
+        elif new_state == CircuitState.OPEN:
+            self._last_failure_at = datetime.now()
 
-    def _should_probe(self) -> bool:
-        return (datetime.now() - self._state_changed_at).total_seconds() >= self.config.recovery_timeout
-
-    def call(self, fn: Callable[..., Any], *args, **kwargs) -> Any:
+    def call(self, func: Callable[..., Any], *args, **kwargs) -> Any:
+        """Основной метод circuit breaker"""
         with self._lock:
             self._prune_window()
+            
             if self.state == CircuitState.OPEN:
-                if not self._should_probe():
+                # Проверяем, можно ли перейти в HALF_OPEN
+                time_since_failure = datetime.now() - self._state_changed_at
+                if time_since_failure.total_seconds() >= self.config.recovery_timeout:
+                    self._transition(CircuitState.HALF_OPEN)
+                else:
                     raise CircuitOpenError(f"Circuit {self.name} is OPEN")
-                self._transition(CircuitState.HALF_OPEN)
+            
+            try:
+                result = func(*args, **kwargs)
+                self._on_success()
+                return result
+            except Exception as e:
+                self._on_failure()
+                raise e
 
-        try:
-            res = fn(*args, **kwargs)
-        except Exception:
-            with self._lock:
-                self._errors.append(datetime.now())
-                self._prune_window()
-                self._last_failure_at = datetime.now()
-                if self.state == CircuitState.HALF_OPEN:
-                    self._transition(CircuitState.OPEN)
-                elif self.state == CircuitState.CLOSED and self._failures_in_window >= self.config.failure_threshold:
-                    self._transition(CircuitState.OPEN)
-            raise
-        else:
-            with self._lock:
-                if self.state == CircuitState.HALF_OPEN:
-                    self._success_in_half_open += 1
-                    if self._success_in_half_open >= self.config.success_threshold:
-                        self._transition(CircuitState.CLOSED)
-                elif self.state == CircuitState.CLOSED:
-                    # успешный вызов в closed — просто «подсыхаем» окно ошибок
-                    self._prune_window()
-            return res
+    def _on_success(self) -> None:
+        if self.state == CircuitState.HALF_OPEN:
+            self._success_in_half_open += 1
+            if self._success_in_half_open >= self.config.success_threshold:
+                self._transition(CircuitState.CLOSED)
+
+    def _on_failure(self) -> None:
+        self._errors.append(datetime.now())
+        self._failures_in_window += 1
+        
+        if self.state == CircuitState.HALF_OPEN:
+            self._transition(CircuitState.OPEN)
+        elif self.state == CircuitState.CLOSED:
+            if self._failures_in_window >= self.config.failure_threshold:
+                self._transition(CircuitState.OPEN)
 
     def get_state(self) -> Dict[str, Any]:
-        with self._lock:
-            self._prune_window()
-            return {
-                "name": self.name,
-                "state": self.state.value,
-                "failures_window": self._failures_in_window,
-                "last_failure_at": self._last_failure_at.isoformat() if self._last_failure_at else None,
-                "state_age_sec": (datetime.now() - self._state_changed_at).total_seconds(),
-            }
-
-
-@dataclass
-class RetryConfig:
-    max_attempts: int = 4
-    base_delay: float = 0.6
-    max_delay: float = 30.0
-    exponential_base: float = 2.0
-    jitter: bool = True
+        """Получить текущее состояние circuit breaker"""
+        return {
+            "state": self.state.value,
+            "failures_in_window": self._failures_in_window,
+            "success_in_half_open": self._success_in_half_open,
+            "last_failure": self._last_failure_at.isoformat() if self._last_failure_at else None,
+            "state_changed_at": self._state_changed_at.isoformat(),
+        }
 
 
 class RetryWithBackoff:
-    def __init__(self, cfg: Optional[RetryConfig] = None):
-        self.cfg = cfg or RetryConfig()
-
-    def execute(self, func, *args, **kwargs):
-        """
-        Совместимость с тестами: синоним основного запуска с ретраями.
-        """
+    """Retry with exponential backoff"""
+    
+    def __init__(self, max_retries: int = 3, base_delay: float = 1.0, max_delay: float = 60.0):
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+    
+    def execute(self, func: Callable[..., Any], *args, **kwargs) -> Any:
         last_exception = None
-        for attempt in range(self.config.max_attempts):
+        
+        for attempt in range(self.max_retries + 1):
             try:
                 return func(*args, **kwargs)
             except Exception as e:
                 last_exception = e
-                if attempt < self.config.max_attempts - 1:
-                    delay = self._calculate_delay(attempt)
-                    logger.warning("Attempt %s failed: %s. Retrying in %.2fs", attempt + 1, e, delay)
+                if attempt < self.max_retries:
+                    delay = min(self.base_delay * (2 ** attempt), self.max_delay)
+                    # Add jitter
+                    delay += random.uniform(0, delay * 0.1)
                     time.sleep(delay)
-        raise last_exception
-
-    def _delay_for(self, attempt: int) -> float:
-        delay = min(self.cfg.base_delay * (self.cfg.exponential_base ** attempt), self.cfg.max_delay)
-        if self.cfg.jitter:
-            delay *= 0.5 + random.random()
-        return delay
-
-    def run(self, fn: Callable[..., Any], *args, **kwargs) -> Any:
-        last_exc: Optional[BaseException] = None
-        for attempt in range(self.cfg.max_attempts):
-            try:
-                return fn(*args, **kwargs)
-            except Exception as exc:
-                last_exc = exc
-                if attempt == self.cfg.max_attempts - 1:
+                else:
                     break
-                sleep_s = self._delay_for(attempt)
-                logger.warning("retry (%d/%d) after error: %s; sleep=%.2fs",
-                               attempt + 1, self.cfg.max_attempts, exc, sleep_s)
-                time.sleep(sleep_s)
-        assert last_exc is not None
-        raise last_exc
+        
+        raise last_exception or RuntimeError("Max retries exceeded")
 
 
 class ErrorRecoverySystem:
-    """
-    Унифицированный слой защиты: circuit breaker + retry.
-    """
-
+    """System for managing multiple circuit breakers"""
+    
     def __init__(self):
-        self._cb_map: Dict[str, CircuitBreaker] = {}
-        self._retry = RetryWithBackoff()
-
-    def breaker(self, name: str, cfg: Optional[CircuitBreakerConfig] = None) -> CircuitBreaker:
-        if name not in self._cb_map:
-            self._cb_map[name] = CircuitBreaker(name, cfg)
-        return self._cb_map[name]
-
-    def protected_call(self, name: str, fn: Callable[..., Any], *args, **kwargs) -> Any:
-        cb = self.breaker(name)
-
-        def _wrapped():
-            return cb.call(fn, *args, **kwargs)
-
-        return self._retry.run(_wrapped)
-
+        self.circuit_breakers: Dict[str, CircuitBreaker] = {}
+        self.retry_handler = RetryWithBackoff()
+    
+    def protected_call(self, service_name: str, func: Callable[..., Any], *args, **kwargs) -> Any:
+        if service_name not in self.circuit_breakers:
+            self.circuit_breakers[service_name] = CircuitBreaker(service_name)
+        
+        cb = self.circuit_breakers[service_name]
+        return cb.call(func, *args, **kwargs)
+    
     def get_status(self) -> Dict[str, Any]:
-        return {name: cb.get_state() for name, cb in self._cb_map.items()}
+        return {
+            name: cb.get_state() 
+            for name, cb in self.circuit_breakers.items()
+        }

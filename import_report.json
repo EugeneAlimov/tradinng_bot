@@ -1,0 +1,15 @@
+{
+  "checked_count": 153,
+  "ok_count": 151,
+  "fail_count": 2,
+  "failed": {
+    "src.monitoring.monitor": {
+      "error": "IndentationError: unexpected indent (monitor.py, line 134)",
+      "traceback": "Traceback (most recent call last):\n  File \"/mnt/A06EBC146EBBE168/EXMO/tradinng_bot/tradinng_bot/scripts/check_project.py\", line 54, in main\n    importlib.import_module(modname)\n    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^\n  File \"/usr/lib64/python3.13/importlib/__init__.py\", line 88, in import_module\n    return _bootstrap._gcd_import(name[level:], package, level)\n           ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<frozen importlib._bootstrap>\", line 1387, in _gcd_import\n  File \"<frozen importlib._bootstrap>\", line 1360, in _find_and_load\n  File \"<frozen importlib._bootstrap>\", line 1331, in _find_and_load_unlocked\n  File \"<frozen importlib._bootstrap>\", line 935, in _load_unlocked\n  File \"<frozen importlib._bootstrap_external>\", line 1022, in exec_module\n  File \"<frozen importlib._bootstrap_external>\", line 1160, in get_code\n  File \"<frozen importlib._bootstrap_external>\", line 1090, in source_to_code\n  File \"<frozen importlib._bootstrap>\", line 488, in _call_with_frames_removed\n  File \"/mnt/A06EBC146EBBE168/EXMO/tradinng_bot/tradinng_bot/src/monitoring/monitor.py\", line 134\n    f\"Error: {error_type}\", error_msg)\nIndentationError: unexpected indent\n"
+    },
+    "src.strategies.registry": {
+      "error": "AttributeError: module 'src.strategies.ema_adx' has no attribute 'build_trades'",
+      "traceback": "Traceback (most recent call last):\n  File \"/mnt/A06EBC146EBBE168/EXMO/tradinng_bot/tradinng_bot/scripts/check_project.py\", line 54, in main\n    importlib.import_module(modname)\n    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^\n  File \"/usr/lib64/python3.13/importlib/__init__.py\", line 88, in import_module\n    return _bootstrap._gcd_import(name[level:], package, level)\n           ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<frozen importlib._bootstrap>\", line 1387, in _gcd_import\n  File \"<frozen importlib._bootstrap>\", line 1360, in _find_and_load\n  File \"<frozen importlib._bootstrap>\", line 1331, in _find_and_load_unlocked\n  File \"<frozen importlib._bootstrap>\", line 935, in _load_unlocked\n  File \"<frozen importlib._bootstrap_external>\", line 1026, in exec_module\n  File \"<frozen importlib._bootstrap>\", line 488, in _call_with_frames_removed\n  File \"/mnt/A06EBC146EBBE168/EXMO/tradinng_bot/tradinng_bot/src/strategies/registry.py\", line 22, in <module>\n    \"ema_adx\": cast(BuildTrades, ema_adx.build_trades),\n                                 ^^^^^^^^^^^^^^^^^^^^\nAttributeError: module 'src.strategies.ema_adx' has no attribute 'build_trades'\n"
+    }
+  }
+}

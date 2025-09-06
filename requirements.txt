@@ -1,16 +1,30 @@
+# Core data processing  
+pandas>=1.5.0
+numpy>=1.20.0
 
-pydantic>=2.5
-python-dotenv>=1.0
-rich>=13.7
-httpx>=0.27
+# HTTP and networking
+requests>=2.28.0
+urllib3>=1.26.0
 
-requests~=2.32.4
-matplotlib~=3.10.5
-requests
-keyring
+# Cryptography for secure credentials
+cryptography>=3.4.0
 
-numpy~=2.3.2
-pandas~=2.3.1
-cryptography~=45.0.6
-urllib3~=2.5.0
-pytest~=8.4.1
+# Math and scientific computing
+scipy>=1.9.0
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pytest-mock>=3.8.0
+
+# Optional: visualization (install manually if needed)
+# matplotlib>=3.5.0
+# plotly>=5.0.0
+
+# Optional: machine learning (install manually if needed)  
+# scikit-learn>=1.1.0
+
+# Development tools
+black>=22.0.0
+flake8>=5.0.0
+mypy>=0.991

@@ -12,9 +12,9 @@ name = "donchian"
 
 
 def signals(
-    df: pd.DataFrame,
-    *,
-    ch_len: int = 20,
+        df: pd.DataFrame,
+        *,
+        ch_len: int = 20,
 ) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
     """
     Donchian channel breakout (close пробивает канал предыдущей свечи).
@@ -37,7 +37,7 @@ def signals(
 
 
 def build(
-    df: pd.DataFrame, params: Dict[str, Any]
+        df: pd.DataFrame, params: Dict[str, Any]
 ) -> Tuple[List[Dict[str, Any]], np.ndarray, Dict[str, Any]]:
     fees_bps: float = float(params.get("fees_bps", 0.0))
     slippage_bps: float = float(params.get("slippage_bps", 0.0))

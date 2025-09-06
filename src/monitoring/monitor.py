@@ -124,7 +124,13 @@ class MonitoringSystem:
         self.stats["total_errors"] += 1
         self.stats["last_error"] = {"type": error_type, "message": error_msg, "ts": datetime.now().isoformat()}
         self.record_metric("errors_total", float(self.stats["total_errors"]), MetricType.COUNTER, {"type": error_type})
-        self.create_alert(AlertSeverity.CRITICAL if critical else AlertSeverity.ERROR,
+        self.create_alert(
+            AlertSeverity.CRITICAL if critical else AlertSeverity.ERROR,
+            f"Error: {error_type}",
+            error_msg,
+            metric="errors_total",
+            value=float(self.stats["total_errors"])
+        )
                           f"Error: {error_type}", error_msg)
 
     def add_health_check(self, name: str, check_fn: Callable[[], bool], interval: int = 60):
