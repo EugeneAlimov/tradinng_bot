@@ -1,8 +1,6 @@
-# src/strategies/registry.py
 from __future__ import annotations
-
 from typing import Any, Dict, List, Tuple, Protocol, cast
-
+from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 
@@ -10,26 +8,26 @@ from src.strategies import ema_adx, ema_adx_atr
 
 
 class BuildTrades(Protocol):
-    """
-    Унифицированная сигнатура стратегий:
-    принимает DataFrame и произвольные именованные параметры,
-    возвращает (trades, pnls).
-    """
     def __call__(self, df: pd.DataFrame, /, **params: Any) -> Tuple[List[Dict[str, Any]], np.ndarray]: ...
 
 
-_REGISTRY: Dict[str, BuildTrades] = {
+_REGISTRY: Dict[str, Any] = {
+    "ema_adx_atr": SimpleNamespace(
+        generate_signals=ema_adx_atr.generate_signals,
+        build_trades=ema_adx_atr.build_trades,
+        default_grid=ema_adx_atr.default_grid,
+    ),
     "ema_adx": cast(BuildTrades, ema_adx.build_trades),
-    "ema_adx_atr": cast(BuildTrades, ema_adx_atr.build_trades),
 }
 
 
-def get_strategy(name: str) -> BuildTrades:
-    key = str(name).strip().lower()
-    if key not in _REGISTRY:
-        raise ValueError(f"Unknown strategy '{name}'. Available: {', '.join(sorted(_REGISTRY))}")
-    return _REGISTRY[key]
+def get_strategy(name: str):
+    return _REGISTRY[name]
 
 
-def list_strategies() -> Dict[str, BuildTrades]:
+def get(name: str):  # алиас для тестов
+    return get_strategy(name)
+
+
+def list_strategies() -> Dict[str, Any]:
     return dict(_REGISTRY)
