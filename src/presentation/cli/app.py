@@ -51,6 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--jsonl", action="store_true")
     p.add_argument("--print-trade-summary", action="store_true")
 
+
+
     # --- HTTP
     p.add_argument("--http-retries", type=int, default=3)
     p.add_argument("--http-backoff", type=float, default=1.0)
@@ -107,6 +109,8 @@ def build_parser() -> argparse.ArgumentParser:
     wf.add_argument("--folds", dest="wf_folds", type=int)  # алиас для теста
     wf.add_argument("--wf-train-frac", type=float, default=0.7)
     wf.add_argument("--min-trades", type=int, default=1)
+    wf.add_argument("--ema-fast", dest="ema_fast", type=int, help="FAST EMA длина")
+    wf.add_argument("--ema-slow", dest="ema_slow", type=int, help="SLOW EMA длина")
     wf.add_argument("--metric", default="sharpe")
     _add_common_io_args(wf)
     wf.set_defaults(_handler=run_walk_forward)
@@ -117,6 +121,11 @@ def build_parser() -> argparse.ArgumentParser:
     tl.add_argument("--mode", required=True, choices=["observe", "paper"])
     tl.add_argument("--strategy", required=True,
                     choices=["ema_adx", "ema_adx_atr", "rsi2", "bb_breakout"])
+    tl.add_argument(
+        "--pairs",
+        type=str,
+        help="Список пар через запятую, напр. DOGE_EUR,XRP_EUR",
+    )
 
     # параметры ema_adx
     tl.add_argument("--ema-fast", type=int, default=12)
