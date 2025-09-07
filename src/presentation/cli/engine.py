@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
 
 LOG = logging.getLogger("cli")
 
@@ -41,7 +42,6 @@ class _HttpClient:
         return f"{self.base_url}/{path.lstrip('/')}"
 
     def get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
-        import requests
         url = self._url(path)
         last_err: Optional[str] = None
         for i in range(self.retries + 1):
@@ -65,49 +65,112 @@ class _HttpClient:
 
 
 def _fetch_exmo_ohlc(args, pair: str, candles: str) -> pd.DataFrame:
+    """
+    Получение OHLC данных с EXMO API
+    """
     try:
         tf, n = _parse_candles(candles)
     except Exception as e:
         LOG.error("bad --candles: %s", e)
         return pd.DataFrame()
+
     if tf not in _PERIODS:
         LOG.error("Unsupported timeframe '%s'", tf)
         return pd.DataFrame()
 
     period = _PERIODS[tf]
-    t_to = int(time.time())
-    t_from = t_to - n * period
-    client = _HttpClient("https://api.exmo.com/v1.1", args.http_timeout, args.http_retries, args.http_backoff)
-    st, js = client.get_json("/candles_history",
-                             params={"symbol": pair, "resolution": int(period / 60), "from": t_from, "to": t_to})
-    if st != 200 or not isinstance(js, dict) or "candles" not in js:
-        LOG.warning("[exmo] bad response status=%s body=%s", st, str(js)[:200])
+    resolution_minutes = period // 60
+
+    # Вычисляем временные рамки
+    current_time = int(time.time())
+    from_time = current_time - (n * period)
+    to_time = current_time
+
+    # Параметры для EXMO API
+    url = "https://api.exmo.com/v1.1/candles_history"
+    params = {
+        "symbol": pair,
+        "resolution": resolution_minutes,
+        "from": from_time,
+        "to": to_time
+    }
+
+    try:
+        LOG.debug(f"[exmo] requesting {n} {tf} candles for {pair}")
+
+        response = requests.get(url, params=params, timeout=20)
+
+        if response.status_code != 200:
+            LOG.warning(f"[exmo] HTTP {response.status_code}: {response.text[:200]}")
+            return pd.DataFrame()
+
+        data = response.json()
+
+        # Проверяем формат ответа
+        if not isinstance(data, dict):
+            LOG.warning(f"[exmo] unexpected response type: {type(data)}")
+            return pd.DataFrame()
+
+        # Проверяем на ошибки API
+        if data.get('result') == False and 'error' in data:
+            LOG.warning(f"[exmo] API error: {data['error']}")
+            return pd.DataFrame()
+
+        if data.get('s') == 'error':
+            LOG.warning(f"[exmo] API error: {data.get('errmsg', 'unknown error')}")
+            return pd.DataFrame()
+
+        # Проверяем наличие данных
+        if 'candles' not in data:
+            LOG.warning(f"[exmo] no 'candles' field in response")
+            return pd.DataFrame()
+
+        candles_data = data['candles']
+        if not candles_data:
+            LOG.warning(f"[exmo] empty candles for {pair}")
+            return pd.DataFrame()
+
+        LOG.info(f"[exmo] received {len(candles_data)} candles for {pair}")
+
+        # Обрабатываем данные
+        df = pd.DataFrame(candles_data)
+
+        # Переименовываем колонки
+        df = df.rename(columns={
+            "t": "timestamp",
+            "o": "open",
+            "h": "high",
+            "l": "low",
+            "c": "close",
+            "v": "volume"
+        })
+
+        # Конвертируем в числовые типы
+        for col in ("open", "high", "low", "close", "volume"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # Обрабатываем timestamp (EXMO возвращает миллисекунды)
+        ts = pd.to_numeric(df["timestamp"], errors="coerce").astype("Int64").to_numpy(dtype="float64")
+        if np.nanmean(ts) > 10_000_000_000:  # ms → s
+            ts = ts / 1000.0
+
+        df["timestamp"] = ts.astype("int64", copy=False)
+        df["dt"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+        df = df.sort_values("dt").drop_duplicates(subset=["dt"]).reset_index(drop=True)
+
+        # Проверяем high/low
+        if {"open", "high", "low", "close"}.issubset(df.columns):
+            hi = df[["open", "close"]].max(axis=1)
+            lo = df[["open", "close"]].min(axis=1)
+            df["high"] = df["high"].fillna(hi).where(df["high"] >= hi, hi)
+            df["low"] = df["low"].fillna(lo).where(df["low"] <= lo, lo)
+
+        return df[["dt", "timestamp", "open", "high", "low", "close", "volume"]]
+
+    except Exception as e:
+        LOG.warning(f"[exmo] request failed: {e}")
         return pd.DataFrame()
-
-    rows = js.get("candles", [])
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    df = df.rename(columns={"t": "timestamp", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
-    for c in ("open", "high", "low", "close", "volume"):
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    ts = pd.to_numeric(df["timestamp"], errors="coerce").astype("Int64").to_numpy(dtype="float64")
-    if np.nanmean(ts) > 10_000_000_000:  # ms → s
-        ts = ts / 1000.0
-    df["timestamp"] = ts.astype("int64", copy=False)
-    df["dt"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
-    df = df.sort_values("dt").drop_duplicates(subset=["dt"]).reset_index(drop=True)
-
-    # sanity high/low
-    if {"open", "high", "low", "close"}.issubset(df.columns):
-        hi = df[["open", "close"]].max(axis=1)
-        lo = df[["open", "close"]].min(axis=1)
-        df["high"] = df["high"].fillna(hi).where(df["high"] >= hi, hi)
-        df["low"] = df["low"].fillna(lo).where(df["low"] <= lo, lo)
-
-    return df[["dt", "timestamp", "open", "high", "low", "close", "volume"]]
 
 
 # ===== Registry bridges =====
@@ -167,12 +230,14 @@ def _build_trades(strategy: str, df: pd.DataFrame, params: Dict[str, Any]):
 # ===== CSV out =====
 
 def _save_csv(args, df: pd.DataFrame, suffix: str) -> None:
-    os.makedirs(args.out_dir, exist_ok=True)
+    out_dir = getattr(args, 'out_dir', 'output')
+    os.makedirs(out_dir, exist_ok=True)
     pair = args.pair
     candles = args.candles
+    out_prefix = getattr(args, 'out_prefix', '')
     path = os.path.join(
-        args.out_dir,
-        f"{(args.out_prefix + '_') if args.out_prefix else ''}"
+        out_dir,
+        f"{(out_prefix + '_') if out_prefix else ''}"
         f"{pair.replace('/', '_')}_{candles.replace(':', '_')}_{suffix}_{_utc_stamp()}.csv"
     )
     df.to_csv(path, index=False)
@@ -409,63 +474,21 @@ def run_trade_live(args) -> int:
             if summary:
                 if last_print_ts != last_ts or entered or exited:
                     state = "IN" if simulated_in_pos else "OUT"
-                    bits = [
-                        f"[tick] {args.pair} {args.candles} {args.strategy}",
-                        f"dt={last['dt']} close={close:.6f}",
-                        f"state={state}",
-                    ]
-                    if fast is not None and slow is not None:
-                        bits.append(f"ema_f={fast:.6f} ema_s={slow:.6f}")
-                    if adx is not None:
-                        bits.append(f"adx={adx:.3f} on={params.get('on', 20.0)} off={params.get('off', 14.0)}")
-                    if entered:
-                        bits.append("SIG=ENTER")
-                    if exited:
-                        bits.append("SIG=EXIT")
-                    print("  ".join(bits))
+                    print(f"[live] {args.pair} close={close:.6f} state={state}")
                     last_print_ts = last_ts
             else:
-                print(f"[live] {last['dt']} close={close:.6f} rows={len(df)}", flush=True)
+                if entered:
+                    print(f"[live] ENTER {args.pair} @ {close:.6f}")
+                elif exited:
+                    print(f"[live] EXIT {args.pair} @ {close:.6f}")
 
             time.sleep(poll)
-
     except KeyboardInterrupt:
-        print("\n[live] stopped by user")
+        LOG.info("[live] stopped by user")
         return 0
-    except Exception as e:
-        LOG.exception("[live] failure: %s", e)
-        return 1
 
 
 def run_auto(args) -> int:
-    LOG.info("Command: auto (strategies=%s, score=%s)", ",".join(args.strategies), args.score)
-    df = _fetch_exmo_ohlc(args, args.pair, args.candles)
-    if df.empty:
-        print("(no data)")
-        return 0
-    score = getattr(args, "score", "sharpe")
-    best: Optional[Dict[str, Any]] = None
-    for strat in args.strategies:
-        grid = _registry_get_grid(strat).get(strat, [])
-        for p in grid:
-            try:
-                _, pnls = _build_trades(strat, df, p)
-                m = _metrics_fast(pnls)
-                val = m.get(score, -math.inf)
-                if (best is None) or (val > best["val"]):
-                    best = {"strategy": strat, "params": p, "metrics": m, "val": val}
-            except Exception as e:
-                LOG.debug("auto: skip %s %s: %s", strat, p, e)
-    if not best:
-        print("(no rows)")
-        return 0
-
-    stamp = _utc_stamp()
-    out_json = os.path.join("out", "auto",
-                            f"{args.pair.replace('/', '_')}_{args.candles.replace(':', '_')}_auto_best_{stamp}.json")
-    os.makedirs(os.path.dirname(out_json), exist_ok=True)
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(best, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    LOG.info("[out] saved %s", out_json)
+    """Автоматический режим - заглушка"""
+    LOG.info("Command: auto mode (not implemented)")
     return 0

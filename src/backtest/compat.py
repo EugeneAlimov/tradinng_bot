@@ -1,237 +1,193 @@
-# src/backtest/compat.py
-from __future__ import annotations
+# Исправление для src/backtest/compat.py или где вызывается fetch_exmo_candles_cached
 
-"""
-Совместимый слой для backtest/walkforward/sweep.
-
-Экспортирует стабильные имена, которые ожидают другие модули:
-  - fetch_exmo_candles_cached
-  - resample_ohlc
-  - simulate_on_df
-  - normalize_resample_rule
-  - build_bt_config
-  - SimConfig
-  - normalize_metrics
-  - run_backtest_compat
-"""
-
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, Optional
+import time
+import requests
+import pandas as pd
+import numpy as np
+from typing import Optional
 
 
-def _sweep() -> Any:
-    # Ленивый импорт, чтобы избежать циклических зависимостей при загрузке модулей
-    from . import sweep  # type: ignore
-    return sweep
-
-
-def _metrics_mod() -> Any:
+def fetch_exmo_candles_cached(pair: str, span: str) -> pd.DataFrame:
+    """
+    Исправленная функция для получения свечей EXMO с правильными параметрами
+    """
     try:
-        from . import metrics  # type: ignore
-        return metrics
-    except Exception:
-        return None
+        tf, count = span.split(":")
+        count = int(count)
+    except ValueError:
+        raise ValueError(f"Bad span format: {span}. Expected 'tf:count', e.g. '1m:720'")
 
+    # Конвертируем timeframe в минуты для resolution
+    tf = tf.strip().lower()
+    if tf.endswith("m"):
+        resolution = int(tf[:-1])
+    elif tf.endswith("h"):
+        resolution = int(tf[:-1]) * 60
+    elif tf.endswith("d"):
+        resolution = int(tf[:-1]) * 1440
+    else:
+        raise ValueError(f"Unsupported timeframe: {tf}")
 
-# ---------- Публичные фасады к хелперам из sweep.py ----------
+    # Вычисляем временные рамки
+    current_time = int(time.time())
+    period_seconds = resolution * 60
+    from_time = current_time - (count * period_seconds)
+    to_time = current_time
 
-def fetch_exmo_candles_cached(pair: str, span: str, cache_dir: Optional[str] = None) -> Any:
-    s = _sweep()
-    return s._fetch_exmo_candles_cached(pair=pair, span=span, cache_dir=cache_dir)
-
-
-def resample_ohlc(df: Any, rule: str) -> Any:
-    s = _sweep()
-    return s._resample_ohlc(df, rule)
-
-
-def simulate_on_df(df: Any, bt_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    s = _sweep()
-    return s._simulate_on_df(df, bt_cfg)
-
-
-def normalize_resample_rule(rule: str) -> str:
-    s = _sweep()
-    return s._normalize_resample_rule(rule)
-
-
-# ---------- Конфиг симуляции и сборка bt-конфига ----------
-
-@dataclass(frozen=True)
-class SimConfig:
-    """
-    Унифицированный конфиг для симуляции/бэктеста.
-    Список полей покрывает потребности sweep/optimize/walkforward.
-    """
-    pair: str
-    resample: str = "5m"
-    fee_bps: int = 10
-    slip_bps: int = 2
-    max_daily_loss_bps: int = 0
-    fast: int = 10
-    slow: int = 20
-    hysteresis_bps: int = 0
-    cooldown_bars: int = 0
-    qty_eur: float = 100.0
-
-    def to_bt_config(self) -> Dict[str, Any]:
-        return build_bt_config(**asdict(self))
-
-
-def build_bt_config(
-    *,
-    pair: str,
-    resample: str = "5m",
-    fee_bps: int = 10,
-    slip_bps: int = 2,
-    max_daily_loss_bps: int = 0,
-    fast: int = 10,
-    slow: int = 20,
-    hysteresis_bps: int = 0,
-    cooldown_bars: int = 0,
-    qty_eur: float = 100.0,
-    **extras: Any,
-) -> Dict[str, Any]:
-    """
-    Собирает dict-конфиг бэктеста в формате, который ожидают наши симуляторы.
-    Любые дополнительные поля из **extras пролетают сквозь — это безопасно.
-    """
-    # Нормализуем правило ресемплинга через общий хелпер (поддержка '5m'/'5T' и т.п.)
-    rule = normalize_resample_rule(resample)
-
-    bt_cfg: Dict[str, Any] = {
-        "pair": pair,
-        "resample": rule,
-        "fee_bps": int(fee_bps),
-        "slip_bps": int(slip_bps),
-        "max_daily_loss_bps": int(max_daily_loss_bps),
-        "fast": int(fast),
-        "slow": int(slow),
-        "hysteresis_bps": int(hysteresis_bps),
-        "cooldown_bars": int(cooldown_bars),
-        "qty_eur": float(qty_eur),
+    # Правильные параметры для EXMO API
+    url = "https://api.exmo.com/v1.1/candles_history"
+    params = {
+        "symbol": pair,
+        "resolution": resolution,
+        "from": from_time,
+        "to": to_time
     }
 
-    if extras:
-        bt_cfg.update(extras)
-
-    return bt_cfg
-
-
-# ---------- Нормализация метрик ----------
-
-def _to_float(x: Any) -> Optional[float]:
     try:
-        if x is None:
-            return None
-        return float(x)
-    except Exception:
-        return None
+        response = requests.get(url, params=params, timeout=20)
+
+        if response.status_code != 200:
+            print(f"EXMO API HTTP error {response.status_code}: {response.text[:100]}")
+            return pd.DataFrame()
+
+        data = response.json()
+
+        # Проверяем на ошибки API
+        if isinstance(data, dict):
+            if data.get('result') == False and 'error' in data:
+                print(f"EXMO API error: {data['error']}")
+                return pd.DataFrame()
+            elif data.get('s') == 'error':
+                print(f"EXMO API error: {data.get('errmsg', 'unknown')}")
+                return pd.DataFrame()
+            elif 'candles' in data:
+                # Успешный ответ
+                candles = data['candles']
+                if not candles:
+                    print(f"EXMO returned empty candles for {pair}")
+                    return pd.DataFrame()
+
+                # Обрабатываем данные
+                df = pd.DataFrame(candles)
+
+                # Переименовываем колонки
+                df = df.rename(columns={
+                    "t": "timestamp",
+                    "o": "open",
+                    "h": "high",
+                    "l": "low",
+                    "c": "close",
+                    "v": "volume"
+                })
+
+                # Конвертируем в числовые типы
+                for col in ["open", "high", "low", "close", "volume"]:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+                # Обрабатываем timestamp (миллисекунды -> секунды)
+                ts = pd.to_numeric(df["timestamp"], errors="coerce")
+                if ts.max() > 10_000_000_000:  # миллисекунды
+                    ts = ts / 1000.0
+
+                # Создаем datetime index
+                df["dt"] = pd.to_datetime(ts, unit="s", utc=True)
+                df = df.set_index("dt").sort_index()
+
+                # Удаляем дубликаты
+                df = df[~df.index.duplicated(keep='first')]
+
+                # Возвращаем нужные колонки
+                return df[["open", "high", "low", "close", "volume"]].dropna()
+
+        print(f"EXMO unexpected response format: {type(data)}")
+        return pd.DataFrame()
+
+    except Exception as e:
+        print(f"EXMO API request failed: {e}")
+        return pd.DataFrame()
 
 
-def _to_int(x: Any) -> Optional[int]:
+# Альтернативно, если нужно исправить конкретно _fetch_exmo_ohlc в engine.py
+def _fetch_exmo_ohlc_fixed(args, pair: str, candles: str) -> pd.DataFrame:
+    """
+    Исправленная версия _fetch_exmo_ohlc для engine.py
+    """
     try:
-        if x is None:
-            return None
-        return int(x)
-    except Exception:
-        return None
+        tf, n = candles.split(":")
+        n = int(n)
+    except Exception as e:
+        print(f"Bad --candles: {e}")
+        return pd.DataFrame()
 
+    # Маппинг timeframes
+    periods = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
 
-def normalize_metrics(metrics: Any, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """
-    Унифицированная нормализация метрик.
+    if tf not in periods:
+        print(f"Unsupported timeframe '{tf}'")
+        return pd.DataFrame()
 
-    Поведение:
-      - если есть src.backtest.metrics.normalize_metrics — делегируем туда (с теми же аргументами);
-      - иначе используем безопасный fallback, который:
-          * принимает dict (или объект с .get);
-          * приводит известные числовые поля к float/int;
-          * не падает при отсутствии полей;
-          * возвращает новый dict (исходный не мутируется).
+    period = periods[tf]
+    resolution = period // 60  # минуты
 
-    Сигнатура поддерживает *args/**kwargs для совместимости с разными вызовами.
-    """
-    mmod = _metrics_mod()
-    if mmod and hasattr(mmod, "normalize_metrics"):
-        # отдадим управление «настоящей» реализации, если она есть
-        return mmod.normalize_metrics(metrics, *args, **kwargs)  # type: ignore
+    # Временные рамки
+    t_to = int(time.time())
+    t_from = t_to - n * period
 
-    # --- fallback: мягкая нормализация словаря метрик ---
-    src = dict(metrics or {}) if isinstance(metrics, dict) else {}
+    # API запрос с правильными параметрами
+    url = "https://api.exmo.com/v1.1/candles_history"
+    params = {
+        "symbol": pair,
+        "resolution": resolution,
+        "from": t_from,
+        "to": t_to
+    }
 
-    out: Dict[str, Any] = dict(src)  # скопируем всё как есть и поправим известные поля
+    try:
+        response = requests.get(url, params=params, timeout=20)
 
-    # список ожидаемых полей и конвертеров
-    float_fields = [
-        "winrate_pct", "total_return_pct", "max_drawdown_pct",
-        "final_equity_eur", "start_equity_eur",
-        "profit_factor", "avg_trade_eur", "exposure_pct",
-        "sharpe", "cagr_pct", "calmar",
-    ]
-    int_fields = ["bars", "trades", "bars_per_year"]
+        if response.status_code != 200:
+            print(f"[exmo] HTTP {response.status_code}: {response.text[:100]}")
+            return pd.DataFrame()
 
-    for f in float_fields:
-        if f in src:
-            out[f] = _to_float(src.get(f))
+        data = response.json()
 
-    for f in int_fields:
-        if f in src:
-            out[f] = _to_int(src.get(f))
+        # Проверка на ошибки
+        if not isinstance(data, dict) or 'candles' not in data:
+            print(f"[exmo] bad response: {data}")
+            return pd.DataFrame()
 
-    # гарантия наличия пары/ресемплинга — если известны
-    if "pair" in src:
-        out["pair"] = str(src.get("pair"))
-    if "resample" in src:
-        out["resample"] = str(src.get("resample"))
+        candles = data['candles']
+        if not candles:
+            print(f"[exmo] empty candles for {pair}")
+            return pd.DataFrame()
 
-    return out
+        # Обрабатываем данные как в оригинальном коде
+        df = pd.DataFrame(candles)
+        df = df.rename(columns={"t": "timestamp", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
 
+        for c in ("open", "high", "low", "close", "volume"):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
 
-# ---------- Совместимый вызов бэктеста (для optimize/sweep) ----------
+        ts = pd.to_numeric(df["timestamp"], errors="coerce").astype("Int64").to_numpy(dtype="float64")
+        if np.nanmean(ts) > 10_000_000_000:  # ms → s
+            ts = ts / 1000.0
 
-def run_backtest_compat(bt_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Унифицированный бэктест:
-      - берёт готовый df из bt_cfg['df'] (если уже получен upstream),
-      - иначе сам скачивает свечи через EXMO-кашер,
-      - нормализует правило ресемплинга и ресемплит,
-      - считает метрики через simulate_on_df.
-    Возвращает dict с метриками (совместим с существующим пайплайном).
-    """
-    # 1) исходный df, если передали заранее
-    df = bt_cfg.get("df")
+        df["timestamp"] = ts.astype("int64", copy=False)
+        df["dt"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+        df = df.sort_values("dt").drop_duplicates(subset=["dt"]).reset_index(drop=True)
 
-    # 2) иначе — подтянем свечи
-    if df is None:
-        pair = str(bt_cfg.get("pair"))
-        if not pair:
-            raise ValueError("run_backtest_compat: 'pair' is required in bt_cfg")
+        # Sanity check for high/low
+        if {"open", "high", "low", "close"}.issubset(df.columns):
+            hi = df[["open", "close"]].max(axis=1)
+            lo = df[["open", "close"]].min(axis=1)
+            df["high"] = df["high"].fillna(hi).where(df["high"] >= hi, hi)
+            df["low"] = df["low"].fillna(lo).where(df["low"] <= lo, lo)
 
-        # Поддерживаем несколько ключей для источника свечей
-        span = bt_cfg.get("span") or bt_cfg.get("exmo_candles") or "1m:2000"
-        cache_dir = bt_cfg.get("cache_dir")
+        print(f"[exmo] success: {len(df)} candles for {pair}")
+        return df[["dt", "timestamp", "open", "high", "low", "close", "volume"]]
 
-        df = fetch_exmo_candles_cached(pair=pair, span=str(span), cache_dir=cache_dir)
-
-    # 3) нормализуем правило ресемплинга и ресемплим
-    rule = normalize_resample_rule(str(bt_cfg.get("resample", "5m")))
-    df_rs = resample_ohlc(df, rule) if rule else df
-
-    # 4) считаем метрики
-    metrics = simulate_on_df(df_rs, bt_cfg)
-
-    # 5) перестраховка: вернуть нормализованные метрики
-    return normalize_metrics(metrics)
-
-
-__all__ = [
-    "fetch_exmo_candles_cached",
-    "resample_ohlc",
-    "simulate_on_df",
-    "normalize_resample_rule",
-    "build_bt_config",
-    "SimConfig",
-    "normalize_metrics",
-    "run_backtest_compat",
-]
+    except Exception as e:
+        print(f"[exmo] request failed: {e}")
+        return pd.DataFrame()
