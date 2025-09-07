@@ -1,265 +1,300 @@
-# src/presentation/cli/trade_live_cmd.py
+# -*- coding: utf-8 -*-
+"""
+trade-live: наблюдение (observe) и бумажная торговля (paper).
+Добавлено:
+- корректный парс процентов/бпс (--risk-max-position-pct принимает 0.25 или 25)
+- мультипары через --pairs DOGE_EUR,XRP_EUR
+- безопасный fallback-раннер, если "боевой" раннер недоступен
+"""
+
 from __future__ import annotations
 
-import argparse
-import logging
-import os
 import time
-from datetime import datetime, timezone
-from typing import Any, List, Optional, Sequence, Tuple
-
-# Наши зависимости из проекта
-from src.infrastructure.exchange.exmo_api import build_exmo_from_settings
-from src.infrastructure.notify.telegram import TelegramNotifier
-from src.application.engine.integration import EngineIntegration
-from src.domain.risk.risk_service import RiskService, RiskCfg
-
-LOG = logging.getLogger("trade-live")
+import typing as t
+from dataclasses import dataclass
 
 
-# ---------------------------
-# ВНУТРЕННИЕ УТИЛИТЫ
-# ---------------------------
+# --- утилиты парсинга процентов/бпс -------------------------------------------------
 
-def _setup_logging(debug: bool) -> None:
-    level = logging.DEBUG if debug or os.getenv("DEBUG", "").lower() in {"1", "true", "yes", "on"} else logging.INFO
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
-    LOG.debug("Logging configured. Level=%s", logging.getLevelName(level))
-
-
-def _parse_candles_span(spec: Optional[str]) -> Tuple[int, int]:
+def _pct_arg(s: str) -> float:
     """
-    '1m:300' -> (1, 300), поддерживаем только минуты.
+    Принимает '0.25' или '25' и приводит к доле (0,1].
     """
-    if not spec:
-        return 1, 300
-    try:
-        frame, cnt = spec.split(":")
-        cnt = int(cnt)
-        if frame.endswith("m"):
-            res_min = int(frame[:-1])
-            if res_min > 0 and cnt > 0:
-                return res_min, cnt
-    except Exception:
-        pass
-    return 1, 300
+    v = float(s)
+    if v > 1.0:
+        v = v / 100.0
+    if not (0.0 < v <= 1.0):
+        raise ValueError("percentage must be in (0,1] или (0,100]")
+    return v
 
 
-def _unix_seconds(ts_like: Any) -> Optional[int]:
+def _bps_arg(s: str) -> int:
+    v = int(s)
+    if v < 0:
+        raise ValueError("bps must be >= 0")
+    return v
+
+
+# --- регистрация сабкоманды ---------------------------------------------------------
+
+def register(subparsers):
     """
-    Нормализация timestamp: секунды / миллисекунды / микросекунды -> секунды (int).
+    Регистрирует команду 'trade-live'.
     """
-    try:
-        ts = float(ts_like)
-    except Exception:
-        return None
-    if ts > 1e15:  # µs
-        ts /= 1_000_000.0
-    elif ts > 1e12:  # ms
-        ts /= 1_000.0
-    return int(ts)
-
-
-def _sma(series: List[float], window: int) -> List[Optional[float]]:
-    if window <= 0:
-        raise ValueError("window must be > 0")
-    out: List[Optional[float]] = [None] * len(series)
-    s = 0.0
-    for i, x in enumerate(series):
-        s += x
-        if i >= window:
-            s -= series[i - window]
-        if i >= window - 1:
-            out[i] = s / window
-    return out
-
-
-def _fetch_candles(pair: str, res_min: int, count: int) -> List[Tuple[int, float]]:
-    """
-    Забираем свечи EXMO, отдаём [(ts_sec, close), ...] отсортировано.
-    """
-    now = int(time.time())
-    since = now - res_min * 60 * count
-    exmo = build_exmo_from_settings()
-    data = exmo.candles_history(pair, res_min, since, now)
-
-    candles = []
-    if isinstance(data, dict) and isinstance(data.get("candles"), list):
-        candles = data["candles"]
-    elif isinstance(data, list):
-        candles = data
-    else:
-        raise RuntimeError(f"Unexpected candles format: {type(data)}")
-
-    rows: List[Tuple[int, float]] = []
-    for c in candles:
-        ts_raw = c.get("t") or c.get("time") or c.get("timestamp") or c.get("date")
-        close_raw = c.get("c") or c.get("close")
-        if ts_raw is None or close_raw is None:
-            continue
-        ts = _unix_seconds(ts_raw)
-        try:
-            close = float(close_raw)
-        except Exception:
-            continue
-        if ts is None:
-            continue
-        rows.append((ts, close))
-
-    rows.sort(key=lambda x: x[0])
-    return rows
-
-
-# ---------------------------
-# НАБЛЮДЕНИЕ (observe)
-# ---------------------------
-
-def _run_observe(args: argparse.Namespace) -> int:
-    """
-    Поллинг свечей, пересчёт SMA(fast/slow), лог последнего бара,
-    опциональные Telegram-алёрты (смена состояния + heartbeat).
-    """
-    if args.exmo_debug:
-        os.environ["EXMO_DEBUG"] = "1"
-
-    _setup_logging(args.debug)
-
-    # Telegram
-    notifier = TelegramNotifier(token=args.tg_token, chat_id=args.tg_chat)
-
-    # Risk-интеграция «на будущее» (когда появится trade-режим)
-    risk = RiskService(RiskCfg(
-        max_position_pct=args.max_position_pct,
-        stop_loss_bps=args.stop_loss_bps,
-        max_daily_loss_bps=args.max_daily_loss_bps,
-    ))
-    integration = EngineIntegration(
-        notifier=notifier,
-        risk=risk,
-        reconcile_threshold_qty=args.reconcile_threshold_qty,
+    sub = subparsers.add_parser(
+        "trade-live",
+        help="Онлайн режим: observe/paper для одной или нескольких пар",
     )
 
-    pair: str = args.exmo_pair
-    res_min, count = _parse_candles_span(args.exmo_candles)
-    fast = max(2, int(args.fast))
-    slow = max(fast + 1, int(args.slow))
-    poll_sec = max(1, int(args.poll_sec))
-    hb_sec = max(5, int(args.heartbeat_sec))
+    # источник данных (EXMO)
+    sub.add_argument("--pair", type=str, help="Пара, напр. BTC_EUR")
+    sub.add_argument("--exmo-pair", dest="exmo_pair", type=str, help="Пара EXMO, напр. BTC_EUR")
+    sub.add_argument("--candles", type=str, help="Правило загрузки свечей, напр. 1m:720")
+    sub.add_argument("--exmo-candles", dest="exmo_candles", type=str, help="Правило загрузки EXMO, напр. 1m:720")
+    sub.add_argument("--resample", type=str, default="5m", help="Ресэмплинг, напр. 5m")
+    sub.add_argument("--poll-sec", type=int, default=15, help="Интервал опроса, сек")
 
-    last_ts = 0
-    last_state: Optional[int] = None
-    last_hb = 0.0
+    # НОВОЕ: мультипары
+    sub.add_argument("--pairs", type=str, help="Список пар через запятую: DOGE_EUR,XRP_EUR")
 
-    LOG.info("[live] observe %s %s fast=%d slow=%d poll=%ds", pair, args.exmo_candles, fast, slow, poll_sec)
+    # режим и стратегия
+    sub.add_argument("--mode", required=True, choices=["observe", "paper"], help="Режим работы")
+    sub.add_argument(
+        "--strategy",
+        required=True,
+        choices=["ema_adx", "ema_adx_atr", "rsi2", "bb_breakout"],
+        help="Стратегия",
+    )
+
+    # параметры стратегии (если ваша реализация их использует)
+    sub.add_argument("--ema-fast", type=int, default=10)
+    sub.add_argument("--ema-slow", type=int, default=20)
+    sub.add_argument("--adx-len", type=int, default=14)
+    sub.add_argument("--adx-on", type=int, default=18)
+    sub.add_argument("--adx-off", type=int, default=14)
+    sub.add_argument("--require-di", action="store_true", default=False)
+
+    # НОВОЕ: нормальный парс процентов/бпс
+    sub.add_argument(
+        "--risk-max-position-pct",
+        type=_pct_arg,
+        default=0.25,
+        help="Макс. размер позиции (0..1) или (0..100] в процентах. Примеры: 0.25 или 25",
+    )
+    sub.add_argument("--risk-stop-loss-bps", type=_bps_arg, default=300, help="Стоп-лосс в bps (1/100%): 300 = 3.0%")
+    sub.add_argument("--cooldown-bars", type=int, default=5)
+    sub.add_argument("--fee-bps", type=_bps_arg, default=10)
+    sub.add_argument("--slip-bps", type=_bps_arg, default=2)
+
+    sub.add_argument("--summary-alert", action="store_true", help="Отправлять краткое резюме в конце итерации")
+
+    sub.set_defaults(_handler=_handle_trade_live)
+    return sub
+
+
+# --- диспетчер и запуск для одной пары ---------------------------------------------
+
+def _handle_trade_live(args):
+    """
+    Поддерживает одну пару (--pair/--exmo-pair) или много (--pairs=...).
+    Для каждой пары запускает live-петлю (боевой раннер или fallback).
+    """
+    # собираем пары
+    pairs: list[str] = []
+    if getattr(args, "pairs", None):
+        pairs = [p.strip() for p in args.pairs.split(",") if p.strip()]
+    elif getattr(args, "exmo_pair", None):
+        pairs = [args.exmo_pair]
+    elif getattr(args, "pair", None):
+        pairs = [args.pair]
+
+    if not pairs:
+        raise SystemExit("нужно указать пару: --pairs или --exmo-pair/--pair")
+
+    results = []
+    for pair in pairs:
+        results.append(_run_live_for_single_pair(pair, args))
+    return results
+
+
+def _run_live_for_single_pair(pair: str, args):
+    """
+    Пытаемся вызвать «боевой» раннер, если он есть; иначе — используем встроенный
+    fallback-наблюдатель/бумажную торговлю.
+    """
+    # 1) попытка делегировать в существующий раннер (если он есть в проекте)
+    #    это сохранит прежнее поведение без переписывания ядра
+    for mod, func in [
+        ("src.presentation.cli.live", "run_live"),
+        ("src.presentation.cli.trade_live_core", "run_live"),
+        ("src.presentation.cli.app_live", "run_live"),
+    ]:
+        try:
+            m = __import__(mod, fromlist=[func])
+            run_live = getattr(m, func, None)
+            if callable(run_live):
+                return run_live(
+                    pair=pair,
+                    candles=args.exmo_candles or args.candles,
+                    resample=args.resample,
+                    mode=args.mode,
+                    strategy=args.strategy,
+                    ema_fast=args.ema_fast,
+                    ema_slow=args.ema_slow,
+                    adx_len=args.adx_len,
+                    adx_on=args.adx_on,
+                    adx_off=args.adx_off,
+                    require_di=args.require_di,
+                    risk_max_position_pct=args.risk_max_position_pct,
+                    risk_stop_loss_bps=args.risk_stop_loss_bps,
+                    cooldown_bars=args.cooldown_bars,
+                    fee_bps=args.fee_bps,
+                    slip_bps=args.slip_bps,
+                    poll_sec=args.poll_sec,
+                    summary_alert=args.summary_alert,
+                )
+        except Exception:
+            # пробуем следующий вариант
+            pass
+
+    # 2) fallback: лёгкая наблюдательная петля (без реальных ордеров)
+    return _fallback_live_runner(pair, args)
+
+
+# --- fallback live runner -----------------------------------------------------------
+
+@dataclass
+class _StrategyDef:
+    name: str
+    gen: t.Callable[..., t.List[int]] | None = None
+
+
+def _fallback_live_runner(pair: str, args):
+    """
+    Простой цикл: каждые poll-sec подтягиваем свечи из EXMO, ресэмплим,
+    считаем сигналы (если стратегия известна) и печатаем сводку.
+    Никаких заявок/ордеров в этом fallback нет — только observe/paper-принт.
+    """
+    # необходимые функции из вашего бэктеста
+    from src.backtest.compat import resample_ohlc, normalize_resample_rule
+
+    # пытаемся найти функцию загрузки EXMO-свечей (путь в проекте может отличаться)
+    fetch = None
+    for mod, func in [
+        ("src.infrastructure.exmo.candles", "fetch_exmo_candles_cached"),
+        ("src.infrastructure.exmo.api", "fetch_exmo_candles_cached"),
+        ("src.infrastructure.exmo", "fetch_exmo_candles_cached"),
+    ]:
+        try:
+            m = __import__(mod, fromlist=[func])
+            fetch = getattr(m, func, None)
+            if callable(fetch):
+                break
+        except Exception:
+            pass
+    if fetch is None:
+        raise RuntimeError("Не найден fetch_exmo_candles_cached (проверьте модуль инфраструктуры EXMO).")
+
+    # стратегия и генератор сигналов (если доступен в реестре)
+    strat = _resolve_strategy(args)
+
+    span = args.exmo_candles or args.candles
+    if not span:
+        span = "1m:720"
+    rr = normalize_resample_rule(args.resample)
+
+    mode_prefix = "[live] observe" if args.mode == "observe" else "[live] paper"
+    print(f"{mode_prefix} {pair} {span} strategy={args.strategy}")
 
     try:
         while True:
+            df = fetch(pair, span)
+            if df is None or len(df) == 0:
+                print("[live] (no data)")
+                time.sleep(args.poll_sec)
+                continue
+
             try:
-                rows = _fetch_candles(pair, res_min, count)
-            except Exception as e:
-                LOG.error("[live] EXMO error: %s", e)
-                time.sleep(poll_sec)
-                continue
+                rs = resample_ohlc(df, rr)
+            except Exception:
+                # на всякий случай работаем на исходных свечах
+                rs = df
 
-            if not rows:
-                time.sleep(poll_sec)
-                continue
+            rows = len(rs)
+            last_ts = getattr(rs.index[-1], "isoformat", lambda: str(rs.index[-1]))()
+            last_close = float(rs["close"].iloc[-1])
 
-            ts_list = [ts for ts, _ in rows]
-            prices = [p for _, p in rows]
-            sma_f = _sma(prices, fast)
-            sma_s = _sma(prices, slow)
-            i = len(prices) - 1
-            if i < 0 or sma_f[i] is None or sma_s[i] is None:
-                time.sleep(poll_sec)
-                continue
-
-            ts = ts_list[i]
-            close = prices[i]
-            f = float(sma_f[i])
-            s_val = float(sma_s[i])
-            state = 1 if f > s_val else (-1 if f < s_val else 0)
-
-            # новый бар
-            if ts != last_ts:
-                t_iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-                LOG.info("[live] %s tick  close=%.6f  f=%.6f  s=%.6f", t_iso, close, f, s_val)
-
-                # алерт при смене состояния
-                if args.summary_alert and notifier.enabled and (last_state is None or state != last_state):
-                    arrow = "🔼" if state == 1 else ("🔽" if state == -1 else "⏸")
-                    msg = (
-                        f"<b>Signal {pair}</b> {args.exmo_candles}\n"
-                        f"{arrow} state={state} close={close:.6f}\n"
-                        f"fast={fast} slow={slow}\n"
-                        f"SMAf={f:.6f} SMAs={s_val:.6f}"
-                    )
-                    try:
-                        notifier.send(msg)
-                    except Exception:
-                        pass
-
-                last_ts = ts
-                last_state = state
-
-            # heartbeat
-            now_mono = time.monotonic()
-            if args.summary_alert and notifier.enabled and (now_mono - last_hb >= hb_sec):
+            # если есть генератор сигналов — посчитаем (для информации)
+            if strat.gen is not None:
                 try:
-                    notifier.send(f"✅ live {pair} ok  close={close:.6f}  f={f:.6f}  s={s_val:.6f}")
+                    sig = _compute_signals(strat, rs, args)
+                    # пример: можно распечатать последний статус
+                    last_sig = sig[-1] if sig else 0
+                    print(f"[live] {last_ts} close={last_close:.6f} rows={rows} sig={last_sig}")
                 except Exception:
-                    pass
-                last_hb = now_mono
+                    print(f"[live] {last_ts} close={last_close:.6f} rows={rows}")
+            else:
+                print(f"[live] {last_ts} close={last_close:.6f} rows={rows}")
 
-            time.sleep(poll_sec)
-
+            time.sleep(args.poll_sec)
     except KeyboardInterrupt:
-        LOG.info("[live] stop by user")
-        return 0
+        print("[live] stopped by user")
+        return {"pair": pair, "ok": True}
 
 
-# ---------------------------
-# ПУБЛИЧНЫЙ РЕГИСТРАТОР КОМАНД
-# ---------------------------
-
-def register_trade_live(subparsers: argparse._SubParsersAction) -> None:
+def _resolve_strategy(args) -> _StrategyDef:
     """
-    Регистрирует подкоманду `trade-live` в твоём большом main.py.
-    Никаких правок main.py не требуется.
+    Пытаемся найти генератор сигналов стратегии из реестра.
+    Если не нашли — вернём заглушку.
     """
-    p = subparsers.add_parser("trade-live", help="Live pipelines (observe-only)")
-    p.add_argument("--mode", type=str, choices=["observe"], default="observe",
-                   help="Live mode")
-    p.add_argument("--exmo-pair", type=str, default="DOGE_EUR")
-    p.add_argument("--exmo-candles", type=str, default="1m:300")
-    p.add_argument("--fast", type=int, default=6)
-    p.add_argument("--slow", type=int, default=25)
+    try:
+        reg = __import__("src.strategies.registry", fromlist=["get"])
+        get = getattr(reg, "get", None)
+        if callable(get):
+            d = get(args.strategy)
+            gen = getattr(d, "generate_signals", None)
+            if callable(gen):
+                return _StrategyDef(name=args.strategy, gen=gen)
+    except Exception:
+        pass
+    return _StrategyDef(name=args.strategy, gen=None)
 
-    p.add_argument("--poll-sec", type=int, default=10)
-    p.add_argument("--heartbeat-sec", type=int, default=60)
 
-    # Risk-флаги (на будущее — когда добавим trade)
-    p.add_argument("--max-position-pct", type=float, default=0.25)
-    p.add_argument("--stop-loss-bps", type=int, default=300)
-    p.add_argument("--max-daily-loss-bps", type=int, default=0)
-    p.add_argument("--reconcile-threshold-qty", type=float, default=0.0001)
+def _compute_signals(strat: _StrategyDef, df, args) -> t.List[int]:
+    """
+    Вызов генератора сигналов с типичными именами аргументов.
+    Для ema_adx_atr используем поля, присутствующие в проекте.
+    """
+    close = df["close"]
+    high = df["high"] if "high" in df.columns else df["close"]
+    low = df["low"] if "low" in df.columns else df["close"]
 
-    # Telegram
-    p.add_argument("--summary-alert", action="store_true")
-    p.add_argument("--tg-token", type=str, default=os.getenv("TG_TOKEN", ""))
-    p.add_argument("--tg-chat", type=str, default=os.getenv("TG_CHAT", ""))
-
-    # Отладка
-    p.add_argument("--debug", action="store_true")
-    p.add_argument("--exmo-debug", action="store_true")
-
-    # обработчик
-    def _handler(args: argparse.Namespace) -> None:
-        if args.mode == "observe":
-            rc = _run_observe(args)
-            # main.py ожидает, что handler сам печатает/выходит при ошибках.
-            # Мы просто возвращаем управление.
-            return
-        print(f'{"error": "Unsupported live mode"}', flush=True)
-
-    p.set_defaults(func=_handler)
+    if strat.name == "ema_adx_atr":
+        return strat.gen(
+            close=close,
+            high=high,
+            low=low,
+            fast=args.ema_fast,
+            slow=args.ema_slow,
+            adx_len=args.adx_len,
+            on=args.adx_on,
+            off=args.adx_off,
+            require_di=args.require_di,
+            atr_len=14,
+            atr_mult=3.0,
+        )
+    elif strat.name == "ema_adx":
+        return strat.gen(
+            close=close,
+            high=high,
+            low=low,
+            fast=args.ema_fast,
+            slow=args.ema_slow,
+            adx_len=args.adx_len,
+            on=args.adx_on,
+            off=args.adx_off,
+            require_di=args.require_di,
+        )
+    else:
+        # другие стратегии — пробуем только close
+        return strat.gen(close=close)  # type: ignore[call-arg]
