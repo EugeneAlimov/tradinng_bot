@@ -31,6 +31,19 @@ def _add_common_market_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--resample", dest="resample", help="Правило ресемплинга (e.g. 5m, 1H)", default=None)
 
 
+class PairsAction(argparse.Action):
+    """
+    Обработчик для --pairs, который устанавливает первую пару как --pair
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        pairs_list = [p.strip() for p in (values or "").split(",") if p.strip()]
+        setattr(namespace, self.dest, ",".join(pairs_list))
+        # Устанавливаем первую пару как основную
+        if pairs_list:
+            setattr(namespace, "pair", pairs_list[0])
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="tradinng-bot")
 
@@ -50,8 +63,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out-prefix", default="")
     p.add_argument("--jsonl", action="store_true")
     p.add_argument("--print-trade-summary", action="store_true")
-
-
 
     # --- HTTP
     p.add_argument("--http-retries", type=int, default=3)
@@ -121,9 +132,12 @@ def build_parser() -> argparse.ArgumentParser:
     tl.add_argument("--mode", required=True, choices=["observe", "paper"])
     tl.add_argument("--strategy", required=True,
                     choices=["ema_adx", "ema_adx_atr", "rsi2", "bb_breakout"])
+
+    # ИСПРАВЛЕНИЕ: добавляем правильную обработку --pairs
     tl.add_argument(
         "--pairs",
-        type=str,
+        action=PairsAction,
+        dest="pairs",
         help="Список пар через запятую, напр. DOGE_EUR,XRP_EUR",
     )
 
@@ -171,11 +185,8 @@ def _run_cli(argv: Sequence[str]) -> int:
         LOG.debug("argv=%s", list(argv))
         LOG.debug("parsed args=%s", {k: v for k, v in vars(args).items() if k != "_handler"})
 
-    # Переложим алиасы, если заданы только они
-    if getattr(args, "pair", None) is None:
-        setattr(args, "pair", None)
-    if getattr(args, "candles", None) is None:
-        setattr(args, "candles", None)
+    # ИСПРАВЛЕНИЕ: Убираем переустановку None
+    # Теперь PairsAction правильно устанавливает pair из pairs
 
     return _dispatch(args)
 
