@@ -1,11 +1,15 @@
-# Исправление для src/backtest/compat.py или где вызывается fetch_exmo_candles_cached
+# src/backtest/compat.py
+from __future__ import annotations
 
 import time
 import requests
 import pandas as pd
 import numpy as np
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
 
+
+# === Existing functions (already working) ===
 
 def fetch_exmo_candles_cached(pair: str, span: str) -> pd.DataFrame:
     """
@@ -64,130 +68,231 @@ def fetch_exmo_candles_cached(pair: str, span: str) -> pd.DataFrame:
                 # Успешный ответ
                 candles = data['candles']
                 if not candles:
-                    print(f"EXMO returned empty candles for {pair}")
                     return pd.DataFrame()
 
-                # Обрабатываем данные
+                # Создаем DataFrame
                 df = pd.DataFrame(candles)
+                df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
 
-                # Переименовываем колонки
-                df = df.rename(columns={
-                    "t": "timestamp",
-                    "o": "open",
-                    "h": "high",
-                    "l": "low",
-                    "c": "close",
-                    "v": "volume"
-                })
-
-                # Конвертируем в числовые типы
-                for col in ["open", "high", "low", "close", "volume"]:
-                    if col in df.columns:
-                        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-                # Обрабатываем timestamp (миллисекунды -> секунды)
-                ts = pd.to_numeric(df["timestamp"], errors="coerce")
-                if ts.max() > 10_000_000_000:  # миллисекунды
-                    ts = ts / 1000.0
+                # Конвертируем типы
+                df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
 
                 # Создаем datetime index
-                df["dt"] = pd.to_datetime(ts, unit="s", utc=True)
-                df = df.set_index("dt").sort_index()
+                df.index = pd.to_datetime(df['timestamp'], unit='s', utc=True)
 
-                # Удаляем дубликаты
-                df = df[~df.index.duplicated(keep='first')]
+                return df.dropna()
 
-                # Возвращаем нужные колонки
-                return df[["open", "high", "low", "close", "volume"]].dropna()
-
-        print(f"EXMO unexpected response format: {type(data)}")
+        # Неожиданный формат ответа
+        print(f"EXMO API unexpected response format: {str(data)[:100]}")
         return pd.DataFrame()
 
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         print(f"EXMO API request failed: {e}")
         return pd.DataFrame()
-
-
-# Альтернативно, если нужно исправить конкретно _fetch_exmo_ohlc в engine.py
-def _fetch_exmo_ohlc_fixed(args, pair: str, candles: str) -> pd.DataFrame:
-    """
-    Исправленная версия _fetch_exmo_ohlc для engine.py
-    """
-    try:
-        tf, n = candles.split(":")
-        n = int(n)
     except Exception as e:
-        print(f"Bad --candles: {e}")
+        print(f"EXMO API processing error: {e}")
         return pd.DataFrame()
 
-    # Маппинг timeframes
-    periods = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
 
-    if tf not in periods:
-        print(f"Unsupported timeframe '{tf}'")
-        return pd.DataFrame()
+def normalize_resample_rule(rule: str) -> str:
+    """Normalize resample rule to pandas format"""
+    r = (rule or "").strip().lower()
+    if not r:
+        return "5min"
+    if r.endswith("m"):
+        return f"{int(r[:-1])}min"
+    if r.endswith("h"):
+        return f"{int(r[:-1])}H"
+    if r.endswith("d"):
+        return f"{int(r[:-1])}D"
+    return r
 
-    period = periods[tf]
-    resolution = period // 60  # минуты
 
-    # Временные рамки
-    t_to = int(time.time())
-    t_from = t_to - n * period
+def resample_ohlc(df: Any, rule: str) -> pd.DataFrame:
+    """Минимальный ресемплинг для тестов: поддержка Series/DF с колонкой close или OHLCV."""
+    rr = normalize_resample_rule(rule)
+    if isinstance(df, pd.Series):
+        s = pd.to_numeric(df, errors="coerce")
+        out = s.resample(rr).last().to_frame("close").dropna()
+        return out
+    if isinstance(df, pd.DataFrame):
+        cols = set(df.columns)
+        if {"open", "high", "low", "close", "volume"}.issubset(cols):
+            agg = {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }
+            return df.resample(rr).agg(agg).dropna(how="all")
+        if "close" in cols:
+            s = pd.to_numeric(df["close"], errors="coerce")
+            return s.resample(rr).last().to_frame("close").dropna()
+    raise TypeError("resample_ohlc: unsupported input type")
 
-    # API запрос с правильными параметрами
-    url = "https://api.exmo.com/v1.1/candles_history"
-    params = {
-        "symbol": pair,
-        "resolution": resolution,
-        "from": t_from,
-        "to": t_to
+
+# === Missing functions that need to be implemented ===
+
+@dataclass
+class SimConfig:
+    """Configuration for simulation/backtest"""
+    pair: str
+    span: str
+    resample: str
+    fast: int
+    slow: int
+    hysteresis_bps: int = 0
+    cooldown_bars: int = 0
+    fee_bps: int = 10
+    slip_bps: int = 5
+    qty_eur: float = 100.0
+    max_daily_loss_bps: int = 0
+
+
+def build_bt_config(
+        pair: str,
+        span: str,
+        resample: str,
+        fast: int,
+        slow: int,
+        hysteresis_bps: int = 0,
+        cooldown_bars: int = 0,
+        qty_eur: float = 100.0,
+        fee_bps: int = 10,
+        slip_bps: int = 5,
+        max_daily_loss_bps: int = 0,
+) -> Dict[str, Any]:
+    """Build backtest configuration dictionary"""
+    return {
+        "pair": pair,
+        "span": span,
+        "resample": resample,
+        "fast": fast,
+        "slow": slow,
+        "hysteresis_bps": hysteresis_bps,
+        "cooldown_bars": cooldown_bars,
+        "qty_eur": qty_eur,
+        "fee_bps": fee_bps,
+        "slip_bps": slip_bps,
+        "max_daily_loss_bps": max_daily_loss_bps,
     }
 
+
+def normalize_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize metrics to standard format"""
+    normalized = dict(metrics)
+
+    # Ensure standard metric names exist
+    standard_metrics = [
+        "total_return_pct", "max_drawdown_pct", "sharpe", "calmar",
+        "profit_factor", "winrate_pct", "avg_trade_eur", "trades"
+    ]
+
+    for metric in standard_metrics:
+        if metric not in normalized:
+            normalized[metric] = 0.0
+
+    # Add any DataFrames as-is (trades_df, equity_df)
+    return normalized
+
+
+def simulate_on_df(df: pd.DataFrame, config: Dict[str, Any]) -> Dict[str, Any]:
+    """Simple SMA crossover simulation on DataFrame"""
+    if df.empty:
+        return {"trades": 0, "total_return_pct": 0.0, "error": "Empty DataFrame"}
+
+    fast = config.get("fast", 10)
+    slow = config.get("slow", 30)
+    qty_eur = config.get("qty_eur", 100.0)
+    fee_bps = config.get("fee_bps", 10)
+
+    # Calculate SMAs
+    close = pd.to_numeric(df["close"], errors="coerce").dropna()
+    if len(close) < max(fast, slow):
+        return {"trades": 0, "total_return_pct": 0.0, "error": "Insufficient data"}
+
+    sma_fast = close.rolling(fast).mean()
+    sma_slow = close.rolling(slow).mean()
+
+    # Generate signals
+    signals = np.where(sma_fast > sma_slow, 1, -1)
+    signal_changes = np.diff(signals, prepend=signals[0])
+
+    # Simulate trades
+    trades = []
+    position = 0
+    entry_price = 0
+    cash = 1000.0  # Starting cash
+
+    for i, (ts, price, signal_change) in enumerate(zip(df.index, close, signal_changes)):
+        if signal_change == 2 and position == 0:  # Buy signal
+            shares = (cash * 0.95) / price  # 95% investment, leave some for fees
+            fee = shares * price * (fee_bps / 10000)
+            cash -= (shares * price + fee)
+            position = shares
+            entry_price = price
+
+        elif signal_change == -2 and position > 0:  # Sell signal
+            proceeds = position * price
+            fee = proceeds * (fee_bps / 10000)
+            cash += (proceeds - fee)
+
+            trades.append({
+                "entry_price": entry_price,
+                "exit_price": price,
+                "qty": position,
+                "pnl": proceeds - (position * entry_price)
+            })
+
+            position = 0
+
+    # Calculate metrics
+    total_value = cash + (position * close.iloc[-1] if position > 0 else 0)
+    total_return_pct = ((total_value / 1000.0) - 1) * 100
+
+    return {
+        "trades": len(trades),
+        "total_return_pct": total_return_pct,
+        "final_value": total_value,
+        "cash": cash,
+        "position": position,
+        "trades_list": trades
+    }
+
+
+def run_backtest_compat(bt_cfg: Dict[str, Any], write_csv: bool = False) -> Dict[str, Any]:
+    """Run backtest with compatibility wrapper"""
     try:
-        response = requests.get(url, params=params, timeout=20)
+        # Fetch data
+        df = fetch_exmo_candles_cached(bt_cfg["pair"], bt_cfg["span"])
+        if df.empty:
+            return {"trades": 0, "total_return_pct": 0.0, "error": "No data"}
 
-        if response.status_code != 200:
-            print(f"[exmo] HTTP {response.status_code}: {response.text[:100]}")
-            return pd.DataFrame()
+        # Resample if needed
+        if bt_cfg.get("resample"):
+            df = resample_ohlc(df, bt_cfg["resample"])
 
-        data = response.json()
+        # Run simulation
+        result = simulate_on_df(df, bt_cfg)
 
-        # Проверка на ошибки
-        if not isinstance(data, dict) or 'candles' not in data:
-            print(f"[exmo] bad response: {data}")
-            return pd.DataFrame()
+        # Add config info to result
+        result["config"] = bt_cfg
+        result["bars"] = len(df)
 
-        candles = data['candles']
-        if not candles:
-            print(f"[exmo] empty candles for {pair}")
-            return pd.DataFrame()
+        # Optional: create DataFrames for compatibility
+        if write_csv and result.get("trades_list"):
+            trades_df = pd.DataFrame(result["trades_list"])
+            result["trades_df"] = trades_df
 
-        # Обрабатываем данные как в оригинальном коде
-        df = pd.DataFrame(candles)
-        df = df.rename(columns={"t": "timestamp", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
-
-        for c in ("open", "high", "low", "close", "volume"):
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-
-        ts = pd.to_numeric(df["timestamp"], errors="coerce").astype("Int64").to_numpy(dtype="float64")
-        if np.nanmean(ts) > 10_000_000_000:  # ms → s
-            ts = ts / 1000.0
-
-        df["timestamp"] = ts.astype("int64", copy=False)
-        df["dt"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
-        df = df.sort_values("dt").drop_duplicates(subset=["dt"]).reset_index(drop=True)
-
-        # Sanity check for high/low
-        if {"open", "high", "low", "close"}.issubset(df.columns):
-            hi = df[["open", "close"]].max(axis=1)
-            lo = df[["open", "close"]].min(axis=1)
-            df["high"] = df["high"].fillna(hi).where(df["high"] >= hi, hi)
-            df["low"] = df["low"].fillna(lo).where(df["low"] <= lo, lo)
-
-        print(f"[exmo] success: {len(df)} candles for {pair}")
-        return df[["dt", "timestamp", "open", "high", "low", "close", "volume"]]
+        return result
 
     except Exception as e:
-        print(f"[exmo] request failed: {e}")
-        return pd.DataFrame()
+        return {"trades": 0, "total_return_pct": 0.0, "error": str(e)}
+
+
+# Aliases for backward compatibility
+_normalize_resample_rule = normalize_resample_rule
+_resample_ohlc = resample_ohlc
