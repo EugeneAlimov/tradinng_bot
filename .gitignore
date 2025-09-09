@@ -75,5 +75,8 @@ analytics_export_*
 # Temporary migration files
 migration_temp_*
 
-
 Archive.zip
+
+*.pyc
+*.pyo
+
