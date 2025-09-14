@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, Optional
+from typing import Dict, Any, Optional, Protocol
 import numpy as np
 import pandas as pd
+from src.core.types import Signal
 
 
 class Strategy(Protocol):
@@ -60,3 +61,9 @@ def one_to_roundtrip_entries(position: pd.Series) -> pd.Series:
     """
     prev = position.shift(1).fillna(0).astype(int)
     return (prev == 0) & (position == 1)
+
+
+class IStrategy(Protocol):
+    def warmup_bars(self) -> int: ...
+    def fit(self, df: pd.DataFrame, cfg: Optional[Dict[str, Any]] = None) -> None: ...
+    def on_bar(self, df_tail: pd.DataFrame, state: Optional[Dict[str, Any]] = None) -> Signal: ...

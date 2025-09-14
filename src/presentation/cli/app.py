@@ -11,13 +11,11 @@ def build_parser() -> argparse.ArgumentParser:
     """
     Конструктор CLI парсера.
 
-    Важно: тесты ожидают, что парсер:
-      - имеет подкоманды optimize/sweep/walk-forward/robustness/trade-live
-      - корректно парсит примерные наборы аргументов для них
+    Тесты ожидают наличие подкоманд:
+      - optimize / sweep / walk-forward / robustness / trade-live
+    Здесь мы добавляем только НЕобязательные аргументы — совместимость не ломаем.
     """
-    parser = argparse.ArgumentParser(
-        description="Walk-forward runner (CLI)"
-    )
+    parser = argparse.ArgumentParser(description="Walk-forward runner (CLI)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     # --- optimize -----------------------------------------------------------
@@ -57,13 +55,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_tl.add_argument("--resample", dest="resample", help="Напр. 5m, 15m, 1h (или 5min/15min/1H)")
     p_tl.add_argument("--poll-sec", dest="poll_sec", type=int, default=10)
     p_tl.add_argument("--once", action="store_true", help="Сделать один прогон и выйти")
+    # параметры стратегии
+    p_tl.add_argument(
+        "--strategy-params",
+        help="JSON или 'k=v,k=v' (например: '{\"fast\":12,\"slow\":26}' или 'fast=12,slow=26')",
+    )
     # вывод
     p_tl.add_argument("--stdout-json", action="store_true",
                       help="Печатать последнюю свечу OHLCV в JSON и выйти (для --once)")
-    p_tl.add_argument("--quiet", action="store_true",
-                      help="Тихий режим — не печатать таблицы/вспомогательные строки")
     p_tl.add_argument("--signal-json", action="store_true",
                       help="Печатать сигнал и сводку одной строкой JSON (для --once)")
+    p_tl.add_argument("--pure-json", action="store_true",
+                      help="Вывести только одну JSON-строку без каких-либо префиксов/сообщений")
+    p_tl.add_argument("--quiet", action="store_true",
+                      help="Тихий режим — не печатать таблицы/вспомогательные строки")
+    p_tl.add_argument("--out-json", help="Путь для логирования JSON-строк (append)")
 
     # --- fetch (утилита, удобна руками; тесты её не трогают) ---------------
     p_fetch = sub.add_parser("fetch", help="Скачать свечи EXMO (если доступ к сети)")
@@ -102,7 +108,7 @@ def _dispatch_trade_live(args: argparse.Namespace) -> int:
 
 def _dispatch_fetch(args: argparse.Namespace) -> int:
     """
-    Утилитно: попробуем скачать EXMO через compat, отресемплить и при желании сохранить.
+    Попытка скачать EXMO через compat, отресемплить и сохранить (если задан --out).
     В среде без сети вернётся пусто — просто сообщим.
     """
     try:
