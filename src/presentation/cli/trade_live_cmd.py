@@ -1,330 +1,651 @@
 # src/presentation/cli/trade_live_cmd.py
 from __future__ import annotations
 
+import re
+import argparse
 import json
 import os
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from datetime import datetime, timezone, timedelta
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 
-# ---------- утилиты времени/правил ----------
-
-def _normalize_rule(rule: Optional[str]) -> Optional[str]:
-    if not rule:
-        return None
-    r = rule.strip().lower()
-    if r.endswith("m") and not r.endswith("min"):
-        try:
-            n = int(r[:-1])
-            return f"{n}min"
-        except ValueError:
-            pass
-    return r
+# ---------------------------------------------------------------------
+# Utilities: time handling (UTC everywhere)
+# ---------------------------------------------------------------------
 
 
-def _to_utc_index(ser: pd.Series) -> pd.DatetimeIndex:
-    dt = pd.to_datetime(ser, utc=True, errors="coerce")
-    return pd.DatetimeIndex(dt).sort_values()
+def _to_utc_dtindex(s: pd.Series) -> pd.DatetimeIndex:
+    """Coerce a Series to tz-aware UTC DatetimeIndex (no NaT at tail)."""
+    dt = pd.to_datetime(s, utc=True, errors="coerce")
+    if not isinstance(dt, pd.Series):
+        dt = pd.Series(dt)
+    # drop NaT rows (keeps index aligned only if used before concat)
+    mask = dt.notna()
+    return pd.DatetimeIndex(dt[mask].values).tz_convert("UTC")
 
 
-# ---------- загрузка источников ----------
+def _ensure_utc_ts(df: pd.DataFrame, tcol: str = "time") -> pd.DataFrame:
+    """
+    Ensure df[tcol] is tz-aware UTC; keep as column.
+    Does not set index here; resampler will.
+    """
+    if tcol not in df.columns:
+        raise ValueError(f"Timestamp column '{tcol}' not found in DataFrame")
+    df = df.copy()
+    df[tcol] = pd.to_datetime(df[tcol], utc=True, errors="coerce")
+    df = df[df[tcol].notna()]
+    # normalize any non-UTC tz to UTC
+    if getattr(df[tcol].dt, "tz", None) is None:
+        df[tcol] = df[tcol].dt.tz_localize("UTC")
+    else:
+        df[tcol] = df[tcol].dt.tz_convert("UTC")
+    return df
 
-def _load_csv(path: str) -> pd.DataFrame:
-    if not os.path.exists(path):
-        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]).set_index(
-            pd.DatetimeIndex([], name="time")
+
+def _fmt_rfc3339_basic(dt: pd.Timestamp | datetime) -> str:
+    """Format as YYYY-MM-DDTHH:MM:SS+0000 (no colon in offset)."""
+    if isinstance(dt, pd.Timestamp):
+        if dt.tzinfo is None:
+            dt = dt.tz_localize("UTC")
+        else:
+            dt = dt.tz_convert("UTC")
+        dt = dt.to_pydatetime()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def _to_utc_naive_ts(obj: pd.Series | pd.DatetimeIndex) -> pd.Series | pd.DatetimeIndex:
+    """
+    Приводит Series/DatetimeIndex к UTC и делает их naive (без tz).
+    Корректно обрабатывает и tz-aware, и tz-naive.
+    """
+    if isinstance(obj, pd.Series):
+        s = pd.to_datetime(obj, errors="coerce", utc=False)
+        tz = getattr(s.dt, "tz", None)
+        if tz is None:
+            s = s.dt.tz_localize("UTC")
+        else:
+            s = s.dt.tz_convert("UTC")
+        return s.dt.tz_localize(None)
+    elif isinstance(obj, pd.DatetimeIndex):
+        idx = pd.DatetimeIndex(obj)
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        else:
+            idx = idx.tz_convert("UTC")
+        return idx.tz_localize(None)
+    else:
+        # на всякий случай — приведём к Series и обработаем как Series
+        s = pd.to_datetime(pd.Series(obj), errors="coerce", utc=True)
+        return s.dt.tz_localize(None)
+
+
+# ---------------------------------------------------------------------
+# Demo data and CSV loader
+# ---------------------------------------------------------------------
+
+
+def _demo_ohlcv(n_minutes: int = 600, start: Optional[datetime] = None) -> pd.DataFrame:
+    """
+    Generate a simple 1m OHLCV demo series.
+    """
+    if start is None:
+        start = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(
+            minutes=n_minutes
         )
+    idx = pd.date_range(start, periods=n_minutes, freq="1min", tz="UTC")
+    # random walk for close; derived ohlc; volume random-ish
+    rng = np.random.default_rng(42)
+    steps = rng.normal(0, 0.3, size=n_minutes).cumsum() + 100.0
+    close = steps
+    open_ = np.roll(close, 1)
+    open_[0] = close[0]
+    high = np.maximum(open_, close) + rng.random(n_minutes) * 0.5
+    low = np.minimum(open_, close) - rng.random(n_minutes) * 0.5
+    vol = rng.integers(80, 150, size=n_minutes).astype(float)
+
+    df = pd.DataFrame(
+        {
+            "time": idx,
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": vol,
+        }
+    )
+    return df
+
+
+def _read_csv_ohlcv(path: str, tcol: str = "time") -> pd.DataFrame:
+    """
+    Minimal CSV reader: expects columns time, open, high, low, close[, volume].
+    """
     df = pd.read_csv(path)
-    ts_col = None
-    for c in ["timestamp", "time", "ts", "date"]:
+    if tcol not in df.columns:
+        # try a couple of common names
+        for cand in ("timestamp", "datetime", "date"):
+            if cand in df.columns:
+                tcol = cand
+                break
+    # normalize column names (lower)
+    df.columns = [c.strip().lower() for c in df.columns]
+    if tcol not in df.columns:
+        raise ValueError(f"Timestamp column '{tcol}' not present in CSV '{path}'")
+    # coerce numeric columns if present
+    for c in ("open", "high", "low", "close", "volume"):
         if c in df.columns:
-            ts_col = c
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = _ensure_utc_ts(df, tcol=tcol)
+    return df
+
+
+# ---------------------------------------------------------------------
+# Resampling with DuckDB fallback
+# ---------------------------------------------------------------------
+
+
+def _parse_rule_to_duck_interval(rule: str) -> str:
+    """
+    Convert pandas-like rule (e.g., '5min', '1h') to DuckDB INTERVAL string.
+    Supports: s, sec, second(s); min; h; d.
+    """
+    r = rule.strip().lower()
+    # quick map of suffixes
+    mapping = {
+        ("s", "sec", "secs", "second", "seconds"): "second",
+        ("t", "min", "mins", "minute", "minutes"): "minute",
+        ("h", "hour", "hours"): "hour",
+        ("d", "day", "days"): "day",
+    }
+    num = ""
+    unit = ""
+    for ch in r:
+        if ch.isdigit():
+            num += ch
+        else:
+            unit += ch
+    num = num or "1"
+    unit = unit.strip()
+    unit_std = None
+    for keys, val in mapping.items():
+        if unit in keys:
+            unit_std = val
             break
-    if ts_col is None:
-        ts_col = df.columns[0]
-    idx = _to_utc_index(df[ts_col])
-    cols = ["open", "high", "low", "close", "volume"]
-    for c in cols:
-        if c not in df.columns:
-            df[c] = np.nan
-    out = df[cols].copy()
-    out.index = idx
+    if unit_std is None:
+        # fallback: assume minutes if unspecified
+        unit_std = "minute"
+    return f"{int(num)} {unit_std}"
+
+
+def _resample_ohlc_pandas(
+        df: pd.DataFrame, rule: str, tcol: str = "time"
+) -> pd.DataFrame:
+    """
+    Pandas resample to OHLCV with UTC-aware DatetimeIndex.
+    """
+    df = df.copy()
+    df = _ensure_utc_ts(df, tcol=tcol)
+    df = df.set_index(tcol).sort_index()
+    agg = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+    }
+    if "volume" in df.columns:
+        agg["volume"] = "sum"
+    out = df.resample(rule).agg(agg).dropna(how="all")
+    # ensure tz-aware UTC
+    out.index = out.index.tz_convert("UTC")
     out.index.name = "time"
-    out = out.sort_index()
-    for c in cols:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
-    out = out.dropna(subset=["open", "high", "low", "close"]).fillna(0.0)
     return out
 
 
-def _resample_ohlc_pandas(df: pd.DataFrame, rule: Optional[str]) -> pd.DataFrame:
-    if not rule or df.empty:
-        return df
-    rule = _normalize_rule(rule)
-    o = df["open"].resample(rule, origin="start_day").first()
-    h = df["high"].resample(rule, origin="start_day").max()
-    l = df["low"].resample(rule, origin="start_day").min()
-    c = df["close"].resample(rule, origin="start_day").last()
-    v = df["volume"].resample(rule, origin="start_day").sum()
-    out = pd.concat({"open": o, "high": h, "low": l, "close": c, "volume": v}, axis=1)
-    out = out.dropna(subset=["open", "high", "low", "close"])
-    return out
+def _rule_to_seconds(rule: str) -> int:
+    r = rule.strip().lower()
+    num = "".join(ch for ch in r if ch.isdigit()) or "1"
+    unit = "".join(ch for ch in r if ch.isalpha()) or "min"
+    n = int(num)
+    if unit in ("s", "sec", "secs", "second", "seconds"):
+        return n
+    if unit in ("m", "t", "min", "mins", "minute", "minutes"):
+        return n * 60
+    if unit in ("h", "hour", "hours"):
+        return n * 3600
+    if unit in ("d", "day", "days"):
+        return n * 86400
+    return n * 60  # дефолт: минуты
 
 
-def _resample_ohlc(df: pd.DataFrame, rule: Optional[str], prefer_duck: bool = False) -> pd.DataFrame:
-    if not rule or df.empty:
-        return df
-    if prefer_duck:
+def _resample_ohlc_duckdb(df: pd.DataFrame, rule: str, tcol: str = "time") -> pd.DataFrame:
+    import duckdb
+    interval = _parse_rule_to_duck_interval(rule)
+    bin_sec = _rule_to_seconds(rule)
+
+    con = duckdb.connect()
+    try:
+        con.register("t", df.copy())
         try:
-            from src.storage.duckops import resample_via_duckdb
-            return resample_via_duckdb(df, _normalize_rule(rule) or "1min")
+            q1 = f"""
+            SELECT
+                DATE_BIN(INTERVAL '{interval}', {tcol}) AS time,
+                FIRST(open) AS open,
+                MAX(high)   AS high,
+                MIN(low)    AS low,
+                LAST(close) AS close,
+                SUM(COALESCE(volume, 0)) AS volume
+            FROM t
+            GROUP BY 1
+            ORDER BY 1
+            """
+            res = con.sql(q1).df()
+        except Exception:
+            q2 = f"""
+            SELECT
+                to_timestamp(floor(epoch({tcol})/{bin_sec})*{bin_sec}) AS time,
+                FIRST(open) AS open,
+                MAX(high)   AS high,
+                MIN(low)    AS low,
+                LAST(close) AS close,
+                SUM(COALESCE(volume, 0)) AS volume
+            FROM t
+            GROUP BY 1
+            ORDER BY 1
+            """
+            res = con.sql(q2).df()
+    finally:
+        con.close()
+
+    res["time"] = pd.to_datetime(res["time"], utc=True)
+    res = res.set_index("time").sort_index()
+    res.index = res.index.tz_convert("UTC")
+    return res
+
+
+def _rule_to_duck_interval(rule: str) -> str:
+    s = rule.strip().lower().replace(" ", "")
+    m = re.fullmatch(r"(\d+)(s|sec|second|m|min|minute|h|hour|d|day)", s)
+    if not m:
+        raise ValueError(f"Unsupported resample rule for DuckDB: {rule!r}")
+    n = int(m.group(1))
+    unit = m.group(2)
+    unit_map = {
+        "s": "SECOND", "sec": "SECOND", "second": "SECOND",
+        "m": "MINUTE", "min": "MINUTE", "minute": "MINUTE",
+        "h": "HOUR", "hour": "HOUR",
+        "d": "DAY", "day": "DAY",
+    }
+    return f"INTERVAL {n} {unit_map[unit]}"
+
+
+def _resample_ohlc_with_duckdb_fallback(
+        df: pd.DataFrame,
+        rule: str,
+        tcol: str = "time",
+        use_duckdb: bool = True,
+) -> pd.DataFrame:
+    """
+    Ресэмплинг OHLCV: DuckDB (date_bin -> time_bucket) -> pandas.resample().
+    На вход можно давать что угодно по времени (столбец или индекс, tz/без tz).
+    Везде нормализуем к UTC.
+    """
+    # подготовим временную шкалу
+    if tcol in df.columns:
+        ts_naive = _to_utc_naive_ts(df[tcol])
+    else:
+        ts_naive = _to_utc_naive_ts(df.index)
+
+    work = df[["open", "high", "low", "close", "volume"]].copy()
+    work.insert(0, "ts", ts_naive)
+
+    if use_duckdb:
+        try:
+            import duckdb  # noqa: WPS433
+
+            con = duckdb.connect()
+            con.register("df", work)
+            interval = _rule_to_duck_interval(rule)
+
+            # 1) пробуем date_bin(...)
+            sql_date_bin = f"""
+                SELECT
+                  bucket,
+                  arg_min(open, ts)   AS open,
+                  max(high)           AS high,
+                  min(low)            AS low,
+                  arg_max(close, ts)  AS close,
+                  sum(volume)         AS volume
+                FROM (
+                  SELECT date_bin({interval}, ts, TIMESTAMP '1970-01-01') AS bucket,
+                         ts, open, high, low, close, volume
+                  FROM df
+                )
+                GROUP BY bucket
+                ORDER BY bucket
+            """
+            try:
+                out = con.execute(sql_date_bin).fetch_df()
+            except Exception:
+                # 2) если функции нет — пробуем time_bucket(...)
+                sql_time_bucket = f"""
+                    SELECT
+                      bucket,
+                      arg_min(open, ts)   AS open,
+                      max(high)           AS high,
+                      min(low)            AS low,
+                      arg_max(close, ts)  AS close,
+                      sum(volume)         AS volume
+                    FROM (
+                      SELECT time_bucket({interval}, ts) AS bucket,
+                             ts, open, high, low, close, volume
+                      FROM df
+                    )
+                    GROUP BY bucket
+                    ORDER BY bucket
+                """
+                out = con.execute(sql_time_bucket).fetch_df()
+
+            con.close()
+
+            out.rename(columns={"bucket": tcol}, inplace=True)
+            out[tcol] = pd.to_datetime(out[tcol], utc=True)
+            out.set_index(tcol, inplace=True)
+            return out
+
         except Exception as e:
-            print(f"[trade-live] duckdb resample disabled: {e}", file=sys.stderr)
-    return _resample_ohlc_pandas(df, rule)
+            print(f"[duckops] DuckDB resample failed ({e}), fallback to pandas.resample()")
+
+    # --- pandas fallback ---
+    work.set_index("ts", inplace=True)
+    agg = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }
+    out = (
+        work
+        .resample(rule, label="right", closed="right")
+        .agg(agg)
+        .dropna(how="all")
+    )
+    # делаем индекс tz-aware (UTC) и называем как tcol
+    out.index = out.index.tz_localize("UTC")
+    out.index.name = tcol
+    return out
 
 
-# ---------- стратегия/реестр ----------
+# ---------------------------------------------------------------------
+# Signal calculation
+# ---------------------------------------------------------------------
 
-def _parse_params_env(s: Optional[str]) -> Dict[str, Any]:
+
+def _ema(s: pd.Series, span: int) -> pd.Series:
+    return s.ewm(span=span, adjust=False, min_periods=span).mean()
+
+
+def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(n, min_periods=n).mean()
+
+
+def _adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
     """
-    Разбор TB_STRATEGY_PARAMS="k=v, k2=v2" -> dict
+    Simplified ADX (Wilder’s). Good enough for demo and decision gating.
     """
-    if not s:
+    high, low, close = df["high"], df["low"], df["close"]
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    tr = _atr(df, n=1)  # true range daily, then smoothed
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / n).mean() / tr.replace(
+        0, np.nan
+    )
+    minus_di = (
+            100
+            * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / n).mean()
+            / tr.replace(0, np.nan)
+    )
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)).replace([np.inf, -np.inf], np.nan) * 100
+    adx = dx.ewm(alpha=1 / n, adjust=False).mean()
+    return adx
+
+
+def _parse_params_str(params: Optional[str]) -> Dict[str, float | int | str]:
+    """
+    Parse 'k1=v1,k2=v2' into dict with best-effort casting to int/float.
+    """
+    if not params:
         return {}
-    out: Dict[str, Any] = {}
-    for part in s.split(","):
-        part = part.strip()
-        if not part or "=" not in part:
+    out: Dict[str, float | int | str] = {}
+    parts = [p.strip() for p in params.split(",") if p.strip()]
+    for p in parts:
+        if "=" not in p:
             continue
-        k, v = part.split("=", 1)
-        k = k.strip()
-        v = v.strip()
-        # попытка конверсии типов
-        if v.lower() in ("true", "false"):
-            out[k] = (v.lower() == "true")
+        k, v = [x.strip() for x in p.split("=", 1)]
+        if v.isdigit():
+            out[k] = int(v)
         else:
             try:
-                out[k] = int(v)
+                out[k] = float(v)
             except ValueError:
-                try:
-                    out[k] = float(v)
-                except ValueError:
-                    out[k] = v
+                out[k] = v
     return out
 
 
-def _resolve_strategy(name: Optional[str]):
-    from src.strategies.runtime_registry import registry
-    return registry.resolve(name)
+def _compute_signal(
+        df_r: pd.DataFrame, strategy_name: str, params: Dict[str, float | int | str]
+) -> Dict[str, float | str]:
+    """
+    Return dict with keys: side ('LONG'/'SHORT'/'FLAT'), price (float), and extras.
+    """
+    if df_r.empty:
+        return {"side": "FLAT", "price": float("nan")}
+    close = df_r["close"].astype(float)
+
+    # Defaults
+    fast = int(params.get("ema_fast", 12))
+    slow = int(params.get("ema_slow", 26))
+
+    ema_fast = _ema(close, fast)
+    ema_slow = _ema(close, slow)
+
+    side = "FLAT"
+    if len(close) >= max(fast, slow) + 1:
+        cross = np.sign(ema_fast - ema_slow)
+        prev, curr = cross.iloc[-2], cross.iloc[-1]
+        if curr > 0 and prev <= 0:
+            side = "LONG"
+        elif curr < 0 and prev >= 0:
+            side = "SHORT"
+        else:
+            side = "FLAT"
+
+    price = float(close.iloc[-1])
+
+    out = {"side": side, "price": price, "ema_fast": float(ema_fast.iloc[-1]), "ema_slow": float(ema_slow.iloc[-1])}
+
+    if strategy_name.lower() == "ema_adx_atr":
+        n = int(params.get("window", 14))
+        out["atr"] = float(_atr(df_r, n=n).iloc[-1])
+        out["adx"] = float(_adx(df_r, n=n).iloc[-1])
+    return out
 
 
-# ---------- Args-контейнер ----------
-
-@dataclass
-class Args:
-    mode: Optional[str] = None
-    strategy: Optional[str] = None
-    exmo_pair: Optional[str] = None
-    exmo_candles: Optional[str] = None
-    resample: Optional[str] = None
-    poll_sec: int = 10
-    data: Optional[str] = None
-    demo: bool = False
-    bars: int = 720
-    once: bool = False
-    stdout_json: bool = False
-    pure_json: bool = False
-    out_json: Optional[str] = None
-    signal_json: bool = False
-    quiet: bool = False
+# ---------------------------------------------------------------------
+# Signal building + DB writers
+# ---------------------------------------------------------------------
 
 
-def _should_quiet_json(args: Args | Any) -> bool:
-    return bool(getattr(args, "pure_json", False) or getattr(args, "quiet", False)
-                or getattr(args, "stdout_json", False) or getattr(args, "signal_json", False))
-
-
-# ---------- загрузка данных ----------
-
-def _load_source(args: Args | Any) -> tuple[pd.DataFrame, str, str]:
-    prefer_duck = os.getenv("TB_USE_DUCKDB", "0") == "1"
-    resample_rule = getattr(args, "resample", None)
-
-    if getattr(args, "data", None):
-        df = _load_csv(getattr(args, "data"))
-        df = _resample_ohlc(df, resample_rule, prefer_duck=prefer_duck)
-        return df, (getattr(args, "exmo_pair", None) or "CSV"), (_normalize_rule(resample_rule) or "1min")
-
-    if getattr(args, "exmo_pair", None) and getattr(args, "exmo_candles", None):
-        try:
-            from src.backtest.compat import fetch_exmo_candles_cached
-            pair, span = getattr(args, "exmo_pair"), getattr(args, "exmo_candles")
-            df = fetch_exmo_candles_cached(pair, span)
-            df = _resample_ohlc(df, resample_rule, prefer_duck=prefer_duck)
-            return df, pair, (_normalize_rule(resample_rule) or "1min")
-        except Exception:
-            pass
-
-    # demo
-    bars = int(getattr(args, "bars", 720) or 720)
-    idx = pd.date_range(end=pd.Timestamp.utcnow().floor("min"), periods=bars, freq="1min", tz="UTC")
-    rng = np.random.default_rng(42)
-    rets = rng.normal(0, 0.0015, size=len(idx))
-    price = 100 * np.exp(np.cumsum(rets))
-    close = pd.Series(price, index=idx)
-    spread = np.abs(rng.normal(0, 0.0025, size=len(idx))) * close.values
-    high = close + spread
-    low = close - spread
-    open_ = close.shift(1).fillna(close.iloc[0])
-    vol = rng.integers(50, 500, size=len(idx)).astype(float)
-    df = pd.DataFrame({"open": open_, "high": high, "low": low, "close": close, "volume": vol}, index=idx)
-    df = _resample_ohlc(df, resample_rule, prefer_duck=prefer_duck)
-    return df, "DEMO", (_normalize_rule(resample_rule) or "1min")
-
-
-# ---------- агрегаты/статистика ----------
-
-def _summary_stats(close: pd.Series, lookback: int = 500) -> Dict[str, float]:
-    if len(close) == 0:
-        return {"trades": 0.0, "exposure_pct": 0.0, "pnl_pct": 0.0, "max_dd_pct": 0.0, "sharpe": 0.0}
-    s = close.tail(lookback)
-    ret = s.pct_change().fillna(0.0)
-    pnl = (s.iat[-1] / s.iat[0] - 1.0) * 100.0 if len(s) > 1 else 0.0
-    trades = int((ret.abs() > ret.std() * 1.5).sum())
-    exposure = min(100.0, trades / max(1, len(s)) * 100.0 * 2)
-    max_dd = (s / s.cummax() - 1.0).min() * 100.0
-    sharpe = (ret.mean() / (ret.std() + 1e-9)) * np.sqrt(252 * 24 * 12)
-    return {
-        "trades": float(trades),
-        "exposure_pct": float(round(exposure, 1)),
-        "pnl_pct": float(pnl),
-        "max_dd_pct": float(max_dd),
-        "sharpe": float(sharpe),
+def _build_signal(
+        df_resampled: pd.DataFrame,
+        symbol: str,
+        timeframe: str,
+        strategy_name: str,
+        side: str,
+        price: float,
+        tcol: str = "time",
+        extra: Optional[Dict[str, float]] = None,
+) -> Dict[str, object]:
+    if df_resampled.empty:
+        raise ValueError("df_resampled is empty; cannot build a signal")
+    # ensure we have tz-aware UTC index
+    if not isinstance(df_resampled.index, pd.DatetimeIndex):
+        raise TypeError("df_resampled.index must be a DatetimeIndex")
+    ts = df_resampled.index[-1]
+    out = {
+        "time": _fmt_rfc3339_basic(ts),
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "strategy": strategy_name,
+        "price": float(price),
+        "side": side,
+        "run_id": os.environ.get("TB_RUN_ID"),
     }
+    if extra:
+        out.update(extra)
+    return out
 
 
-# ---------- стор/паркет ----------
-
-def _maybe_open_store():
-    url = os.getenv("TB_STORE_URL")
+def _write_signal_if_enabled(signal: Dict[str, object]) -> None:
+    if os.environ.get("TB_WRITE_SIGNALS", "0") not in ("1", "true", "True"):
+        return
+    url = os.environ.get("TB_STORE_URL")
     if not url:
-        return None
+        print("No TB_STORE_URL; skip signal write.", file=sys.stderr)
+        return
     try:
-        from src.storage.db import open_store
-        return open_store(url)
-    except Exception as e:
-        print(f"[trade-live] storage disabled: {e}", file=sys.stderr)
-        return None
+        from src.storage import db  # local import
+        db.write_signal(signal, url=url)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] write_signal failed: {e!s}", file=sys.stderr)
 
 
-# ---------- run/main/handler ----------
+def _write_candles_if_enabled(
+        df_r: pd.DataFrame, symbol: str, timeframe: str, tcol: str = "time"
+) -> None:
+    if os.environ.get("TB_WRITE_CANDLES", "0") not in ("1", "true", "True"):
+        return
+    url = os.environ.get("TB_STORE_URL")
+    if not url:
+        print("No TB_STORE_URL; skip candles write.", file=sys.stderr)
+        return
+    try:
+        from src.storage import db  # local import
 
-def run(args: Args | Any) -> int:
-    header = (
-        f"[trade-live] mode={getattr(args, 'mode', None)} strategy={getattr(args, 'strategy', None)} "
-        f"pair={getattr(args, 'exmo_pair', None)} span={getattr(args, 'exmo_candles', None)} "
-        f"resample={getattr(args, 'resample', None)} poll_sec={getattr(args, 'poll_sec', 10)} "
-        f"data={getattr(args, 'data', None)} demo={getattr(args, 'demo', False)} bars={getattr(args, 'bars', 720)}"
+        out = df_r.reset_index()
+        out.rename(columns={"index": tcol}, inplace=True)
+        out[tcol] = pd.to_datetime(out[tcol], utc=True)
+        # store as string in our unified format
+        out[tcol] = out[tcol].map(_fmt_rfc3339_basic)
+        cols = ["time", "open", "high", "low", "close"]
+        if "volume" in out.columns:
+            cols.append("volume")
+        out = out[cols]
+        db.write_candles(out, symbol=symbol, timeframe=timeframe, url=url)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] write_candles failed: {e!s}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="tb trade-live",
+        description="Live/demo signal generation with optional DB persistence.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    if not _should_quiet_json(args):
-        print(header)
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--demo", action="store_true", help="Use synthetic demo 1m data")
+    src.add_argument("--data", type=str, help="CSV with columns time, open, high, low, close[, volume]")
 
-    df, symbol, timeframe = _load_source(args)
-    if df.empty:
-        if not _should_quiet_json(args):
-            print(
-                "[trade-live] Пустые данные. Варианты:\n"
-                "  • --demo [--bars N] — сгенерировать синтетические свечи\n"
-                "  • --data /путь/к/ohlcv.csv — загрузить локальный CSV\n"
-                "  • --exmo-pair ... --exmo-candles ... — если кэш EXMO уже прогрет"
-            )
-        return 0
+    p.add_argument("--bars", type=int, default=1440, help="Bars for demo 1m series")
+    p.add_argument("--symbol", type=str, default="DEMO", help="Symbol label for output/DB")
+    p.add_argument("--tcol", type=str, default="time", help="Timestamp column name")
+    p.add_argument("--resample", type=str, default="5min", help="Target timeframe (e.g., 5min, 1h)")
+    p.add_argument("--once", action="store_true", help="Run once and exit")
 
-    # выбор стратегии
-    spec = _resolve_strategy(getattr(args, "strategy", None))
-    params_env = _parse_params_env(os.getenv("TB_STRATEGY_PARAMS"))
-    params = {**spec.defaults, **params_env}
+    p.add_argument("--strategy", type=str, default="ema_cross", help="Strategy name: ema_cross | ema_adx_atr")
+    p.add_argument("--params", type=str, default=None, help="Extra params, e.g. 'ema_fast=12,ema_slow=26'")
+    p.add_argument("--signal-json", action="store_true", help="Print the built signal as JSON")
+    return p
 
-    side, extras = spec.fn(df, params)
-    last_ts = df.index[-1]
-    last_close = float(df["close"].iat[-1])
-    summary = _summary_stats(df["close"], lookback=500)
 
-    # parquet sink (опц.)
-    parquet_dir = os.getenv("TB_PARQUET_DIR")
-    if parquet_dir:
-        try:
-            from src.storage.duckops import write_parquet_partitioned
-            write_parquet_partitioned(df, parquet_dir, symbol=symbol, timeframe=timeframe)
-        except Exception as e:
-            print(f"[trade-live] parquet disabled: {e}", file=sys.stderr)
-
-    # вывод сигнала
-    if getattr(args, "signal_json", False):
-        payload = {
-            "time": last_ts.isoformat(),
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "strategy": spec.name,
-            "price": last_close,
-            "side": side,
-            **extras,
-            **summary,
-            "lookback": 500,
-        }
-        text = json.dumps(payload, ensure_ascii=False)
-        print(text)
-        if getattr(args, "out_json", None):
-            os.makedirs(os.path.dirname(args.out_json), exist_ok=True)
-            with open(args.out_json, "a", encoding="utf-8") as f:
-                f.write(text + "\n")
-
-        store = _maybe_open_store()
-        if store and os.getenv("TB_WRITE_SIGNALS", "1") == "1":
-            run_id = os.getenv("TB_RUN_ID") or pd.Timestamp.utcnow().strftime("run-%Y%m%d-%H%M%S")
-            to_db = {
-                "time": last_ts,  # стор сам нормализует к ISO
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "strategy": spec.name,
-                "side": side,
-                "price": last_close,
-                "run_id": run_id,
-                "payload": payload,
-            }
-            try:
-                store.write_signal(to_db)
-            except Exception as e:
-                print(f"[trade-live] failed to write signal: {e}", file=sys.stderr)
-
-        if store and os.getenv("TB_WRITE_CANDLES", "0") == "1":
-            try:
-                store.write_candles(df, symbol=symbol, timeframe=timeframe)
-            except Exception as e:
-                print(f"[trade-live] failed to write candles: {e}", file=sys.stderr)
-
+def _once(args: argparse.Namespace) -> int:
+    # 1) Load data
+    if args.demo:
+        df = _demo_ohlcv(args.bars)
     else:
-        if not _should_quiet_json(args):
-            extras_str = " ".join(f"{k}={v:.6f}" for k, v in extras.items() if isinstance(v, (int, float)))
-            print(
-                f"[trade-live] signal={side} time={last_ts.isoformat()} price={last_close:.6f} {extras_str}"
-            )
-            print(
-                f"[trade-live] summary (lookback=500): trades={int(summary['trades'])} "
-                f"exposure={summary['exposure_pct']:.1f}% pnl={summary['pnl_pct']:.2f}% "
-                f"maxDD={summary['max_dd_pct']:.2f}% sharpe={summary['sharpe']:.2f}"
-            )
+        df = _read_csv_ohlcv(args.data, tcol=args.tcol)
 
+    # 2) Normalize times & resample
+    df = _ensure_utc_ts(df, tcol=args.tcol)
+    use_duck = os.environ.get("TB_USE_DUCKDB", "1") in ("1", "true", "True")
+    df_r = _resample_ohlc_with_duckdb_fallback(df, rule=args.resample, tcol=args.tcol, use_duckdb=use_duck)
+
+    # 3) Compute signal
+    params = _parse_params_str(args.params)
+    sig_fields = _compute_signal(df_r, args.strategy, params)
+    extra = {k: v for k, v in sig_fields.items() if k not in ("side", "price")}
+
+    # 4) Build and print
+    sig = _build_signal(
+        df_resampled=df_r,
+        symbol=args.symbol if args.data is None else args.symbol,
+        timeframe=args.resample,
+        strategy_name=args.strategy,
+        side=sig_fields["side"],
+        price=float(sig_fields["price"]),
+        tcol=args.tcol,
+        extra=extra,
+    )
+
+    if args.signal_json:
+        print("[signal]", json.dumps(sig, ensure_ascii=False))
+
+    # 5) Persist
+    _write_signal_if_enabled(sig)
+    _write_candles_if_enabled(df_r, symbol=args.symbol, timeframe=args.resample, tcol=args.tcol)
     return 0
 
 
-def main(args: Args | Any) -> int:
-    return run(args)
+def main(argv: Optional[Tuple[str, ...]] = None) -> int:
+    """
+    Entry point; compatible with app launcher which may call main(argv=...).
+    """
+    parser = build_parser()
+    ns = parser.parse_args(list(argv) if argv is not None else None)
+    if ns.once:
+        return _once(ns)
+    # For now, 'once' mode only; a streaming loop can be added later.
+    # Run once by default to keep behavior predictable in CI / tests.
+    return _once(ns)
 
 
-def handler(args: Args | Any) -> int:
-    return run(args)
+if __name__ == "__main__":
+    raise SystemExit(main())

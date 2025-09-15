@@ -1,335 +1,239 @@
-# src/storage/db.py
 from __future__ import annotations
 
 import json
 import os
 import sqlite3
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, Optional
 
-import pandas as pd
+# =========================
+# DDL
+# =========================
 
-
-def open_store(url: str) -> "BaseStore":
-    """
-    Открывает стор по URL:
-      - sqlite:///absolute/path/to.db
-      - sqlite:///:memory:
-      - duckdb:///absolute/path/to.duckdb
-    """
-    if not isinstance(url, str) or "://" not in url:
-        raise ValueError(f"Invalid store url: {url!r}")
-
-    scheme, rest = url.split("://", 1)
-    scheme = scheme.lower()
-
-    if scheme == "sqlite":
-        path = _parse_sqlite_path(rest)
-        return SQLiteStore(path)
-
-    if scheme == "duckdb":
-        return DuckDBStore(rest)
-
-    raise ValueError(f"Unsupported store scheme: {scheme}")
-
-
-class BaseStore:
-    def write_candles(self, df: pd.DataFrame, symbol: str, timeframe: str) -> int:
-        raise NotImplementedError
-
-    def read_candles(
-            self,
-            symbol: str,
-            timeframe: str,
-            start: Optional[pd.Timestamp] = None,
-            end: Optional[pd.Timestamp] = None,
-    ) -> pd.DataFrame:
-        raise NotImplementedError
-
-    def write_signal(self, payload: Dict[str, Any]) -> int:
-        raise NotImplementedError
-
-
-# ---------- SQLite ----------
-
-_SQLITE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS candles (
-    ts_utc TEXT NOT NULL,
-    symbol TEXT NOT NULL,
-    timeframe TEXT NOT NULL,
-    open REAL NOT NULL,
-    high REAL NOT NULL,
-    low  REAL NOT NULL,
-    close REAL NOT NULL,
-    volume REAL NOT NULL,
-    PRIMARY KEY (ts_utc, symbol, timeframe)
-);
-
+SIGNALS_DDL = """
 CREATE TABLE IF NOT EXISTS signals (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts_utc TEXT NOT NULL,
-    symbol TEXT,
-    timeframe TEXT,
-    strategy TEXT,
-    side TEXT,
-    price REAL,
-    run_id TEXT,
-    payload_json TEXT
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  time      TEXT NOT NULL,
+  symbol    TEXT,
+  timeframe TEXT,
+  strategy  TEXT,
+  side      TEXT,
+  price     REAL,
+  run_id    TEXT,
+  data      TEXT
 );
-
-CREATE INDEX IF NOT EXISTS idx_candles_symbol_tf_ts ON candles(symbol, timeframe, ts_utc);
-CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts_utc);
 """
 
+CANDLES_DDL = """
+CREATE TABLE IF NOT EXISTS candles (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  time      TEXT NOT NULL,
+  symbol    TEXT NOT NULL,
+  timeframe TEXT NOT NULL,
+  open      REAL,
+  high      REAL,
+  low       REAL,
+  close     REAL,
+  volume    REAL,
+  data      TEXT,
+  UNIQUE(time, symbol, timeframe)
+);
+"""
 
-def _parse_sqlite_path(rest: str) -> str:
-    if rest == "/:memory:" or rest == "///:memory:":
-        return ":memory:"
-    if rest.startswith("///"):
-        return rest[2:]
-    return rest.lstrip("/")
+# Индексы
+SIGNALS_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_signals_time      ON signals(time)",
+    "CREATE INDEX IF NOT EXISTS idx_signals_sym_tf_t  ON signals(symbol, timeframe, time)",
+    # Уникальность ключа сигнала — нужна для UPSERT
+    "CREATE UNIQUE INDEX IF NOT EXISTS uniq_signals_keys ON signals(time, symbol, timeframe, strategy, run_id)",
+]
+
+CANDLES_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_candles_time ON candles(time)",
+    "CREATE INDEX IF NOT EXISTS idx_candles_main ON candles(symbol, timeframe, time)",
+]
 
 
-class SQLiteStore(BaseStore):
-    def __init__(self, path: str):
-        self.path = path
-        self._conn = sqlite3.connect(self.path, isolation_level=None)
+# =========================
+# Helpers
+# =========================
+
+def _parse_sqlite_path(url_or_path: str) -> str:
+    """
+    Принимает строку вида "sqlite:///data/bot.db" или путь "data/bot.db"
+    и возвращает путь к файлу БД.
+    """
+    if url_or_path.startswith("sqlite:///"):
+        return url_or_path[len("sqlite:///"):]
+    return url_or_path
+
+
+def open_store(url_or_path: Optional[str]) -> "SQLiteStore":
+    """
+    Универсальный открыватель стора (пока только SQLite).
+    """
+    url = url_or_path or os.getenv("TB_STORE_URL", "sqlite:///data/bot.db")
+    db_path = _parse_sqlite_path(url)
+    return SQLiteStore(db_path)
+
+
+def _json_dumps_or_none(obj: Any) -> Optional[str]:
+    if obj is None:
+        return None
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return None
+
+
+# =========================
+# SQLite store
+# =========================
+
+@dataclass
+class SQLiteStore:
+    path: str
+
+    def __post_init__(self) -> None:
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        self._conn = sqlite3.connect(self.path)
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
-        for stmt in filter(None, _SQLITE_SCHEMA.split(";")):
-            s = stmt.strip()
-            if s:
-                self._conn.execute(s)
+        self._conn.execute("PRAGMA foreign_keys=ON;")
+        self.ensure_schema()
 
-    def write_candles(self, df: pd.DataFrame, symbol: str, timeframe: str) -> int:
-        if df.empty:
-            return 0
-        if df.index.name is None:
-            df = df.copy()
-            df.index.name = "time"
-        idx = pd.DatetimeIndex(df.index)
-        if idx.tz is None:
-            idx = idx.tz_localize("UTC")
-        else:
-            idx = idx.tz_convert("UTC")
+    def ensure_schema(self) -> None:
+        # таблицы
+        self._conn.executescript(SIGNALS_DDL + "\n" + CANDLES_DDL)
+        # индексы
+        with self._conn:
+            cur = self._conn.cursor()
+            self._ensure_indexes(cur, SIGNALS_INDEXES)
+            self._ensure_indexes(cur, CANDLES_INDEXES)
 
-        cols = ["open", "high", "low", "close", "volume"]
-        for c in cols:
-            if c not in df.columns:
-                raise ValueError(f"OHLCV column missing: {c}")
+    @staticmethod
+    def _ensure_indexes(cur: sqlite3.Cursor, stmts: Iterable[str]) -> None:
+        for s in stmts:
+            cur.execute(s)
 
-        rows = [
-            (
-                ts.isoformat(),
-                symbol,
-                timeframe,
-                float(df.at[ts, "open"]),
-                float(df.at[ts, "high"]),
-                float(df.at[ts, "low"]),
-                float(df.at[ts, "close"]),
-                float(df.at[ts, "volume"]),
-            )
-            for ts in idx
-        ]
-        cur = self._conn.cursor()
-        cur.executemany(
-            """
-            INSERT OR REPLACE INTO candles
-            (ts_utc, symbol, timeframe, open, high, low, close, volume)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
-        return cur.rowcount or 0
+    # ---------- API: запись ----------
 
-    def read_candles(
-            self,
-            symbol: str,
-            timeframe: str,
-            start: Optional[pd.Timestamp] = None,
-            end: Optional[pd.Timestamp] = None,
-    ) -> pd.DataFrame:
-        conds = ["symbol = ?", "timeframe = ?"]
-        params: list[Any] = [symbol, timeframe]
-        if start is not None:
-            conds.append("ts_utc >= ?")
-            params.append(pd.to_datetime(start, utc=True).isoformat())
-        if end is not None:
-            conds.append("ts_utc <= ?")
-            params.append(pd.to_datetime(end, utc=True).isoformat())
-        where = " AND ".join(conds)
-        q = f"""
-            SELECT ts_utc, open, high, low, close, volume
-            FROM candles
-            WHERE {where}
-            ORDER BY ts_utc
+    def upsert_signal(self, signal: Dict[str, Any]) -> None:
         """
+        Идемпотентная запись сигнала по ключу (time,symbol,timeframe,strategy,run_id).
+        Обновляет side/price/data при конфликте.
+        """
+        row = {
+            "time": signal.get("time"),
+            "symbol": signal.get("symbol"),
+            "timeframe": signal.get("timeframe"),
+            "strategy": signal.get("strategy"),
+            "side": signal.get("side"),
+            "price": signal.get("price"),
+            "run_id": signal.get("run_id"),
+            "data": _json_dumps_or_none(signal.get("data")),
+        }
+        sql = """
+        INSERT INTO signals (time, symbol, timeframe, strategy, side, price, run_id, data)
+        VALUES (:time, :symbol, :timeframe, :strategy, :side, :price, :run_id, :data)
+        ON CONFLICT(time, symbol, timeframe, strategy, run_id) DO UPDATE SET
+            side  = excluded.side,
+            price = excluded.price,
+            data  = excluded.data
+        """
+        with self._conn:
+            self._conn.execute(sql, row)
+
+    def upsert_candles(
+            self,
+            candles: Iterable[Dict[str, Any]],
+    ) -> None:
+        """
+        Идемпотентная запись свечей. Ключ (time,symbol,timeframe).
+        """
+        sql = """
+        INSERT INTO candles (time, symbol, timeframe, open, high, low, close, volume, data)
+        VALUES (:time, :symbol, :timeframe, :open, :high, :low, :close, :volume, :data)
+        ON CONFLICT(time, symbol, timeframe) DO UPDATE SET
+            open   = excluded.open,
+            high   = excluded.high,
+            low    = excluded.low,
+            close  = excluded.close,
+            volume = excluded.volume,
+            data   = excluded.data
+        """
+        with self._conn:
+            self._conn.executemany(sql, candles)
+
+    # ---------- API: чтение/инфо ----------
+
+    def counts(self) -> Dict[str, int]:
         cur = self._conn.cursor()
-        cur.execute(q, params)
-        rows = cur.fetchall()
-        if not rows:
-            return pd.DataFrame(
-                columns=["open", "high", "low", "close", "volume"]
-            ).set_index(pd.DatetimeIndex([], name="time"))
+        cur.execute("SELECT COUNT(*) FROM signals")
+        s = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM candles")
+        c = cur.fetchone()[0]
+        return {"signals": s, "candles": c}
 
-        df = pd.DataFrame(
-            rows, columns=["ts_utc", "open", "high", "low", "close", "volume"]
-        )
-        idx = pd.to_datetime(df["ts_utc"], utc=True)
-        df = df.drop(columns=["ts_utc"])
-        df.index = idx
-        df.index.name = "time"
-        return df
-
-    def write_signal(self, payload: Dict[str, Any]) -> int:
-        # Нормализуем время и JSON, чтобы не падать на Timestamp
-        ts_iso = pd.to_datetime(payload.get("time"), utc=True).isoformat()
-
-        safe = dict(payload)
-        safe["time"] = ts_iso
-        payload_json = json.dumps(safe, ensure_ascii=False, default=str)
-
-        row = (
-            ts_iso,
-            payload.get("symbol"),
-            payload.get("timeframe"),
-            payload.get("strategy"),
-            payload.get("side"),
-            float(payload["price"]) if payload.get("price") is not None else None,
-            payload.get("run_id"),
-            payload_json,
-        )
+    def last_signals(self, limit: int = 10) -> Iterable[sqlite3.Row]:
+        self._conn.row_factory = sqlite3.Row
         cur = self._conn.cursor()
         cur.execute(
             """
-            INSERT INTO signals
-            (ts_utc, symbol, timeframe, strategy, side, price, run_id, payload_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            SELECT id, time, symbol, timeframe, strategy, side, price, run_id
+            FROM signals
+            ORDER BY id DESC
+            LIMIT ?
             """,
-            row,
+            (limit,),
         )
-        return int(cur.lastrowid or 0)
+        return cur.fetchall()
 
 
-# ---------- DuckDB (опционально) ----------
+# =========================
+# Module-level helpers used around the codebase
+# =========================
 
-class DuckDBStore(BaseStore):
-    def __init__(self, rest: str):
-        path = rest[2:] if rest.startswith("///") else rest.lstrip("/")
-        try:
-            import duckdb  # type: ignore
-        except Exception as e:
-            raise RuntimeError(
-                f"DuckDB is not installed. Install with `pip install duckdb`. Details: {e}"
-            )
-        self._duckdb = duckdb
-        self._con = duckdb.connect(path)
-        self._ensure_schema()
+def write_signal(signal: Dict[str, Any], url: Optional[str] = None) -> None:
+    """
+    Унифицированная точка записи сигнала из других модулей.
+    """
+    store = open_store(url)
+    store.upsert_signal(signal)
 
-    def _ensure_schema(self) -> None:
-        self._con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS candles (
-                ts_utc TIMESTAMP WITH TIME ZONE,
-                symbol TEXT,
-                timeframe TEXT,
-                open DOUBLE,
-                high DOUBLE,
-                low  DOUBLE,
-                close DOUBLE,
-                volume DOUBLE
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_candles_pk
-              ON candles(ts_utc, symbol, timeframe);
 
-            CREATE TABLE IF NOT EXISTS signals (
-                id BIGINT AUTO_INCREMENT,
-                ts_utc TIMESTAMP WITH TIME ZONE,
-                symbol TEXT,
-                timeframe TEXT,
-                strategy TEXT,
-                side TEXT,
-                price DOUBLE,
-                run_id TEXT,
-                payload_json TEXT
-            );
-            """
+def write_candles(df, symbol: str, timeframe: str, url: Optional[str] = None, tcol: str = "time") -> None:
+    """
+    df: pandas.DataFrame с колонками [open,high,low,close,volume] и индексом-датой
+        или с колонкой времени `tcol`. Все времена должны быть в UTC-ISO.
+    """
+    try:
+        import pandas as pd  # noqa: F401
+    except Exception:
+        raise RuntimeError("write_candles: требуется pandas DataFrame")
+
+    if tcol in df.columns:
+        times = df[tcol].astype(str)
+    else:
+        times = df.index.astype(str)
+
+    to_rows = []
+    for t, row in zip(times, df.itertuples(index=False, name=None)):
+        # предполагаем порядок: open,high,low,close,volume [и, возможно, лишние поля]
+        o, h, l, c, v = row[:5]
+        to_rows.append(
+            {
+                "time": str(t),
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "open": float(o) if o is not None else None,
+                "high": float(h) if h is not None else None,
+                "low": float(l) if l is not None else None,
+                "close": float(c) if c is not None else None,
+                "volume": float(v) if v is not None else None,
+                "data": None,
+            }
         )
 
-    def write_candles(self, df: pd.DataFrame, symbol: str, timeframe: str) -> int:
-        if df.empty:
-            return 0
-        idx = pd.DatetimeIndex(df.index)
-        if idx.tz is None:
-            idx = idx.tz_localize("UTC")
-        else:
-            idx = idx.tz_convert("UTC")
-        tdf = df.copy()
-        tdf = tdf.assign(
-            ts_utc=idx,
-            symbol=symbol,
-            timeframe=timeframe,
-        )[["ts_utc", "symbol", "timeframe", "open", "high", "low", "close", "volume"]]
-        self._con.register("tmp_df", tdf)
-        self._con.execute(
-            "INSERT OR REPLACE INTO candles SELECT * FROM tmp_df"
-        )
-        return int(len(tdf))
-
-    def read_candles(
-            self,
-            symbol: str,
-            timeframe: str,
-            start: Optional[pd.Timestamp] = None,
-            end: Optional[pd.Timestamp] = None,
-    ) -> pd.DataFrame:
-        conds = ["symbol = ?", "timeframe = ?"]
-        params: list[Any] = [symbol, timeframe]
-        if start is not None:
-            conds.append("ts_utc >= ?")
-            params.append(pd.to_datetime(start, utc=True))
-        if end is not None:
-            conds.append("ts_utc <= ?")
-            params.append(pd.to_datetime(end, utc=True))
-        where = " AND ".join(conds)
-        q = f"""
-            SELECT ts_utc, open, high, low, close, volume
-            FROM candles
-            WHERE {where}
-            ORDER BY ts_utc
-        """
-        df = self._con.execute(q, params).fetch_df()
-        if df.empty:
-            return df.reindex(columns=["open", "high", "low", "close", "volume"]).set_index(
-                pd.DatetimeIndex([], name="time")
-            )
-        idx = pd.to_datetime(df["ts_utc"], utc=True)
-        df = df.drop(columns=["ts_utc"])
-        df.index = idx
-        df.index.name = "time"
-        return df
-
-    def write_signal(self, payload: Dict[str, Any]) -> int:
-        ts = pd.to_datetime(payload.get("time"), utc=True)
-        safe = dict(payload)
-        safe["time"] = ts.isoformat()
-        payload_json = json.dumps(safe, ensure_ascii=False, default=str)
-
-        row = pd.DataFrame(
-            [
-                {
-                    "ts_utc": ts,
-                    "symbol": payload.get("symbol"),
-                    "timeframe": payload.get("timeframe"),
-                    "strategy": payload.get("strategy"),
-                    "side": payload.get("side"),
-                    "price": float(payload["price"]) if payload.get("price") is not None else None,
-                    "run_id": payload.get("run_id"),
-                    "payload_json": payload_json,
-                }
-            ]
-        )
-        self._con.register("tmp_sig", row)
-        out = self._con.execute(
-            "INSERT INTO signals SELECT * FROM tmp_sig RETURNING id"
-        ).fetchall()
-        return int(out[0][0]) if out else 0
+    store = open_store(url)
+    store.upsert_candles(to_rows)

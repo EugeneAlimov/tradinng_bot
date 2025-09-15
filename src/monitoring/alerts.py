@@ -1,40 +1,54 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
-
 import os
-import requests
+from dataclasses import dataclass
 from typing import Optional
+from src.infrastructure.notify.telegram import TelegramNotifier, _sanitize_token, _mask_token
 
 
+def _read_env_token() -> Optional[str]:
+    tok = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    return _sanitize_token(tok) if tok else None
+
+
+@dataclass
 class Alerter:
-    """
-    Простой алертинг в Telegram через Bot API.
-    Настройка через ENV:
-      TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-    """
+    tg: Optional[TelegramNotifier]
 
-    def __init__(self, token: Optional[str] = None, chat_id: Optional[str] = None, timeout: float = 5.0):
-        self.token = token or os.getenv("TELEGRAM_TOKEN")
-        self.chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
-        self.timeout = float(timeout)
-        self._base = f"https://api.telegram.org/bot{self.token}" if self.token else None
+    @classmethod
+    def from_env(cls) -> "Alerter":
+        token = _read_env_token()
+        chat_id = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_TO")
+        if not token:
+            print("[telegram] no TELEGRAM_TOKEN/TELEGRAM_BOT_TOKEN in env — notifications disabled")
+            return cls(tg=None)
+        tg = TelegramNotifier(token=token, chat_id=chat_id)
+        r = tg.get_me()
+        if not r.get("ok"):
+            print(f"[telegram] getMe failed: HTTP {r.get('http')}: {r.get('error')}")
+            if r.get("http") == 404:
+                print("[telegram] hint: 404 обычно значит, что токен пустой в текущей сессии. "
+                      "Убедись, что он export'нут:  export TELEGRAM_TOKEN=123:ABC")
+            elif r.get("http") == 401:
+                print("[telegram] hint: неверный токен. Формат должен быть '123456789:AA...'. "
+                      "Не добавляй префикс 'bot'.")
+        else:
+            print(f"[telegram] ok, bot @{r['result']['username']} (token {_mask_token(token)})")
+        return cls(tg=tg)
 
-    @property
-    def enabled(self) -> bool:
-        return bool(self.token and self.chat_id and self._base)
+    def send_text(self, text: str) -> bool:
+        if not self.tg:
+            return False
+        r = self.tg.send_text(text)
+        if not r.get("ok"):
+            print(f"[telegram] sendMessage failed: HTTP {r.get('http')}: {r.get('error')}")
+            return False
+        return True
 
-    def send(self, text: str) -> None:
-        if not self.enabled:
-            return
-        try:
-            url = f"{self._base}/sendMessage"
-            payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-            requests.post(url, json=payload, timeout=self.timeout)
-        except Exception:
-            # не роняем торговлю из-за телеги
-            pass
-
-
-# Удобная фабрика
-def make_alerter() -> Alerter:
-    return Alerter()
+    def send_photo(self, photo_bytes: bytes, caption: str = "") -> bool:
+        if not self.tg:
+            return False
+        r = self.tg.send_photo(photo_bytes, caption=caption)
+        if not r.get("ok"):
+            print(f"[telegram] sendPhoto failed: HTTP {r.get('http')}: {r.get('error')}")
+            return False
+        return True
