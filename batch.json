@@ -1,0 +1,17 @@
+{
+  "db": "sqlite:///data/bot.db",
+  "defaults": {
+    "timeframe": "5min",
+    "fee_bps": 5,
+    "slip_bps": 2,
+    "initial_cash": 10000,
+    "fill_mode": "next_open",
+    "entry_lag": 0,
+    "notify_telegram": true,
+    "tg_attach_csv": true,
+    "tg_attach_report": false
+  },
+  "runs": [
+    { "symbol": "DEMO", "strategy": "ema_adx_atr", "run_id": "e2e-demo-1" }
+  ]
+}

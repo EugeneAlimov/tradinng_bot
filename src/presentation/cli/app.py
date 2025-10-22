@@ -1,58 +1,43 @@
 # src/presentation/cli/app.py
 from __future__ import annotations
 
-import sys
 import argparse
-from importlib import import_module
-from typing import List, Optional
+import logging
+import os
+import sys
+from typing import Optional
 
-SUBCMDS = {
-    # имя подкоманды -> dotted-path модуля с main(argv: Optional[List[str]]) -> int|None
-    "trade-live": "src.presentation.cli.trade_live_cmd",
-    # задел под будущие команды — когда появятся, просто создадим соответствующие модули
-    "optimize": "src.presentation.cli.optimize_cmd",
-    "sweep": "src.presentation.cli.sweep_cmd",
-    "walk-forward": "src.presentation.cli.walk_forward_cmd",
-    "robustness": "src.presentation.cli.robustness_cmd",
-}
+from src.presentation.cli.paper_trade_cmd import main as paper_trade_main
 
 
-def build_top_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="tb", description="Trading bot CLI")
-    sp = p.add_subparsers(dest="command", required=True)
-    for name in SUBCMDS:
-        sp.add_parser(name, help=f"{name} subcommand (delegated)")
+def build_root_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="tb", description="Trading Bot CLI (intrabar-enabled)")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    # paper-trade
+    paper = sub.add_parser("paper-trade", help="Run intrabar paper trading for EMA+ADX strategy.")
+    # все аргументы делегируем парсеру из paper_trade_cmd
+    # но для удобства: просто позволим прокинуть дальше argv без повторного описания
+    paper.add_argument("args", nargs=argparse.REMAINDER, help="Args forwarded to paper_trade_cmd.")
+
     return p
 
 
-def _call_module_main(module_path: str, argv: Optional[List[str]]) -> int:
-    mod = import_module(module_path)
-    fn = getattr(mod, "main", None)
-    if fn is None:
-        raise SystemExit(f"Module {module_path} does not define main()")
+def main(argv: Optional[list[str]] = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [cli] %(message)s")
+    parser = build_root_parser()
+    ns = parser.parse_args(argv)
 
-    try:
-        # предпочтительно — если команда принимает argv явно
-        ret = fn(argv=argv)
-    except TypeError:
-        # back-compat: если у команды старая сигнатура main()
-        sys.argv = [module_path.split(".")[-1]] + (argv or [])
-        ret = fn()
+    if ns.command == "paper-trade":
+        # передаём всё, что после 'paper-trade'
+        fwd = ns.args or []
+        # удаляем возможный '--' в начале
+        if len(fwd) and fwd[0] == "--":
+            fwd = fwd[1:]
+        return paper_trade_main(fwd)
 
-    return int(ret) if ret is not None else 0
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    top = build_top_parser()
-    # ВАЖНО: парсим только имя подкоманды, остальные аргументы отдаём модулю подкоманды
-    ns, rest = top.parse_known_args(argv)
-
-    module_path = SUBCMDS.get(ns.command)
-    if not module_path:
-        top.print_help()
-        return 2
-
-    return _call_module_main(module_path, rest)
+    parser.print_help()
+    return 2
 
 
 if __name__ == "__main__":

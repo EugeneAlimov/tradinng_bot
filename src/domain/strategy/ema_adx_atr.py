@@ -1,179 +1,158 @@
 # src/domain/strategy/ema_adx_atr.py
 from __future__ import annotations
-from typing import List, Optional, Tuple
-from .registry import StrategyDef, register
+
+from typing import Literal, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+
+Side = Literal["LONG", "SHORT", "FLAT"]
 
 
-def _ema(series: List[float], period: int) -> List[Optional[float]]:
-    p = max(2, int(period))
-    out: List[Optional[float]] = [None] * len(series)
-    k = 2.0 / (p + 1.0)
-    v: Optional[float] = None
-    for i, x in enumerate(series):
-        v = x if v is None else x * k + v * (1 - k)
-        out[i] = v
+def _ema(x: pd.Series, n: int) -> pd.Series:
+    return x.ewm(span=n, adjust=False).mean()
+
+
+def _rma(x: pd.Series, n: int) -> pd.Series:
+    # Wilder's RMA (SMMA)
+    alpha = 1.0 / float(n)
+    return x.ewm(alpha=alpha, adjust=False).mean()
+
+
+def _adx_dm_di(ohlc: pd.DataFrame, length: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    high = ohlc["high"].astype(float)
+    low = ohlc["low"].astype(float)
+    close = ohlc["close"].astype(float)
+
+    up = high.diff()
+    down = (-low.diff())
+
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+
+    tr = pd.concat([
+        (high - low),
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+
+    atr = _rma(tr, length)
+    plus_di = 100.0 * _rma(pd.Series(plus_dm, index=ohlc.index), length) / atr
+    minus_di = 100.0 * _rma(pd.Series(minus_dm, index=ohlc.index), length) / atr
+
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = _rma(dx, length)
+    return adx, plus_di, minus_di
+
+
+def resample_ohlc(ohlc_base: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    df = ohlc_base.copy()
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df = df.sort_values("time").set_index("time")
+
+    o = df["open"].resample(timeframe).first()
+    h = df["high"].resample(timeframe).max()
+    l = df["low"].resample(timeframe).min()
+    c = df["close"].resample(timeframe).last()
+    if "volume" in df.columns:
+        v = df["volume"].resample(timeframe).sum()
+        out = pd.DataFrame({"open": o, "high": h, "low": l, "close": c, "volume": v})
+    else:
+        out = pd.DataFrame({"open": o, "high": h, "low": l, "close": c})
+    out = out.dropna().reset_index()
     return out
 
 
-def _tr(high: List[float], low: List[float], close: List[float]) -> List[float]:
-    out = [0.0] * len(close)
-    for i in range(len(close)):
-        if i == 0:
-            out[i] = high[i] - low[i]
-        else:
-            out[i] = max(
-                high[i] - low[i],
-                abs(high[i] - close[i - 1]),
-                abs(low[i] - close[i - 1]),
-            )
-    return out
+def _merge_asof(left: pd.DataFrame, right: pd.DataFrame, left_on: str, right_on: str, cols: list[str]) -> pd.DataFrame:
+    r = right[[right_on] + cols].sort_values(right_on).rename(columns={right_on: "__rt"})
+    l = left.sort_values(left_on).rename(columns={left_on: "__lt"})
+    merged = pd.merge_asof(l, r, left_on="__lt", right_on="__rt", direction="backward")
+    merged = merged.drop(columns=["__rt"]).rename(columns={"__lt": left_on})
+    return merged
 
 
-def _rma(vals: List[float], length: int) -> List[float]:
-    n = max(1, int(length))
-    out = [0.0] * len(vals)
-    avg = None
-    for i, v in enumerate(vals):
-        if avg is None:
-            if i < n:
-                out[i] = 0.0
-                avg = (avg or 0.0) + v
-                if i == n - 1:
-                    out[i] = avg / n
-                    avg = out[i]
+def generate_signals_ema_adx_atr(
+        ohlc_base: pd.DataFrame,
+        resample_tf: str = "5min",
+        ema_fast: int = 12,
+        ema_slow: int = 21,
+        adx_len: int = 14,
+        adx_on: float = 25.0,
+        adx_off: float = 18.0,
+        require_di: bool = True,
+        # NEW: HTF filter
+        htf_tf: Optional[str] = None,  # например "15min" или "1H"
+        htf_ema_fast: int = 48,
+        htf_ema_slow: int = 96,
+) -> pd.DataFrame:
+    """
+    EMA/ADX сигналы на сигнальном ТФ (+ опциональный HTF-фильтр тренда).
+    Возвращает DataFrame: ['time','side','price'] где price = close сигнального бара.
+    """
+    sig_ohlc = resample_ohlc(ohlc_base, resample_tf)
+    sig_ohlc = sig_ohlc.copy()
+    sig_ohlc["ema_fast"] = _ema(sig_ohlc["close"], ema_fast)
+    sig_ohlc["ema_slow"] = _ema(sig_ohlc["close"], ema_slow)
+
+    adx, di_plus, di_minus = _adx_dm_di(sig_ohlc, adx_len)
+    sig_ohlc["adx"] = adx
+    sig_ohlc["+di"] = di_plus
+    sig_ohlc["-di"] = di_minus
+
+    # базовые стороны без HTF
+    sides = []
+    last_side: Side = "FLAT"
+    for i in range(len(sig_ohlc)):
+        row = sig_ohlc.iloc[i]
+        adx_v = row["adx"]
+        fast = row["ema_fast"]
+        slow = row["ema_slow"]
+        di_p = row["+di"]
+        di_m = row["-di"]
+
+        side: Side = last_side
+        if np.isfinite(adx_v) and adx_v <= adx_off:
+            side = "FLAT"
+        elif np.isfinite(adx_v) and adx_v >= adx_on:
+            want_long = fast > slow and (not require_di or (di_p > di_m))
+            want_short = fast < slow and (not require_di or (di_m > di_p))
+            if want_long and not want_short:
+                side = "LONG"
+            elif want_short and not want_long:
+                side = "SHORT"
             else:
-                out[i] = v
-                avg = v
-        else:
-            alpha = 1.0 / n
-            avg = alpha * v + (1 - alpha) * avg
-            out[i] = avg
+                side = "FLAT"
+        # в зоне гистерезиса держим прежний side
+        sides.append(side)
+        last_side = side
+
+    out = sig_ohlc[["time", "close"]].copy()
+    out["side"] = sides
+    out.rename(columns={"close": "price"}, inplace=True)
+
+    # HTF-фильтр: пропускаем только сделки в сторону тренда старшего ТФ
+    if htf_tf:
+        htf = resample_ohlc(ohlc_base, htf_tf)
+        htf = htf.copy()
+        htf["ema_f"] = _ema(htf["close"], htf_ema_fast)
+        htf["ema_s"] = _ema(htf["close"], htf_ema_slow)
+        htf_side = np.where(htf["ema_f"] > htf["ema_s"], "LONG", np.where(htf["ema_f"] < htf["ema_s"], "SHORT", "FLAT"))
+        htf = htf[["time"]].copy().assign(htf_side=htf_side)
+
+        out = _merge_asof(out, htf, "time", "time", ["htf_side"])
+        # где нет данных HTF — считаем FLAT (без сделок)
+        out["htf_side"] = out["htf_side"].fillna("FLAT")
+
+        def _gate(row) -> str:
+            s = row["side"]
+            hs = row["htf_side"]
+            if s == "LONG" and hs != "LONG":
+                return "FLAT"
+            if s == "SHORT" and hs != "SHORT":
+                return "FLAT"
+            return s
+
+        out["side"] = out.apply(_gate, axis=1)
+        out = out.drop(columns=["htf_side"])
+
     return out
-
-
-def _adx(high: List[float], low: List[float], close: List[float], length: int):
-    n = max(2, int(length))
-    tr = _tr(high, low, close)
-    plus_dm = [0.0] * len(close)
-    minus_dm = [0.0] * len(close)
-    for i in range(1, len(close)):
-        up = high[i] - high[i - 1]
-        down = low[i - 1] - low[i]
-        plus_dm[i] = up if (up > down and up > 0) else 0.0
-        minus_dm[i] = down if (down > up and down > 0) else 0.0
-    tr_rma = _rma(tr, n)
-    plus_rma = _rma(plus_dm, n)
-    minus_rma = _rma(minus_dm, n)
-    plus_di = [0.0 if tr_rma[i] == 0 else 100.0 * plus_rma[i] / tr_rma[i] for i in range(len(close))]
-    minus_di = [0.0 if tr_rma[i] == 0 else 100.0 * minus_rma[i] / tr_rma[i] for i in range(len(close))]
-    dx = [0.0 if (plus_di[i] + minus_di[i]) == 0 else 100.0 * abs(plus_di[i] - minus_di[i]) / (plus_di[i] + minus_di[i])
-          for i in range(len(close))]
-    adx = _rma(dx, n)
-    return plus_di, minus_di, adx
-
-
-def _atr(high: List[float], low: List[float], close: List[float], length: int) -> List[float]:
-    return _rma(_tr(high, low, close), max(1, int(length)))
-
-
-def generate_signals(
-        close: List[float],
-        high: List[float],
-        low: List[float],
-        fast: int = 12,
-        slow: int = 26,
-        adx_len: int = 14,
-        on: float = 22.0,
-        off: float = 18.0,
-        require_di: bool = True,
-        atr_len: int = 14,
-        atr_mult: float = 3.0,
-) -> List[int]:
-    """
-    Вход long: EMA(fast) пересекает EMA(slow) ВВЕРХ и ADX>=on (и при require_di: +DI>-DI).
-    Выход: обратный кросс ИЛИ ADX<off ИЛИ трейлинг-стоп ATR (C < trail).
-    """
-    fast = max(2, int(fast))
-    slow = max(fast + 1, int(slow))
-    adx_len = max(2, int(adx_len))
-    on = float(on);
-    off = float(off)
-    atr_len = max(1, int(atr_len));
-    atr_mult = float(atr_mult)
-
-    ema_f = _ema(close, fast)
-    ema_s = _ema(close, slow)
-    pdi, mdi, adx = _adx(high, low, close, adx_len)
-    atr = _atr(high, low, close, atr_len)
-
-    in_pos = False
-    trail = 0.0
-    signals = [0] * len(close)
-    for i in range(1, len(close)):
-        ef = ema_f[i];
-        es = ema_s[i]
-        e_prev_f = ema_f[i - 1];
-        e_prev_s = ema_s[i - 1]
-        if ef is None or es is None or e_prev_f is None or e_prev_s is None:
-            continue
-
-        cross_up = (e_prev_f <= e_prev_s and ef > es)
-        cross_dn = (e_prev_f >= e_prev_s and ef < es)
-        allow_trend = adx[i] >= on
-        allow_dir = (pdi[i] > mdi[i]) if require_di else True
-
-        if not in_pos and cross_up and allow_trend and allow_dir:
-            signals[i] = +1
-            in_pos = True
-            trail = close[i] - atr_mult * atr[i]
-        elif in_pos:
-            trail = max(trail, close[i] - atr_mult * atr[i])
-            if cross_dn or (adx[i] < off) or (close[i] < trail):
-                signals[i] = -1
-                in_pos = False
-                trail = 0.0
-    return signals
-
-
-def status(
-        close: List[float],
-        high: List[float],
-        low: List[float],
-        fast: int = 12,
-        slow: int = 26,
-        adx_len: int = 14,
-        on: float = 22.0,
-        off: float = 18.0,
-        require_di: bool = True,
-        atr_len: int = 14,
-        atr_mult: float = 3.0,
-) -> Tuple[str, int]:
-    ema_f = _ema(close, max(2, int(fast)))
-    ema_s = _ema(close, max(int(fast) + 1, int(slow)))
-    pdi, mdi, adx = _adx(high, low, close, int(adx_len))
-    atr = _atr(high, low, close, int(atr_len))
-    i = len(close) - 1
-    if i < 0 or ema_f[i] is None or ema_s[i] is None:
-        return "EMA+ADX+ATR: EMAf=?, EMAs=?, ADX=?, ATR=?", 0
-    f = float(ema_f[i]);
-    s = float(ema_s[i]);
-    a = float(adx[i]);
-    p = float(pdi[i]);
-    m = float(mdi[i]);
-    at = float(atr[i])
-    ok_trend = a >= on
-    ok_dir = (p > m) if require_di else True
-    state = 1 if (f > s and ok_trend and ok_dir) else (-1 if (f < s and (a >= on) and (m > p)) else 0)
-    txt = f"EMAf={f:.6f} EMAs={s:.6f} ADX={a:.2f} +DI={p:.2f} -DI={m:.2f} ATR={at:.6f} on={on:.1f}/off={off:.1f} x{atr_mult:.1f}"
-    if require_di:
-        txt += " DI=on"
-    return txt, state
-
-
-register(StrategyDef(
-    name="ema_adx_atr",
-    generate_signals=generate_signals,
-    status=status,
-    defaults={"fast": 12, "slow": 26, "adx_len": 14, "on": 22.0, "off": 18.0, "require_di": True, "atr_len": 14,
-              "atr_mult": 3.0},
-))

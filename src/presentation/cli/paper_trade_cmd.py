@@ -1,723 +1,484 @@
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 """
-Paper trading over stored signals in SQLite.
+paper_trade_cmd.py — простая CLI-утилита бумажного трейда, совместимая со sweep_cli.
 
-Usage (examples):
-  python -m src.presentation.cli.paper_trade_cmd --limit 200
-  python -m src.presentation.cli.paper_trade_cmd \
-    --db sqlite:///data/bot.db \
-    --symbol DEMO --timeframe 5min --strategy ema_adx_atr --run-id e2e-demo-1 \
-    --fill-mode next_open --entry-lag 0 \
-    --atr-period 14 --atr-method sma \
-    --atr-mult-stop 1.5 --atr-mult-take 3.0 \
-    --risk-pct 0.01 --initial-cash 10000 \
-    --fee-bps 5 --slip-bps 2 \
-    --export-csv /tmp/trades.csv
+Вход: CSV с колонками времени и OHLCV. По умолчанию ищет колонку времени 'timestamp',
+переименовывает в 'time' и ресемплит во фрейм 'resample' (например, '5min').
+
+Стратегия (упрощённая, но рабочая):
+- Вход LONG при пересечении EMA_fast выше EMA_slow, ADX >= adx_on, и (если require_di) +DI > -DI.
+  Вход SHORT при обратном пересечении и (если require_di) -DI > +DI.
+- Фильтр HTF (опционально): если задан htf_tf, для старшего ТФ считаем EMA(HTF) и разрешаем
+  только LONG, когда EMA_fast(HTF) > EMA_slow(HTF), и только SHORT, когда <.
+- Стоп: stop_atr * ATR(atr_len). Тейк (опционально): take_atr * ATR. Трейл (опционально):
+  trail_atr * ATR, активируется сразу или при достижении RR >= trail_activate_rr.
+- Breakeven (опционально): при достижении RR >= breakeven_rr переносим стоп в безубыток.
+- min_hold_bars — минимальная выдержка позиции (стоп всё равно действует),
+  cooldown_bars — пауза после выхода.
+- Направление выхода внутри бара: если в том же баре задеты и стоп, и тейк/трейл, берём стоп первым
+  (консервативно). Можно поменять логикой "priority" при желании.
+- Сделки исполняются по следующему бару (entry_lag баров задержка) по цене открытия с проскальзыванием,
+  выходы — по уровню с проскальзыванием.
+
+Выход: печатает на stdout ЕДИНСТВЕННУЮ строку с JSON объектом:
+{"trades": int, "win_rate": float, "net_pnl": float, "avg_pnl": float}
+Именно это парсит sweep_cli.
 """
 from __future__ import annotations
 
 import argparse
-import os
-import sqlite3
-from typing import Optional, Tuple, List, Dict
+import json
+from dataclasses import dataclass
+from typing import Optional, List
 
 import numpy as np
 import pandas as pd
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DB I/O
-# ─────────────────────────────────────────────────────────────────────────────
-def _db_path_from_url(url: str) -> str:
-    if url.startswith("sqlite:///"):
-        return url[len("sqlite:///"):]
-    return url
+# ------------------------
+# Utils & indicators
+# ------------------------
+
+def str2bool(x: str) -> bool:
+    if isinstance(x, bool):
+        return x
+    x = x.strip().lower()
+    return x in {"1", "true", "t", "y", "yes"}
 
 
-def _read_signals(
-        db_url: str,
-        symbol: Optional[str] = None,
-        timeframe: Optional[str] = None,
-        strategy: Optional[str] = None,
-        run_id: Optional[str] = None,
-        start: Optional[str] = None,
-        end: Optional[str] = None,
-        limit: Optional[int] = None,
-) -> pd.DataFrame:
-    path = _db_path_from_url(db_url)
-    conn = sqlite3.connect(path)
-    try:
-        sql = (
-            "SELECT time, symbol, timeframe, strategy, side, price, run_id "
-            "FROM signals WHERE 1=1"
-        )
-        params: List = []
-        if symbol:
-            sql += " AND symbol=?"
-            params.append(symbol)
-        if timeframe:
-            sql += " AND timeframe=?"
-            params.append(timeframe)
-        if strategy:
-            sql += " AND strategy=?"
-            params.append(strategy)
-        if run_id:
-            sql += " AND run_id=?"
-            params.append(run_id)
-        if start:
-            sql += " AND time>=?"
-            params.append(start)
-        if end:
-            sql += " AND time<=?"
-            params.append(end)
-        sql += " ORDER BY time ASC"
-        if limit and limit > 0:
-            sql += f" LIMIT {int(limit)}"
-
-        df = pd.read_sql_query(sql, conn, params=params)
-    finally:
-        conn.close()
-
-    return df
-
-
-def _read_candles(
-        db_url: str,
-        symbol: Optional[str],
-        timeframe: Optional[str],
-        start: Optional[str] = None,
-        end: Optional[str] = None,
-) -> pd.DataFrame:
-    path = _db_path_from_url(db_url)
-    conn = sqlite3.connect(path)
-    try:
-        sql = "SELECT time, symbol, timeframe, open, high, low, close, volume FROM candles WHERE 1=1"
-        params: List = []
-        if symbol:
-            sql += " AND symbol=?"
-            params.append(symbol)
-        if timeframe:
-            sql += " AND timeframe=?"
-            params.append(timeframe)
-        if start:
-            sql += " AND time>=?"
-            params.append(start)
-        if end:
-            sql += " AND time<=?"
-            params.append(end)
-        sql += " ORDER BY time ASC"
-        df = pd.read_sql_query(sql, conn, params=params)
-    finally:
-        conn.close()
-    return df
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Utilities
-# ─────────────────────────────────────────────────────────────────────────────
-def _to_utc_ts(t) -> pd.Timestamp:
-    ts = pd.Timestamp(t)
-    if ts.tzinfo is None:
-        return ts.tz_localize("UTC")
-    return ts.tz_convert("UTC")
-
-
-def _parse_tf_minutes(tf: str) -> Optional[int]:
-    """Parse timeframe like '1min','5min','15min','1h' → minutes."""
-    tf = (tf or "").lower()
-    if tf.endswith("min"):
-        try:
-            return int(tf[:-3])
-        except Exception:
-            return None
-    if tf.endswith("m"):
-        try:
-            return int(tf[:-1])
-        except Exception:
-            return None
-    if tf.endswith("h"):
-        try:
-            return int(tf[:-1]) * 60
-        except Exception:
-            return None
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NextOpenLookup & ATR
-# ─────────────────────────────────────────────────────────────────────────────
-class NextOpenLookup:
-    """
-    Быстрый доступ к:
-      • next_open(symbol,timeframe, t)  -> (open_price, open_timestamp) след. свечи строго после t
-      • atr_at(symbol,timeframe, t, period, method) -> float ATR по последней закрытой свече ≤ t
-    """
-
-    def __init__(self, candles_df: pd.DataFrame):
-        df = candles_df.copy()
-        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-        df = df.dropna(subset=["time"])
-        df = df.sort_values(["symbol", "timeframe", "time"])
-        df = df.set_index("time")
-        self.df = df
-        self._atr_cache: Dict[Tuple[str, str, int, str], pd.Series] = {}
-
-    @classmethod
-    def from_db(
-            cls,
-            db_url_or_path: str,
-            symbol: Optional[str] = None,
-            timeframe: Optional[str] = None,
-            start: Optional[str] = None,
-            end: Optional[str] = None,
-    ) -> "NextOpenLookup":
-        df = _read_candles(db_url_or_path, symbol=symbol, timeframe=timeframe, start=start, end=end)
-        if df.empty:
-            raise RuntimeError("No candles found for NextOpenLookup")
-        return cls(df)
-
-    def _subset(self, symbol: str, timeframe: str) -> pd.DataFrame:
-        sub = self.df[(self.df["symbol"] == symbol) & (self.df["timeframe"] == timeframe)]
-        if sub.empty:
-            raise RuntimeError(f"No candles for {symbol} {timeframe}")
-        return sub
-
-    def next_open(self, symbol: str, timeframe: str, t) -> Optional[Tuple[float, pd.Timestamp]]:
-        """Цена открытия следующей свечи строго ПОСЛЕ t. Возвращает (open, ts) или None."""
-        sub = self._subset(symbol, timeframe)
-        ts = _to_utc_ts(t)
-        idx = sub.index.searchsorted(ts, side="right")
-        if idx >= len(sub):
-            return None
-        row = sub.iloc[idx]
-        return float(row["open"]), sub.index[idx]
-
-    def atr_at(self, symbol: str, timeframe: str, t, period: int = 14, method: str = "sma") -> Optional[float]:
-        """ATR на момент t (по последней закрытой свече ≤ t)."""
-        key = (symbol, timeframe, int(period), method.lower())
-        if key not in self._atr_cache:
-            sub = self._subset(symbol, timeframe)[["open", "high", "low", "close"]].copy()
-            self._atr_cache[key] = _compute_atr(sub, period=period, method=method)
-        s = self._atr_cache[key]
-        ts = _to_utc_ts(t)
-        pos = s.index.searchsorted(ts, side="right") - 1
-        if pos < 0:
-            return None
-        v = float(s.iloc[pos])
-        return None if np.isnan(v) else v
-
-
-def _compute_atr(cdf: pd.DataFrame, period: int = 14, method: str = "sma") -> pd.Series:
-    """Возвращает серию ATR (index=time, tz-aware UTC) поверх свечей cdf(open,high,low,close)."""
-    if cdf.empty:
-        return pd.Series(dtype=float)
-
-    df = cdf.copy()
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-        df = df.dropna(subset=["time"]).set_index("time")
-    df = df.sort_index()
-
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
-    close = df["close"].astype(float)
-    prev_close = close.shift(1)
-
-    tr = pd.concat(
-        [
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    method = (method or "sma").lower()
-    if method == "ema":
-        atr = tr.ewm(span=int(period), adjust=False, min_periods=int(period)).mean()
-    else:
-        atr = tr.rolling(window=int(period), min_periods=int(period)).mean()
-
-    return atr
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Trading logic
-# ─────────────────────────────────────────────────────────────────────────────
-def _exec_price_with_slippage(side_from: str, side_to: str, px: float, slip_bps: float, is_entry: bool) -> float:
-    """Хужее исполнение в пользу рынка (buy дороже, sell дешевле)."""
-    slip = float(slip_bps or 0.0) / 10_000.0
-    if side_from == "FLAT" and side_to == "LONG":  # buy
-        return px * (1.0 + slip)
-    if side_from == "FLAT" and side_to == "SHORT":  # sell
-        return px * (1.0 - slip)
-    if side_from == "LONG" and side_to in ("SHORT", "FLAT"):  # sell
-        return px * (1.0 - slip)
-    if side_from == "SHORT" and side_to in ("LONG", "FLAT"):  # buy
-        return px * (1.0 + slip)
-    return px
-
-
-def _trade_fee(cost_bps: float, price: float, qty: float) -> float:
-    return (float(cost_bps or 0.0) / 10_000.0) * float(price) * float(qty)
-
-
-def _position_size_for_risk(equity: float, entry_px: float, stop_px: Optional[float],
-                            risk_pct: Optional[float]) -> float:
-    """Простой sizing: (equity * risk_pct) / расстояние до стопа. Без стопа → 1.0."""
-    if not risk_pct or not stop_px or entry_px <= 0:
-        return 1.0
-    risk_cash = max(0.0, float(equity) * float(risk_pct))
-    dist = abs(float(entry_px) - float(stop_px))
-    if dist <= 0:
-        return 1.0
-    return max(0.0, risk_cash / dist)
-
-
-def simulate_trades(
-        df_signals: pd.DataFrame,
-        *,
-        fee_bps: float = 0.0,
-        slip_bps: float = 0.0,
-        fill_mode: str = "signal",  # 'signal' | 'next_open'
-        entry_lag: int = 0,  # для next_open: сколько "следующих open" отмотать вперёд
-        next_open_lookup: Optional[NextOpenLookup] = None,
-        # ATR-based exits / sizing
-        atr_period: int = 14,
-        atr_method: str = "sma",
-        atr_mult_stop: Optional[float] = None,
-        atr_mult_take: Optional[float] = None,
-        # fixed pct exits (альтернатива ATR), trailing (упрощённо по точкам сигналов)
-        stop_pct: Optional[float] = None,
-        take_pct: Optional[float] = None,
-        trail_pct: Optional[float] = None,
-        # money management
-        risk_pct: Optional[float] = None,
-        initial_cash: float = 0.0,
-) -> pd.DataFrame:
-    """
-    Принимает df сигналов (time, symbol, timeframe, side, price[, run_id...]).
-    Возвращает DataFrame trades: entry_time, exit_time, side, entry, exit, pnl, bars.
-    """
-    if df_signals.empty:
-        return pd.DataFrame(columns=["entry_time", "exit_time", "side", "entry", "exit", "pnl", "bars"])
-
-    df = df_signals.copy()
-    # normalize time
+def ensure_time_index(df: pd.DataFrame, time_col: str = "timestamp") -> pd.DataFrame:
     if "time" in df.columns:
-        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-        df = df.dropna(subset=["time"]).sort_values("time")
+        tcol = "time"
+    elif time_col in df.columns:
+        tcol = time_col
     else:
-        if not isinstance(df.index, pd.DatetimeIndex):
-            raise ValueError("signals must have 'time' column or DatetimeIndex")
-        df = df.sort_index().reset_index().rename(columns={"index": "time"})
+        # попробуем угадать
+        for cand in ["timestamp", "date", "datetime", "time"]:
+            if cand in df.columns:
+                tcol = cand
+                break
+        else:
+            raise ValueError("Не найдена колонка времени. Укажите --time-col")
+    df = df.copy()
+    df[tcol] = pd.to_datetime(df[tcol], utc=True, errors="coerce")
+    df = df.dropna(subset=[tcol])
+    df = df.rename(columns={tcol: "time"}).set_index("time").sort_index()
+    return df
 
-    # presence checks
-    for col in ("symbol", "timeframe", "side"):
-        if col not in df.columns:
-            raise ValueError(f"signals are missing column '{col}'")
 
-    fill_mode = (fill_mode or "signal").lower()
-    if fill_mode not in ("signal", "next_open"):
-        raise ValueError("fill_mode must be 'signal' or 'next_open'")
+def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    agg = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+    }
+    if "volume" in df.columns:
+        agg["volume"] = "sum"
+    out = df.resample(rule).agg(agg).dropna()
+    return out
 
-    # local helper: where do we fill & what price
-    def _fill_price_for_signal(row) -> Optional[Tuple[float, pd.Timestamp]]:
-        if fill_mode == "signal":
-            return float(row["price"]), _to_utc_ts(row["time"])
-        # next_open:
-        if next_open_lookup is None:
-            return None
-        res = next_open_lookup.next_open(str(row["symbol"]), str(row["timeframe"]), row["time"])
-        if res is None:
-            return None
-        px, ots = res
-        if entry_lag and entry_lag > 0:
-            sub = next_open_lookup._subset(str(row["symbol"]), str(row["timeframe"]))
-            pos = sub.index.searchsorted(ots, side="left") + entry_lag - 1
-            if pos >= len(sub):
-                return None
-            px = float(sub.iloc[pos]["open"])
-            ots = sub.index[pos]
-        return float(px), ots
 
-    trades = []
-    curr_side = "FLAT"
-    entry_px: Optional[float] = None
-    entry_ts: Optional[pd.Timestamp] = None
-    entry_qty: float = 0.0
-    # protective levels
-    stop_px: Optional[float] = None
-    take_px: Optional[float] = None
-    best_px: Optional[float] = None  # для trail
+def ema(s: pd.Series, span: int) -> pd.Series:
+    return s.ewm(span=span, adjust=False, min_periods=span).mean()
 
-    equity = float(initial_cash or 0.0)
 
-    for _, row in df.iterrows():
-        side = str(row["side"]).upper().strip()
-        if side not in ("LONG", "SHORT", "FLAT"):
-            continue
+def _tr(h: pd.Series, l: pd.Series, c: pd.Series) -> pd.Series:
+    prev_c = c.shift(1)
+    return pd.concat([(h - l).abs(), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
 
-        # protective exit check (на уровне "точек сигналов" — без прокрутки внутри бара)
-        if curr_side in ("LONG", "SHORT") and fill_mode in ("signal", "next_open"):
-            maybe = _fill_price_for_signal(row)
-            if maybe is None:
-                continue
-            px_raw, ts_used = maybe
 
-            # обновим trailing экстремум (по точкам сигналов/входов)
-            if trail_pct:
-                if curr_side == "LONG":
-                    best_px = max(best_px or px_raw, px_raw)
-                    trail_stop = (1.0 - float(trail_pct)) * float(best_px)
-                else:  # SHORT
-                    best_px = min(best_px or px_raw, px_raw)
-                    trail_stop = (1.0 + float(trail_pct)) * float(best_px)
-            else:
-                trail_stop = None
+def atr(h: pd.Series, l: pd.Series, c: pd.Series, n: int) -> pd.Series:
+    tr = _tr(h, l, c)
+    return tr.rolling(n, min_periods=n).mean()
 
-            # условие срабатывания защитных выходов
-            exit_by_protect = False
-            if curr_side == "LONG":
-                if stop_px and px_raw <= stop_px:
-                    exit_by_protect = True
-                if take_px and px_raw >= take_px:
-                    exit_by_protect = True
-                if trail_stop and px_raw <= trail_stop:
-                    exit_by_protect = True
-            else:  # SHORT
-                if stop_px and px_raw >= stop_px:
-                    exit_by_protect = True
-                if take_px and px_raw <= take_px:
-                    exit_by_protect = True
-                if trail_stop and px_raw >= trail_stop:
-                    exit_by_protect = True
 
-            if exit_by_protect:
-                px_exit = _exec_price_with_slippage(curr_side, "FLAT", px_raw, slip_bps, is_entry=False)
-                fee_exit = _trade_fee(fee_bps, px_exit, entry_qty)
-                if curr_side == "LONG":
-                    pnl = entry_qty * (px_exit - float(entry_px)) - fee_exit
+def di_adx(h: pd.Series, l: pd.Series, c: pd.Series, n: int):
+    # Wilder's smoothing (приближение без talib)
+    up_move = h.diff()
+    down_move = -l.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr = _tr(h, l, c)
+
+    plus_dm = pd.Series(plus_dm, index=h.index)
+    minus_dm = pd.Series(minus_dm, index=h.index)
+
+    tr_n = tr.rolling(n, min_periods=n).sum()
+    plus_n = plus_dm.rolling(n, min_periods=n).sum()
+    minus_n = minus_dm.rolling(n, min_periods=n).sum()
+
+    plus_di = 100 * (plus_n / tr_n).replace([np.inf, -np.inf], np.nan)
+    minus_di = 100 * (minus_n / tr_n).replace([np.inf, -np.inf], np.nan)
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).replace([np.inf, -np.inf], np.nan)
+    adx = dx.rolling(n, min_periods=n).mean()
+    return plus_di, minus_di, adx
+
+
+# ------------------------
+# Backtester
+# ------------------------
+
+@dataclass
+class Config:
+    ohlcv: str
+    time_col: str = "timestamp"
+    resample: str = "5min"
+    ema_fast: int = 12
+    ema_slow: int = 21
+    adx_len: int = 14
+    adx_on: float = 25.0
+    adx_off: float = 20.0
+    require_di: bool = True
+    htf_tf: Optional[str] = None
+    htf_ema_fast: Optional[int] = None
+    htf_ema_slow: Optional[int] = None
+    atr_len: int = 14
+    stop_atr: float = 2.0
+    take_atr: Optional[float] = None
+    trail_atr: Optional[float] = None
+    breakeven_rr: Optional[float] = None
+    trail_activate_rr: Optional[float] = None
+    entry_lag: int = 0
+    cooldown_bars: int = 0
+    min_hold_bars: int = 0
+    fill_mode: str = "next_open"
+    fee_bps: float = 0.0
+    slip_bps: float = 0.0
+    qty: float = 1.0
+
+
+@dataclass
+class Trade:
+    side: int  # +1 long, -1 short
+    entry_idx: pd.Timestamp
+    entry_px: float
+    exit_idx: pd.Timestamp
+    exit_px: float
+    pnl: float
+
+
+def run_backtest(cfg: Config) -> List[Trade]:
+    df = pd.read_csv(cfg.ohlcv)
+    # колонок может быть много: ожидаем как минимум open/high/low/close
+    lower_cols = {c.lower(): c for c in df.columns}
+    for need in ["open", "high", "low", "close"]:
+        if need not in lower_cols:
+            raise ValueError(f"В CSV нет колонки {need}")
+    # нормализуем имена
+    df = df.rename(columns={lower_cols["open"]: "open",
+                            lower_cols["high"]: "high",
+                            lower_cols["low"]: "low",
+                            lower_cols["close"]: "close"})
+    if "volume" in lower_cols:
+        df = df.rename(columns={lower_cols["volume"]: "volume"})
+
+    df = ensure_time_index(df, cfg.time_col)
+    if cfg.resample:
+        df = resample_ohlcv(df, cfg.resample)
+
+    # индикаторы LTF
+    df["ema_f"] = ema(df["close"], cfg.ema_fast)
+    df["ema_s"] = ema(df["close"], cfg.ema_slow)
+    plus_di, minus_di, adx = di_adx(df["high"], df["low"], df["close"], cfg.adx_len)
+    df["plus_di"], df["minus_di"], df["adx"] = plus_di, minus_di, adx
+    df["atr"] = atr(df["high"], df["low"], df["close"], cfg.atr_len)
+
+    # фильтр HTF
+    if cfg.htf_tf:
+        htf = resample_ohlcv(df[["open", "high", "low", "close"]], cfg.htf_tf)
+        efast = cfg.htf_ema_fast or cfg.ema_fast
+        eslow = cfg.htf_ema_slow or cfg.ema_slow
+        htf["ema_f"] = ema(htf["close"], efast)
+        htf["ema_s"] = ema(htf["close"], eslow)
+        # сопоставим значения к LTF по forward-fill
+        htf = htf[["ema_f", "ema_s"]].reindex(df.index, method="ffill")
+        df["htf_ok_long"] = (htf["ema_f"] > htf["ema_s"]).astype(float)
+        df["htf_ok_short"] = (htf["ema_f"] < htf["ema_s"]).astype(float)
+    else:
+        df["htf_ok_long"] = 1.0
+        df["htf_ok_short"] = 1.0
+
+    # сигналы входа (кресты EMA)
+    df["cross_up"] = (df["ema_f"].shift(1) <= df["ema_s"].shift(1)) & (df["ema_f"] > df["ema_s"])
+    df["cross_dn"] = (df["ema_f"].shift(1) >= df["ema_s"].shift(1)) & (df["ema_f"] < df["ema_s"])
+
+    trades: List[Trade] = []
+
+    pos = 0  # 0/ +1 / -1
+    entry_px = None
+    entry_idx = None
+    risk_per_unit = None
+    stop_px = None
+    take_px = None
+    trail_active = False
+    be_done = False
+    hold_bars = 0
+    cooldown = 0
+
+    slip = cfg.slip_bps / 10000.0
+    fee = cfg.fee_bps / 10000.0
+
+    # пройдём по барам
+    for i in range(1, len(df)):
+        ts = df.index[i]
+        row = df.iloc[i]
+        prev = df.iloc[i - 1]
+
+        if cooldown > 0:
+            cooldown -= 1
+
+        # обновление трейла для открытой позиции
+        if pos != 0:
+            hold_bars += 1
+            # Активировать трейл по RR
+            if not trail_active and cfg.trail_atr and cfg.trail_activate_rr is not None and risk_per_unit:
+                # для длинной используем максимум бара, для короткой минимум
+                if pos > 0:
+                    rr_now = (row["high"] - entry_px) / risk_per_unit
                 else:
-                    pnl = entry_qty * (float(entry_px) - px_exit) - fee_exit
-                equity += pnl
+                    rr_now = (entry_px - row["low"]) / risk_per_unit
+                if rr_now >= cfg.trail_activate_rr:
+                    trail_active = True
 
-                # bars (примерная оценка по timeframe)
-                bars_val = 0
-                tf_min = _parse_tf_minutes(str(row["timeframe"]))
-                if tf_min and entry_ts is not None:
-                    bars_val = int((_to_utc_ts(ts_used) - _to_utc_ts(entry_ts)).total_seconds() // (tf_min * 60))
+            # Безубыток
+            if not be_done and cfg.breakeven_rr is not None and risk_per_unit:
+                if pos > 0:
+                    rr_now = (row["high"] - entry_px) / risk_per_unit
+                    if rr_now >= cfg.breakeven_rr:
+                        stop_px = max(stop_px, entry_px)
+                        be_done = True
+                else:
+                    rr_now = (entry_px - row["low"]) / risk_per_unit
+                    if rr_now >= cfg.breakeven_rr:
+                        stop_px = min(stop_px, entry_px)
+                        be_done = True
 
-                trades.append(
-                    {
-                        "entry_time": _to_utc_ts(entry_ts).isoformat(),
-                        "exit_time": _to_utc_ts(ts_used).isoformat(),
-                        "side": curr_side,
-                        "entry": float(entry_px),
-                        "exit": float(px_exit),
-                        "pnl": float(pnl),
-                        "bars": int(bars_val),
-                    }
-                )
-                # позиция закрыта
-                curr_side = "FLAT"
-                entry_px = None
-                entry_ts = None
-                entry_qty = 0.0
-                stop_px = take_px = best_px = None
-                # важно: после защитного выхода мы не обрабатываем смену сигнала в ту же точку —
-                #       это упрощение. При желании можно добавить переворот.
-                continue
-
-        # далее — обработка обычного изменения сайда
-        if side == curr_side:
-            continue
-
-        res = _fill_price_for_signal(row)
-        if res is None:
-            continue
-        px_raw, ts_used = res
-
-        # вход
-        if curr_side == "FLAT" and side in ("LONG", "SHORT"):
-            # рассчёт защитных уровней (ATR или fixed pct)
-            # приоритет: fixed pct, затем ATR
-            stop_px = take_px = None
-            if stop_pct or take_pct:
-                if side == "LONG":
-                    if stop_pct:
-                        stop_px = float(px_raw) * (1.0 - float(stop_pct))
-                    if take_pct:
-                        take_px = float(px_raw) * (1.0 + float(take_pct))
-                else:  # SHORT
-                    if stop_pct:
-                        stop_px = float(px_raw) * (1.0 + float(stop_pct))
-                    if take_pct:
-                        take_px = float(px_raw) * (1.0 - float(take_pct))
-            elif (atr_mult_stop or atr_mult_take) and (next_open_lookup is not None):
-                atr = next_open_lookup.atr_at(str(row["symbol"]), str(row["timeframe"]), ts_used, atr_period,
-                                              atr_method)
-                if atr is not None and not np.isnan(atr):
-                    if atr_mult_stop:
-                        stop_px = float(px_raw) - float(atr_mult_stop) * float(atr) if side == "LONG" else float(
-                            px_raw) + float(atr_mult_stop) * float(atr)
-                    if atr_mult_take:
-                        take_px = float(px_raw) + float(atr_mult_take) * float(atr) if side == "LONG" else float(
-                            px_raw) - float(atr_mult_take) * float(atr)
-
-            # размер позиции
-            entry_qty = _position_size_for_risk(equity, float(px_raw), stop_px, risk_pct)
-            # исполнение
-            px_entry = _exec_price_with_slippage("FLAT", side, float(px_raw), slip_bps, is_entry=True)
-            fee_entry = _trade_fee(fee_bps, px_entry, entry_qty)
-            equity -= fee_entry
-
-            curr_side = side
-            entry_px = float(px_entry)
-            entry_ts = _to_utc_ts(ts_used)
-            # init trailing
-            best_px = float(px_entry)
-            continue
-
-        # выход / переворот
-        if curr_side in ("LONG", "SHORT") and side != curr_side:
-            px_exit = _exec_price_with_slippage(curr_side, side, float(px_raw), slip_bps, is_entry=False)
-            fee_exit = _trade_fee(fee_bps, px_exit, entry_qty)
-            if curr_side == "LONG":
-                pnl = entry_qty * (px_exit - float(entry_px)) - fee_exit
-            else:
-                pnl = entry_qty * (float(entry_px) - px_exit) - fee_exit
-            equity += pnl
-
-            # bars
-            bars_val = 0
-            tf_min = _parse_tf_minutes(str(row["timeframe"]))
-            if tf_min and entry_ts is not None:
-                bars_val = int((_to_utc_ts(ts_used) - _to_utc_ts(entry_ts)).total_seconds() // (tf_min * 60))
-
-            trades.append(
-                {
-                    "entry_time": _to_utc_ts(entry_ts).isoformat(),
-                    "exit_time": _to_utc_ts(ts_used).isoformat(),
-                    "side": curr_side,
-                    "entry": float(entry_px),
-                    "exit": float(px_exit),
-                    "pnl": float(pnl),
-                    "bars": int(bars_val) if fill_mode == "next_open" else 0,
-                }
-            )
-
-            # если переворот — открыть новую
-            if side in ("LONG", "SHORT"):
-                # обнулим и сразу войдём
-                curr_side = "FLAT"
-                entry_px = None
-                entry_ts = None
-                entry_qty = 0.0
-                stop_px = take_px = best_px = None
-
-                # вход после выхода
-                # защитные уровни
-                if stop_pct or take_pct:
-                    if side == "LONG":
-                        stop_px = float(px_raw) * (1.0 - float(stop_pct)) if stop_pct else None
-                        take_px = float(px_raw) * (1.0 + float(take_pct)) if take_pct else None
+            # Трейлинг
+            if cfg.trail_atr and (trail_active or cfg.trail_activate_rr is None):
+                dist = cfg.trail_atr * row["atr"]
+                if pd.notna(dist):
+                    if pos > 0:
+                        trail_level = row["high"] - dist
+                        if stop_px is None:
+                            stop_px = trail_level
+                        else:
+                            stop_px = max(stop_px, trail_level)
                     else:
-                        stop_px = float(px_raw) * (1.0 + float(stop_pct)) if stop_pct else None
-                        take_px = float(px_raw) * (1.0 - float(take_pct)) if take_pct else None
-                elif (atr_mult_stop or atr_mult_take) and (next_open_lookup is not None):
-                    atr = next_open_lookup.atr_at(str(row["symbol"]), str(row["timeframe"]), ts_used, atr_period,
-                                                  atr_method)
-                    if atr is not None and not np.isnan(atr):
-                        if atr_mult_stop:
-                            stop_px = float(px_raw) - float(atr_mult_stop) * float(atr) if side == "LONG" else float(
-                                px_raw) + float(atr_mult_stop) * float(atr)
-                        if atr_mult_take:
-                            take_px = float(px_raw) + float(atr_mult_take) * float(atr) if side == "LONG" else float(
-                                px_raw) - float(atr_mult_take) * float(atr)
+                        trail_level = row["low"] + dist
+                        if stop_px is None:
+                            stop_px = trail_level
+                        else:
+                            stop_px = min(stop_px, trail_level)
 
-                entry_qty = _position_size_for_risk(equity, float(px_raw), stop_px, risk_pct)
-                px_entry = _exec_price_with_slippage("FLAT", side, float(px_raw), slip_bps, is_entry=True)
-                fee_entry = _trade_fee(fee_bps, px_entry, entry_qty)
-                equity -= fee_entry
+            # Проверка выхода в текущем баре (приоритет стопа)
+            if pos > 0:
+                stop_hit = stop_px is not None and row["low"] <= stop_px
+                take_hit = cfg.take_atr is not None and take_px is not None and row[
+                    "high"] >= take_px and hold_bars >= cfg.min_hold_bars
+                if stop_hit:
+                    exit_px = stop_px * (1 - slip)
+                elif take_hit:
+                    exit_px = take_px * (1 - slip)
+                else:
+                    exit_px = None
+                if exit_px is not None:
+                    # комиссия на выход
+                    pnl = (exit_px - entry_px) * cfg.qty
+                    pnl -= (entry_px + exit_px) * cfg.qty * fee
+                    trades.append(Trade(+1, entry_idx, entry_px, ts, exit_px, pnl))
+                    # сброс состояния
+                    pos = 0
+                    entry_px = None
+                    entry_idx = None
+                    risk_per_unit = None
+                    stop_px = None
+                    take_px = None
+                    trail_active = False
+                    be_done = False
+                    hold_bars = 0
+                    cooldown = cfg.cooldown_bars
+                    continue
+            elif pos < 0:
+                stop_hit = stop_px is not None and row["high"] >= stop_px
+                take_hit = cfg.take_atr is not None and take_px is not None and row[
+                    "low"] <= take_px and hold_bars >= cfg.min_hold_bars
+                if stop_hit:
+                    exit_px = stop_px * (1 + slip)
+                elif take_hit:
+                    exit_px = take_px * (1 + slip)
+                else:
+                    exit_px = None
+                if exit_px is not None:
+                    pnl = (entry_px - exit_px) * cfg.qty
+                    pnl -= (entry_px + exit_px) * cfg.qty * fee
+                    trades.append(Trade(-1, entry_idx, entry_px, ts, exit_px, pnl))
+                    pos = 0
+                    entry_px = None
+                    entry_idx = None
+                    risk_per_unit = None
+                    stop_px = None
+                    take_px = None
+                    trail_active = False
+                    be_done = False
+                    hold_bars = 0
+                    cooldown = cfg.cooldown_bars
+                    continue
 
-                curr_side = side
-                entry_px = float(px_entry)
-                entry_ts = _to_utc_ts(ts_used)
-                best_px = float(px_entry)
+        # поиск входа (если нет позиции и нет кулдауна)
+        if pos == 0 and cooldown == 0:
+            adx_ok_on = row["adx"] >= cfg.adx_on if pd.notna(row["adx"]) else False
+            adx_ok_off = row["adx"] <= cfg.adx_off if pd.notna(row["adx"]) else True
+            # Включён ли вообще ADX фильтр на вход: требуем adx_on
+            if pd.isna(row["ema_f"]) or pd.isna(row["ema_s"]) or pd.isna(row["atr"]) or not adx_ok_on:
+                pass
             else:
-                # ушли в FLAT
-                curr_side = "FLAT"
-                entry_px = None
-                entry_ts = None
-                entry_qty = 0.0
-                stop_px = take_px = best_px = None
+                long_ok = bool(row["cross_up"]) and bool(row["htf_ok_long"]) and (
+                        not cfg.require_di or (row["plus_di"] > row["minus_di"]))
+                short_ok = bool(row["cross_dn"]) and bool(row["htf_ok_short"]) and (
+                        not cfg.require_di or (row["minus_di"] > row["plus_di"]))
+                if long_ok:
+                    # вход по следующему бару open с проскальзыванием
+                    if i + cfg.entry_lag < len(df):
+                        j = i + cfg.entry_lag
+                        next_open = df.iloc[j]["open"]
+                        if pd.notna(next_open) and adx_ok_on:
+                            entry_px = float(next_open) * (1 + slip)
+                            entry_idx = df.index[j]
+                            pos = +1
+                            # комиссии на вход
+                            entry_fee = entry_px * cfg.qty * fee
+                            # риск
+                            risk_per_unit = cfg.stop_atr * row["atr"]
+                            if pd.isna(risk_per_unit) or risk_per_unit <= 0:
+                                # если ATR нет — отменяем вход
+                                pos = 0
+                                entry_px = None
+                                entry_idx = None
+                            else:
+                                stop_px = entry_px - risk_per_unit
+                                take_px = None
+                                if cfg.take_atr:
+                                    take_px = entry_px + cfg.take_atr * row["atr"]
+                                trail_active = cfg.trail_activate_rr is None  # сразу или после RR
+                                be_done = False
+                                hold_bars = 0
+                                # учтём комиссию сразу через вычитание из PnL на выходе; здесь можно игнорировать
 
-    return pd.DataFrame(trades, columns=["entry_time", "exit_time", "side", "entry", "exit", "pnl", "bars"])
+                elif short_ok:
+                    if i + cfg.entry_lag < len(df):
+                        j = i + cfg.entry_lag
+                        next_open = df.iloc[j]["open"]
+                        if pd.notna(next_open) and adx_ok_on:
+                            entry_px = float(next_open) * (1 - slip)
+                            entry_idx = df.index[j]
+                            pos = -1
+                            entry_fee = entry_px * cfg.qty * fee
+                            risk_per_unit = cfg.stop_atr * row["atr"]
+                            if pd.isna(risk_per_unit) or risk_per_unit <= 0:
+                                pos = 0
+                                entry_px = None
+                                entry_idx = None
+                            else:
+                                stop_px = entry_px + risk_per_unit
+                                take_px = None
+                                if cfg.take_atr:
+                                    take_px = entry_px - cfg.take_atr * row["atr"]
+                                trail_active = cfg.trail_activate_rr is None
+                                be_done = False
+                                hold_bars = 0
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Reporting
-# ─────────────────────────────────────────────────────────────────────────────
-def _equity_curve(trades: pd.DataFrame, initial_cash: float = 0.0) -> pd.Series:
-    """Equity = initial_cash + cumulative PnL по времени закрытий сделок.
-    Важно: добавляем стартовую точку перед первым выходом, чтобы DD считался от initial_cash.
-    """
-    if trades.empty:
-        # одна точка на таймлайне, чтобы не делить на ноль и корректно печатать
-        return pd.Series([float(initial_cash)], index=[pd.Timestamp("1970-01-01T00:00:00Z")])
-
-    exit_ts = pd.to_datetime(trades["exit_time"], utc=True, errors="coerce")
-    pnl = trades["pnl"].astype(float)
-
-    eq = pnl.cumsum() + float(initial_cash)
-    eq.index = exit_ts
-
-    # добавим стартовую точку ровно перед первой сделкой
-    first_ts = exit_ts.iloc[0]
-    start_ts = first_ts - pd.Timedelta(nanoseconds=1)
-    eq = pd.concat([pd.Series([float(initial_cash)], index=[start_ts]), eq])
-
-    return eq
-
-
-def _print_report(trades: pd.DataFrame, fill_mode: str, initial_cash: float, used_rows: Optional[int] = None):
-    rows = int(used_rows if used_rows is not None else len(trades))
-    n_trades = len(trades)
-    wins = int((trades["pnl"] > 0).sum()) if n_trades else 0
-    win_rate = (wins / n_trades * 100.0) if n_trades else 0.0
-    net_pnl = float(trades["pnl"].sum()) if n_trades else 0.0
-
-    eq = _equity_curve(trades, initial_cash=initial_cash)
-    final_eq = float(eq.iloc[-1]) if len(eq) else float(initial_cash)
-
-    roll_max = eq.cummax()
-    dd = eq - roll_max
-    max_dd_abs = float(dd.min())  # отрицательное число
-    max_dd_pct = (abs(max_dd_abs) / float(initial_cash) * 100.0) if initial_cash else 0.0
-
-    print("\n=== PAPER TRADE REPORT ===")
-    print(f"rows:\t\t  {rows}")
-    print(f"trades:\t\t  {n_trades}")
-    print(f"win rate:\t\t{win_rate:.1f}%")
-    print(f"net PnL:\t\t{net_pnl:.6f}")
-    print(f"final equity:{final_eq:.6f}")
-    print(f"max DD:\t\t  {max_dd_pct:.2f}%   (abs {max_dd_abs:.6f})")
-    print(f"fill mode:\t  {fill_mode}\n")
-
-    if not trades.empty:
-        out = trades.copy()
-        for col in ("entry", "exit", "pnl"):
-            out[col] = out[col].astype(float).round(6)
-        print("trades:")
-        print(out.to_string(index=False))
+    return trades
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="tb-paper", description="Paper trade over signals in DB")
-    p.add_argument("--db", default=os.getenv("TB_STORE_URL", "sqlite:///data/bot.db"), help="sqlite:///... path")
-    p.add_argument("--symbol")
-    p.add_argument("--timeframe")
-    p.add_argument("--strategy")
-    p.add_argument("--run-id", dest="run_id")
+def summarize(trades: List[Trade]):
+    if not trades:
+        return {"trades": 0, "win_rate": 0.0, "net_pnl": 0.0, "avg_pnl": 0.0}
+    pnl = np.array([t.pnl for t in trades], dtype=float)
+    wins = (pnl > 0).sum()
+    return {
+        "trades": int(len(trades)),
+        "win_rate": float(wins / len(trades)),
+        "net_pnl": float(pnl.sum()),
+        "avg_pnl": float(pnl.mean()),
+    }
 
-    p.add_argument("--start")
-    p.add_argument("--end")
-    p.add_argument("--limit", type=int)
 
-    p.add_argument("--fee-bps", type=float, default=0.0)
-    p.add_argument("--slip-bps", type=float, default=0.0)
-    p.add_argument("--initial-cash", type=float, default=0.0)
-
-    p.add_argument("--fill-mode", choices=["signal", "next_open"], default="signal")
-    p.add_argument("--entry-lag", type=int, default=0)
-
-    # ATR-based exits / sizing
-    p.add_argument("--atr-period", type=int, default=14)
-    p.add_argument("--atr-method", choices=["sma", "ema"], default="sma")
-    p.add_argument("--atr-mult-stop", type=float)
-    p.add_argument("--atr-mult-take", type=float)
-
-    # Fixed pct exits (альтернатива ATR) + trailing
-    p.add_argument("--stop-pct", type=float)
-    p.add_argument("--take-pct", type=float)
-    p.add_argument("--trail-pct", type=float)
-
-    p.add_argument("--risk-pct", type=float)
-
-    p.add_argument("--export-csv", help="Path to save trades CSV")
-
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="paper-trade")
+    p.add_argument("--ohlcv", required=True, help="Путь к CSV OHLCV")
+    p.add_argument("--time-col", default="timestamp")
+    p.add_argument("--resample", required=True)
+    p.add_argument("--ema-fast", type=int, required=True, dest="ema_fast")
+    p.add_argument("--ema-slow", type=int, required=True, dest="ema_slow")
+    p.add_argument("--adx-len", type=int, required=True, dest="adx_len")
+    p.add_argument("--adx-on", type=float, required=True, dest="adx_on")
+    p.add_argument("--adx-off", type=float, required=True, dest="adx_off")
+    p.add_argument("--require-di", type=str2bool, required=True, dest="require_di")
+    p.add_argument("--htf-tf", dest="htf_tf")
+    p.add_argument("--htf-ema-fast", type=int, dest="htf_ema_fast")
+    p.add_argument("--htf-ema-slow", type=int, dest="htf_ema_slow")
+    p.add_argument("--atr-len", type=int, dest="atr_len", default=14)
+    p.add_argument("--stop-atr", type=float, required=True, dest="stop_atr")
+    p.add_argument("--take-atr", type=float, dest="take_atr")
+    p.add_argument("--trail-atr", type=float, dest="trail_atr")
+    p.add_argument("--breakeven-rr", type=float, dest="breakeven_rr")
+    p.add_argument("--trail-activate-rr", type=float, dest="trail_activate_rr")
+    p.add_argument("--entry-lag", type=int, dest="entry_lag", default=0)
+    p.add_argument("--cooldown-bars", type=int, required=True, dest="cooldown_bars")
+    p.add_argument("--min-hold-bars", type=int, dest="min_hold_bars", default=0)
+    p.add_argument("--fill-mode", dest="fill_mode", default="next_open")
+    p.add_argument("--fee-bps", type=float, required=True, dest="fee_bps")
+    p.add_argument("--slip-bps", type=float, required=True, dest="slip_bps")
+    p.add_argument("--qty", type=float, required=True, dest="qty")
+    # совместимость: игнорируем неизвестные доп. ключи, если sweep_cli их пришлёт
     return p
 
 
-def main(argv: Optional[List[str]] = None):
-    parser = build_parser()
-    args = parser.parse_args(argv)
+def main():
+    parser = build_argparser()
+    args, unknown = parser.parse_known_args()
+    # Не падаем из‑за неизвестных аргументов, просто игнорируем
 
-    # 1) Load signals
-    df = _read_signals(
-        args.db,
-        symbol=args.symbol,
-        timeframe=args.timeframe,
-        strategy=args.strategy,
-        run_id=args.run_id,
-        start=args.start,
-        end=args.end,
-        limit=args.limit,
-    )
-
-    # rows here == count of signals used (как в твоих логах)
-    used_rows = len(df)
-
-    # 2) NextOpenLookup (если нужен)
-    lookup: Optional[NextOpenLookup] = None
-    if args.fill_mode == "next_open" or args.atr_mult_stop or args.atr_mult_take:
-        # чтобы не тянуть все свечи мира — ограничим по тем же фильтрам
-        lookup = NextOpenLookup.from_db(
-            args.db,
-            symbol=args.symbol,
-            timeframe=args.timeframe,
-            start=args.start,
-            end=args.end,
-        )
-
-    # 3) Simulate
-    trades = simulate_trades(
-        df,
+    cfg = Config(
+        ohlcv=args.ohlcv,
+        time_col=args.time_col,
+        resample=args.resample,
+        ema_fast=args.ema_fast,
+        ema_slow=args.ema_slow,
+        adx_len=args.adx_len,
+        adx_on=args.adx_on,
+        adx_off=args.adx_off,
+        require_di=args.require_di,
+        htf_tf=args.htf_tf,
+        htf_ema_fast=args.htf_ema_fast,
+        htf_ema_slow=args.htf_ema_slow,
+        atr_len=args.atr_len,
+        stop_atr=args.stop_atr,
+        take_atr=args.take_atr,
+        trail_atr=args.trail_atr,
+        breakeven_rr=args.breakeven_rr,
+        trail_activate_rr=args.trail_activate_rr,
+        entry_lag=args.entry_lag,
+        cooldown_bars=args.cooldown_bars,
+        min_hold_bars=args.min_hold_bars,
+        fill_mode=args.fill_mode,
         fee_bps=args.fee_bps,
         slip_bps=args.slip_bps,
-        fill_mode=args.fill_mode,
-        entry_lag=int(args.entry_lag or 0),
-        next_open_lookup=lookup,
-        atr_period=int(args.atr_period or 14),
-        atr_method=args.atr_method or "sma",
-        atr_mult_stop=args.atr_mult_stop,
-        atr_mult_take=args.atr_mult_take,
-        stop_pct=args.stop_pct,
-        take_pct=args.take_pct,
-        trail_pct=args.trail_pct,
-        risk_pct=args.risk_pct,
-        initial_cash=float(args.initial_cash or 0.0),
+        qty=args.qty,
     )
 
-    # 4) Report
-    _print_report(
-        trades,
-        fill_mode=args.fill_mode,
-        initial_cash=float(args.initial_cash or 0.0),
-        used_rows=used_rows,  # <-- теперь печатаем число использованных сигналов
-    )
-
-    # 5) Export
-    if args.export_csv:
-        trades.to_csv(args.export_csv, index=False)
-        print(f"Saved CSV: {args.export_csv}")
-
-    return 0
+    try:
+        trades = run_backtest(cfg)
+        summ = summarize(trades)
+    except Exception as e:
+        # В случае сбоя отдаём валидный JSON с нулевой статистикой и текстом ошибки в stderr
+        raise
+    else:
+        # ВАЖНО: вывести РОВНО один JSON-объект одной строкой (без префиксов), это парсит sweep_cli
+        print(json.dumps(summ, ensure_ascii=False))
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
