@@ -1,484 +1,365 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-paper_trade_cmd.py — простая CLI-утилита бумажного трейда, совместимая со sweep_cli.
+paper_trade_cmd: листовой и авто-режимы.
 
-Вход: CSV с колонками времени и OHLCV. По умолчанию ищет колонку времени 'timestamp',
-переименовывает в 'time' и ресемплит во фрейм 'resample' (например, '5min').
+- Leaf: печатает JSON {"net","net_pnl","trades"} и (опционально) plain-строку "net=<..> trades=<..>" для свипера.
+- Auto: запускает sweep_cli с явным --paper-cli "<python> -m src.presentation.cli.paper_trade_cmd --emit-plain"
+        и затем ранкинг (rank_cli или надёжный inline fallback).
 
-Стратегия (упрощённая, но рабочая):
-- Вход LONG при пересечении EMA_fast выше EMA_slow, ADX >= adx_on, и (если require_di) +DI > -DI.
-  Вход SHORT при обратном пересечении и (если require_di) -DI > +DI.
-- Фильтр HTF (опционально): если задан htf_tf, для старшего ТФ считаем EMA(HTF) и разрешаем
-  только LONG, когда EMA_fast(HTF) > EMA_slow(HTF), и только SHORT, когда <.
-- Стоп: stop_atr * ATR(atr_len). Тейк (опционально): take_atr * ATR. Трейл (опционально):
-  trail_atr * ATR, активируется сразу или при достижении RR >= trail_activate_rr.
-- Breakeven (опционально): при достижении RR >= breakeven_rr переносим стоп в безубыток.
-- min_hold_bars — минимальная выдержка позиции (стоп всё равно действует),
-  cooldown_bars — пауза после выхода.
-- Направление выхода внутри бара: если в том же баре задеты и стоп, и тейк/трейл, берём стоп первым
-  (консервативно). Можно поменять логикой "priority" при желании.
-- Сделки исполняются по следующему бару (entry_lag баров задержка) по цене открытия с проскальзыванием,
-  выходы — по уровню с проскальзыванием.
-
-Выход: печатает на stdout ЕДИНСТВЕННУЮ строку с JSON объектом:
-{"trades": int, "win_rate": float, "net_pnl": float, "avg_pnl": float}
-Именно это парсит sweep_cli.
+Зависимости: pandas, numpy.
 """
+
 from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
+import shlex
+import sys
+import subprocess
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional, Tuple, List, Dict
 
-import numpy as np
 import pandas as pd
+import numpy as np
 
+# ----------------------------- Индикаторы -----------------------------
 
-# ------------------------
-# Utils & indicators
-# ------------------------
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False, min_periods=span).mean()
 
-def str2bool(x: str) -> bool:
-    if isinstance(x, bool):
-        return x
-    x = x.strip().lower()
-    return x in {"1", "true", "t", "y", "yes"}
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
+    tr = true_range(high, low, close)
+    return tr.rolling(window=length, min_periods=length).mean()
 
-def ensure_time_index(df: pd.DataFrame, time_col: str = "timestamp") -> pd.DataFrame:
-    if "time" in df.columns:
-        tcol = "time"
-    elif time_col in df.columns:
-        tcol = time_col
-    else:
-        # попробуем угадать
-        for cand in ["timestamp", "date", "datetime", "time"]:
-            if cand in df.columns:
-                tcol = cand
-                break
-        else:
-            raise ValueError("Не найдена колонка времени. Укажите --time-col")
-    df = df.copy()
-    df[tcol] = pd.to_datetime(df[tcol], utc=True, errors="coerce")
-    df = df.dropna(subset=[tcol])
-    df = df.rename(columns={tcol: "time"}).set_index("time").sort_index()
-    return df
+def _dm_pos_neg(high: pd.Series, low: pd.Series) -> Tuple[pd.Series, pd.Series]:
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    return pd.Series(plus_dm, index=high.index), pd.Series(minus_dm, index=high.index)
 
+def adx_di(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    tr = true_range(high, low, close)
+    plus_dm, minus_dm = _dm_pos_neg(high, low)
+    atr_s = tr.rolling(window=length, min_periods=length).mean()
+    plus_di = 100.0 * (pd.Series(plus_dm, index=high.index).rolling(length, min_periods=length).mean() / atr_s)
+    minus_di = 100.0 * (pd.Series(minus_dm, index=high.index).rolling(length, min_periods=length).mean() / atr_s)
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    adx_val = dx.rolling(window=length, min_periods=length).mean()
+    return adx_val, plus_di, minus_di
 
-def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    agg = {
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-    }
-    if "volume" in df.columns:
-        agg["volume"] = "sum"
-    out = df.resample(rule).agg(agg).dropna()
-    return out
+# ----------------------------- Ресемплинг -----------------------------
 
+_PANDAS_TF = {
+    "1min": "1min", "3min": "3min", "5min": "5min", "15min": "15min", "30min": "30min",
+    "1h": "1H", "2h": "2H", "4h": "4H",
+    "1d": "1D",
+}
+def _to_pd_tf(tf: str) -> str:
+    tf = tf.strip().lower()
+    return _PANDAS_TF.get(tf, tf)
 
-def ema(s: pd.Series, span: int) -> pd.Series:
-    return s.ewm(span=span, adjust=False, min_periods=span).mean()
+def resample_ohlcv(df: pd.DataFrame, tf: str, time_col: str = "time") -> pd.DataFrame:
+    rule = _to_pd_tf(tf)
+    ohlc = df.resample(rule, on=time_col).agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+    )
+    ohlc = ohlc.dropna().reset_index(names=[time_col])
+    return ohlc
 
-
-def _tr(h: pd.Series, l: pd.Series, c: pd.Series) -> pd.Series:
-    prev_c = c.shift(1)
-    return pd.concat([(h - l).abs(), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
-
-
-def atr(h: pd.Series, l: pd.Series, c: pd.Series, n: int) -> pd.Series:
-    tr = _tr(h, l, c)
-    return tr.rolling(n, min_periods=n).mean()
-
-
-def di_adx(h: pd.Series, l: pd.Series, c: pd.Series, n: int):
-    # Wilder's smoothing (приближение без talib)
-    up_move = h.diff()
-    down_move = -l.diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    tr = _tr(h, l, c)
-
-    plus_dm = pd.Series(plus_dm, index=h.index)
-    minus_dm = pd.Series(minus_dm, index=h.index)
-
-    tr_n = tr.rolling(n, min_periods=n).sum()
-    plus_n = plus_dm.rolling(n, min_periods=n).sum()
-    minus_n = minus_dm.rolling(n, min_periods=n).sum()
-
-    plus_di = 100 * (plus_n / tr_n).replace([np.inf, -np.inf], np.nan)
-    minus_di = 100 * (minus_n / tr_n).replace([np.inf, -np.inf], np.nan)
-    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).replace([np.inf, -np.inf], np.nan)
-    adx = dx.rolling(n, min_periods=n).mean()
-    return plus_di, minus_di, adx
-
-
-# ------------------------
-# Backtester
-# ------------------------
-
-@dataclass
-class Config:
-    ohlcv: str
-    time_col: str = "timestamp"
-    resample: str = "5min"
-    ema_fast: int = 12
-    ema_slow: int = 21
-    adx_len: int = 14
-    adx_on: float = 25.0
-    adx_off: float = 20.0
-    require_di: bool = True
-    htf_tf: Optional[str] = None
-    htf_ema_fast: Optional[int] = None
-    htf_ema_slow: Optional[int] = None
-    atr_len: int = 14
-    stop_atr: float = 2.0
-    take_atr: Optional[float] = None
-    trail_atr: Optional[float] = None
-    breakeven_rr: Optional[float] = None
-    trail_activate_rr: Optional[float] = None
-    entry_lag: int = 0
-    cooldown_bars: int = 0
-    min_hold_bars: int = 0
-    fill_mode: str = "next_open"
-    fee_bps: float = 0.0
-    slip_bps: float = 0.0
-    qty: float = 1.0
-
+# ----------------------------- Бэктестер (лонг) -----------------------------
 
 @dataclass
 class Trade:
-    side: int  # +1 long, -1 short
-    entry_idx: pd.Timestamp
-    entry_px: float
-    exit_idx: pd.Timestamp
-    exit_px: float
-    pnl: float
+    entry_idx: int
+    exit_idx: int
+    entry_price: float
+    exit_price: float
+    pnl_gross: float
+    fees: float
+    pnl_net: float
 
+@dataclass
+class Config:
+    ohlcv: str; time_col: str; resample: str
+    ema_fast: int; ema_slow: int
+    adx_len: int; adx_on: float; adx_off: float; require_di: bool
+    atr_len: int; stop_atr: float; take_atr: float; trail_atr: float
+    breakeven_rr: float; trail_activate_rr: float
+    entry_lag: int; cooldown_bars: int; min_hold_bars: int; fill_mode: str
+    fee_bps: float; slip_bps: float; qty: float
 
-def run_backtest(cfg: Config) -> List[Trade]:
+def _price_with_slip(price: float, slip_bps: float, side: str) -> float:
+    m = slip_bps / 10000.0
+    return price * (1.0 + m) if side == "buy" else price * (1.0 - m)
+
+def _fees_for_trade(entry_px_eff: float, exit_px_eff: float, qty: float, fee_bps: float) -> float:
+    turn = (abs(entry_px_eff) + abs(exit_px_eff)) * abs(qty)
+    return turn * (fee_bps / 10000.0)
+
+def run_backtest(cfg: Config) -> Tuple[List[Trade], Dict[str, float]]:
     df = pd.read_csv(cfg.ohlcv)
-    # колонок может быть много: ожидаем как минимум open/high/low/close
-    lower_cols = {c.lower(): c for c in df.columns}
-    for need in ["open", "high", "low", "close"]:
-        if need not in lower_cols:
-            raise ValueError(f"В CSV нет колонки {need}")
-    # нормализуем имена
-    df = df.rename(columns={lower_cols["open"]: "open",
-                            lower_cols["high"]: "high",
-                            lower_cols["low"]: "low",
-                            lower_cols["close"]: "close"})
-    if "volume" in lower_cols:
-        df = df.rename(columns={lower_cols["volume"]: "volume"})
+    time_col = cfg.time_col if cfg.time_col else "timestamp"
+    if time_col not in df.columns:
+        for alt in ("time", "timestamp", "date"):
+            if alt in df.columns:
+                time_col = alt; break
+    df = df.rename(columns={time_col: "time"})
+    for c in ("open", "high", "low", "close"):
+        if c not in df.columns:
+            if "price" in df.columns:
+                df["open"] = df["high"] = df["low"] = df["close"] = df["price"]; break
+            raise SystemExit(f"CSV missing columns: {c}")
+    if "volume" not in df.columns:
+        df["volume"] = 0.0
+    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    df = df.dropna(subset=["time"]).sort_values("time")
 
-    df = ensure_time_index(df, cfg.time_col)
-    if cfg.resample:
-        df = resample_ohlcv(df, cfg.resample)
+    ohlc = resample_ohlcv(df, cfg.resample, time_col="time")
+    if len(ohlc) < max(cfg.ema_fast, cfg.ema_slow, cfg.adx_len, cfg.atr_len) + 5:
+        return [], {"net": 0.0, "net_pnl": 0.0, "trades": 0}
 
-    # индикаторы LTF
-    df["ema_f"] = ema(df["close"], cfg.ema_fast)
-    df["ema_s"] = ema(df["close"], cfg.ema_slow)
-    plus_di, minus_di, adx = di_adx(df["high"], df["low"], df["close"], cfg.adx_len)
-    df["plus_di"], df["minus_di"], df["adx"] = plus_di, minus_di, adx
-    df["atr"] = atr(df["high"], df["low"], df["close"], cfg.atr_len)
+    ohlc["ema_fast"] = ema(ohlc["close"], cfg.ema_fast)
+    ohlc["ema_slow"] = ema(ohlc["close"], cfg.ema_slow)
+    ohlc["atr"] = atr(ohlc["high"], ohlc["low"], ohlc["close"], cfg.atr_len)
+    ohlc["adx"], ohlc["+di"], ohlc["-di"] = adx_di(ohlc["high"], ohlc["low"], ohlc["close"], cfg.adx_len)
 
-    # фильтр HTF
-    if cfg.htf_tf:
-        htf = resample_ohlcv(df[["open", "high", "low", "close"]], cfg.htf_tf)
-        efast = cfg.htf_ema_fast or cfg.ema_fast
-        eslow = cfg.htf_ema_slow or cfg.ema_slow
-        htf["ema_f"] = ema(htf["close"], efast)
-        htf["ema_s"] = ema(htf["close"], eslow)
-        # сопоставим значения к LTF по forward-fill
-        htf = htf[["ema_f", "ema_s"]].reindex(df.index, method="ffill")
-        df["htf_ok_long"] = (htf["ema_f"] > htf["ema_s"]).astype(float)
-        df["htf_ok_short"] = (htf["ema_f"] < htf["ema_s"]).astype(float)
-    else:
-        df["htf_ok_long"] = 1.0
-        df["htf_ok_short"] = 1.0
+    cross_up = (ohlc["ema_fast"] > ohlc["ema_slow"]) & (ohlc["ema_fast"].shift(1) <= ohlc["ema_slow"].shift(1))
+    adx_ok = ohlc["adx"] >= cfg.adx_on
+    di_ok = (ohlc["+di"] > ohlc["-di"]) if cfg.require_di else pd.Series(True, index=ohlc.index)
+    entries = cross_up & adx_ok & di_ok
 
-    # сигналы входа (кресты EMA)
-    df["cross_up"] = (df["ema_f"].shift(1) <= df["ema_s"].shift(1)) & (df["ema_f"] > df["ema_s"])
-    df["cross_dn"] = (df["ema_f"].shift(1) >= df["ema_s"].shift(1)) & (df["ema_f"] < df["ema_s"])
-
+    in_pos = False; entry_idx = -1; entry_price = 0.0; risk_atr = 0.0
+    stop = np.nan; take = np.nan; trail_active = False; peak = -np.inf
+    last_exit_idx = -10_000
     trades: List[Trade] = []
 
-    pos = 0  # 0/ +1 / -1
-    entry_px = None
-    entry_idx = None
-    risk_per_unit = None
-    stop_px = None
-    take_px = None
-    trail_active = False
-    be_done = False
-    hold_bars = 0
-    cooldown = 0
+    for i in range(len(ohlc)):
+        row = ohlc.iloc[i]
+        if not in_pos:
+            if (i - last_exit_idx) >= max(0, cfg.cooldown_bars) and entries.iloc[i]:
+                j = i + max(0, cfg.entry_lag)
+                if j < len(ohlc):
+                    entry_idx = j
+                    entry_price = float(ohlc["close"].iloc[entry_idx])
+                    risk_atr = float(ohlc["atr"].iloc[entry_idx]) * max(1e-12, cfg.stop_atr)
+                    stop = entry_price - cfg.stop_atr * float(ohlc["atr"].iloc[entry_idx])
+                    take = np.nan if cfg.take_atr <= 0 else entry_price + cfg.take_atr * float(ohlc["atr"].iloc[entry_idx])
+                    trail_active = False; peak = entry_price; in_pos = True
+            continue
 
-    slip = cfg.slip_bps / 10000.0
-    fee = cfg.fee_bps / 10000.0
+        c = float(row["close"]); h = float(row["high"]); l = float(row["low"])
+        a = float(row["atr"]) if not math.isnan(row["atr"]) else risk_atr
+        peak = max(peak, c)
 
-    # пройдём по барам
-    for i in range(1, len(df)):
-        ts = df.index[i]
-        row = df.iloc[i]
-        prev = df.iloc[i - 1]
+        rr_now = (c - entry_price) / max(risk_atr, 1e-12)
+        if not trail_active and cfg.trail_activate_rr > 0 and rr_now >= cfg.trail_activate_rr:
+            trail_active = True
+        if cfg.breakeven_rr > 0 and rr_now >= cfg.breakeven_rr:
+            stop = max(stop, entry_price)
+        if trail_active and cfg.trail_atr > 0:
+            stop = max(stop, c - cfg.trail_atr * a)
 
-        if cooldown > 0:
-            cooldown -= 1
+        trend_exit = False
+        if (i - entry_idx) >= max(0, cfg.min_hold_bars):
+            cross_down = (ohlc["ema_fast"].iloc[i] < ohlc["ema_slow"].iloc[i]) and (
+                ohlc["ema_fast"].iloc[i - 1] >= ohlc["ema_slow"].iloc[i - 1]
+            )
+            adx_off = ohlc["adx"].iloc[i] <= cfg.adx_off
+            trend_exit = bool(cross_down or adx_off)
 
-        # обновление трейла для открытой позиции
-        if pos != 0:
-            hold_bars += 1
-            # Активировать трейл по RR
-            if not trail_active and cfg.trail_atr and cfg.trail_activate_rr is not None and risk_per_unit:
-                # для длинной используем максимум бара, для короткой минимум
-                if pos > 0:
-                    rr_now = (row["high"] - entry_px) / risk_per_unit
-                else:
-                    rr_now = (entry_px - row["low"]) / risk_per_unit
-                if rr_now >= cfg.trail_activate_rr:
-                    trail_active = True
+        exit_price: Optional[float] = None
+        if not math.isnan(stop) and l <= stop:
+            exit_price = stop
+        elif not math.isnan(take) and h >= take:
+            exit_price = take
+        elif trend_exit:
+            exit_price = c
 
-            # Безубыток
-            if not be_done and cfg.breakeven_rr is not None and risk_per_unit:
-                if pos > 0:
-                    rr_now = (row["high"] - entry_px) / risk_per_unit
-                    if rr_now >= cfg.breakeven_rr:
-                        stop_px = max(stop_px, entry_px)
-                        be_done = True
-                else:
-                    rr_now = (entry_px - row["low"]) / risk_per_unit
-                    if rr_now >= cfg.breakeven_rr:
-                        stop_px = min(stop_px, entry_px)
-                        be_done = True
+        if exit_price is not None:
+            entry_eff = _price_with_slip(entry_price, cfg.slip_bps, "buy")
+            exit_eff = _price_with_slip(exit_price, cfg.slip_bps, "sell")
+            pnl_gross = (exit_eff - entry_eff) * cfg.qty
+            fees = _fees_for_trade(entry_eff, exit_eff, cfg.qty, cfg.fee_bps)
+            pnl_net = pnl_gross - fees
+            trades.append(Trade(entry_idx, i, entry_price, exit_price, pnl_gross, fees, pnl_net))
+            in_pos = False; last_exit_idx = i
+            entry_idx = -1; entry_price = 0.0; stop = np.nan; take = np.nan; trail_active = False; peak = -np.inf
 
-            # Трейлинг
-            if cfg.trail_atr and (trail_active or cfg.trail_activate_rr is None):
-                dist = cfg.trail_atr * row["atr"]
-                if pd.notna(dist):
-                    if pos > 0:
-                        trail_level = row["high"] - dist
-                        if stop_px is None:
-                            stop_px = trail_level
-                        else:
-                            stop_px = max(stop_px, trail_level)
-                    else:
-                        trail_level = row["low"] + dist
-                        if stop_px is None:
-                            stop_px = trail_level
-                        else:
-                            stop_px = min(stop_px, trail_level)
+    net = float(np.nansum([t.pnl_net for t in trades])) if trades else 0.0
+    return trades, {"net": net, "net_pnl": net, "trades": len(trades)}
 
-            # Проверка выхода в текущем баре (приоритет стопа)
-            if pos > 0:
-                stop_hit = stop_px is not None and row["low"] <= stop_px
-                take_hit = cfg.take_atr is not None and take_px is not None and row[
-                    "high"] >= take_px and hold_bars >= cfg.min_hold_bars
-                if stop_hit:
-                    exit_px = stop_px * (1 - slip)
-                elif take_hit:
-                    exit_px = take_px * (1 - slip)
-                else:
-                    exit_px = None
-                if exit_px is not None:
-                    # комиссия на выход
-                    pnl = (exit_px - entry_px) * cfg.qty
-                    pnl -= (entry_px + exit_px) * cfg.qty * fee
-                    trades.append(Trade(+1, entry_idx, entry_px, ts, exit_px, pnl))
-                    # сброс состояния
-                    pos = 0
-                    entry_px = None
-                    entry_idx = None
-                    risk_per_unit = None
-                    stop_px = None
-                    take_px = None
-                    trail_active = False
-                    be_done = False
-                    hold_bars = 0
-                    cooldown = cfg.cooldown_bars
-                    continue
-            elif pos < 0:
-                stop_hit = stop_px is not None and row["high"] >= stop_px
-                take_hit = cfg.take_atr is not None and take_px is not None and row[
-                    "low"] <= take_px and hold_bars >= cfg.min_hold_bars
-                if stop_hit:
-                    exit_px = stop_px * (1 + slip)
-                elif take_hit:
-                    exit_px = take_px * (1 + slip)
-                else:
-                    exit_px = None
-                if exit_px is not None:
-                    pnl = (entry_px - exit_px) * cfg.qty
-                    pnl -= (entry_px + exit_px) * cfg.qty * fee
-                    trades.append(Trade(-1, entry_idx, entry_px, ts, exit_px, pnl))
-                    pos = 0
-                    entry_px = None
-                    entry_idx = None
-                    risk_per_unit = None
-                    stop_px = None
-                    take_px = None
-                    trail_active = False
-                    be_done = False
-                    hold_bars = 0
-                    cooldown = cfg.cooldown_bars
-                    continue
+# ----------------------------- Inline ranking -----------------------------
 
-        # поиск входа (если нет позиции и нет кулдауна)
-        if pos == 0 and cooldown == 0:
-            adx_ok_on = row["adx"] >= cfg.adx_on if pd.notna(row["adx"]) else False
-            adx_ok_off = row["adx"] <= cfg.adx_off if pd.notna(row["adx"]) else True
-            # Включён ли вообще ADX фильтр на вход: требуем adx_on
-            if pd.isna(row["ema_f"]) or pd.isna(row["ema_s"]) or pd.isna(row["atr"]) or not adx_ok_on:
-                pass
-            else:
-                long_ok = bool(row["cross_up"]) and bool(row["htf_ok_long"]) and (
-                        not cfg.require_di or (row["plus_di"] > row["minus_di"]))
-                short_ok = bool(row["cross_dn"]) and bool(row["htf_ok_short"]) and (
-                        not cfg.require_di or (row["minus_di"] > row["plus_di"]))
-                if long_ok:
-                    # вход по следующему бару open с проскальзыванием
-                    if i + cfg.entry_lag < len(df):
-                        j = i + cfg.entry_lag
-                        next_open = df.iloc[j]["open"]
-                        if pd.notna(next_open) and adx_ok_on:
-                            entry_px = float(next_open) * (1 + slip)
-                            entry_idx = df.index[j]
-                            pos = +1
-                            # комиссии на вход
-                            entry_fee = entry_px * cfg.qty * fee
-                            # риск
-                            risk_per_unit = cfg.stop_atr * row["atr"]
-                            if pd.isna(risk_per_unit) or risk_per_unit <= 0:
-                                # если ATR нет — отменяем вход
-                                pos = 0
-                                entry_px = None
-                                entry_idx = None
-                            else:
-                                stop_px = entry_px - risk_per_unit
-                                take_px = None
-                                if cfg.take_atr:
-                                    take_px = entry_px + cfg.take_atr * row["atr"]
-                                trail_active = cfg.trail_activate_rr is None  # сразу или после RR
-                                be_done = False
-                                hold_bars = 0
-                                # учтём комиссию сразу через вычитание из PnL на выходе; здесь можно игнорировать
+def _rank_inline(sweep_csv: str, out_top: str, out_robust: str, objective: str = "net_pnl", top_k: int = 50) -> int:
+    if not os.path.exists(sweep_csv):
+        print(f"[paper-cmd][rank-inline] file not found: {sweep_csv}", file=sys.stderr)
+        return 1
+    df = pd.read_csv(sweep_csv).replace([np.inf, -np.inf], np.nan)
+    if objective not in df.columns and "net" in df.columns:
+        df["net_pnl"] = df["net"]; objective = "net_pnl"
+    df = df.dropna(subset=[objective])
+    if "trades" in df.columns:
+        df = df[df["trades"] > 0]
+    if df.empty:
+        print("[paper-cmd][rank-inline] no champion candidate rows", file=sys.stderr)
+        pd.DataFrame().to_csv(out_top, index=False)
+        pd.DataFrame().to_csv(out_robust, index=False)
+        return 1
+    top = df.sort_values(objective, ascending=False).head(top_k)
+    top.to_csv(out_top, index=False)
+    thr = top[objective].median()
+    if "trades" in top.columns:
+        min_trades = max(1, int(top["trades"].median()))
+        robust = top[(top[objective] >= thr) & (top["trades"] >= min_trades)]
+    else:
+        robust = top
+    robust.to_csv(out_robust, index=False)
+    print(f"[paper-cmd][rank-inline] saved: {out_top} ({len(top)} rows)")
+    print(f"[paper-cmd][rank-inline] saved: {out_robust} ({len(robust)} rows)")
+    return 0
 
-                elif short_ok:
-                    if i + cfg.entry_lag < len(df):
-                        j = i + cfg.entry_lag
-                        next_open = df.iloc[j]["open"]
-                        if pd.notna(next_open) and adx_ok_on:
-                            entry_px = float(next_open) * (1 - slip)
-                            entry_idx = df.index[j]
-                            pos = -1
-                            entry_fee = entry_px * cfg.qty * fee
-                            risk_per_unit = cfg.stop_atr * row["atr"]
-                            if pd.isna(risk_per_unit) or risk_per_unit <= 0:
-                                pos = 0
-                                entry_px = None
-                                entry_idx = None
-                            else:
-                                stop_px = entry_px + risk_per_unit
-                                take_px = None
-                                if cfg.take_atr:
-                                    take_px = entry_px - cfg.take_atr * row["atr"]
-                                trail_active = cfg.trail_activate_rr is None
-                                be_done = False
-                                hold_bars = 0
+def _parse_bool(v: str) -> bool:
+    return str(v).strip().lower() in ("1", "true", "t", "yes", "y")
 
-    return trades
+# ----------------------------- CLI -----------------------------
 
-
-def summarize(trades: List[Trade]):
-    if not trades:
-        return {"trades": 0, "win_rate": 0.0, "net_pnl": 0.0, "avg_pnl": 0.0}
-    pnl = np.array([t.pnl for t in trades], dtype=float)
-    wins = (pnl > 0).sum()
-    return {
-        "trades": int(len(trades)),
-        "win_rate": float(wins / len(trades)),
-        "net_pnl": float(pnl.sum()),
-        "avg_pnl": float(pnl.mean()),
-    }
-
-
-def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="paper-trade")
-    p.add_argument("--ohlcv", required=True, help="Путь к CSV OHLCV")
-    p.add_argument("--time-col", default="timestamp")
-    p.add_argument("--resample", required=True)
-    p.add_argument("--ema-fast", type=int, required=True, dest="ema_fast")
-    p.add_argument("--ema-slow", type=int, required=True, dest="ema_slow")
-    p.add_argument("--adx-len", type=int, required=True, dest="adx_len")
-    p.add_argument("--adx-on", type=float, required=True, dest="adx_on")
-    p.add_argument("--adx-off", type=float, required=True, dest="adx_off")
-    p.add_argument("--require-di", type=str2bool, required=True, dest="require_di")
-    p.add_argument("--htf-tf", dest="htf_tf")
-    p.add_argument("--htf-ema-fast", type=int, dest="htf_ema_fast")
-    p.add_argument("--htf-ema-slow", type=int, dest="htf_ema_slow")
-    p.add_argument("--atr-len", type=int, dest="atr_len", default=14)
-    p.add_argument("--stop-atr", type=float, required=True, dest="stop_atr")
-    p.add_argument("--take-atr", type=float, dest="take_atr")
-    p.add_argument("--trail-atr", type=float, dest="trail_atr")
-    p.add_argument("--breakeven-rr", type=float, dest="breakeven_rr")
-    p.add_argument("--trail-activate-rr", type=float, dest="trail_activate_rr")
-    p.add_argument("--entry-lag", type=int, dest="entry_lag", default=0)
-    p.add_argument("--cooldown-bars", type=int, required=True, dest="cooldown_bars")
-    p.add_argument("--min-hold-bars", type=int, dest="min_hold_bars", default=0)
-    p.add_argument("--fill-mode", dest="fill_mode", default="next_open")
-    p.add_argument("--fee-bps", type=float, required=True, dest="fee_bps")
-    p.add_argument("--slip-bps", type=float, required=True, dest="slip_bps")
-    p.add_argument("--qty", type=float, required=True, dest="qty")
-    # совместимость: игнорируем неизвестные доп. ключи, если sweep_cli их пришлёт
+def build_leaf_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="paper-trade", add_help=True)
+    add = p.add_argument
+    add("--ohlcv", required=True)
+    add("--time-col", default="timestamp")
+    add("--resample", required=True)
+    add("--ema-fast", type=int, required=True)
+    add("--ema-slow", type=int, required=True)
+    add("--adx-len", type=int, required=True)
+    add("--adx-on", type=float, required=True)
+    add("--adx-off", type=float, required=True)
+    add("--require-di", type=str, required=True)
+    add("--htf-tf", default="")
+    add("--htf-ema-fast", type=int, default=0)
+    add("--htf-ema-slow", type=int, default=0)
+    add("--atr-len", type=int, default=14)
+    add("--stop-atr", type=float, required=True)
+    add("--take-atr", type=float, default=0.0)
+    add("--trail-atr", type=float, default=0.0)
+    add("--breakeven-rr", type=float, default=0.0)
+    add("--trail-activate-rr", type=float, default=0.0)
+    add("--entry-lag", type=int, default=0)
+    add("--cooldown-bars", type=int, required=True)
+    add("--min-hold-bars", type=int, default=0)
+    add("--fill-mode", default="close")
+    add("--fee-bps", type=float, required=True)
+    add("--slip-bps", type=float, required=True)
+    add("--qty", type=float, required=True)
+    # совместимость со свипером
+    add("--emit-plain", action="store_true", help="в конце stdout напечатать 'net=<..> trades=<..>'")
     return p
 
+def build_auto_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="paper_trade_cmd", add_help=True)
+    ap.add_argument("--sweep-args", help="строка аргументов для sweep_cli")
+    ap.add_argument("--rank-args", help="строка аргументов для rank_cli", default="")
+    ap.add_argument("--wf-splits", type=int, default=0)
+    ap.add_argument("--wf-min-trades", type=int, default=0)
+    ap.add_argument("--cache-all", action="store_true")
+    return ap
 
-def main():
-    parser = build_argparser()
-    args, unknown = parser.parse_known_args()
-    # Не падаем из‑за неизвестных аргументов, просто игнорируем
-
+def run_leaf(ns: argparse.Namespace) -> int:
     cfg = Config(
-        ohlcv=args.ohlcv,
-        time_col=args.time_col,
-        resample=args.resample,
-        ema_fast=args.ema_fast,
-        ema_slow=args.ema_slow,
-        adx_len=args.adx_len,
-        adx_on=args.adx_on,
-        adx_off=args.adx_off,
-        require_di=args.require_di,
-        htf_tf=args.htf_tf,
-        htf_ema_fast=args.htf_ema_fast,
-        htf_ema_slow=args.htf_ema_slow,
-        atr_len=args.atr_len,
-        stop_atr=args.stop_atr,
-        take_atr=args.take_atr,
-        trail_atr=args.trail_atr,
-        breakeven_rr=args.breakeven_rr,
-        trail_activate_rr=args.trail_activate_rr,
-        entry_lag=args.entry_lag,
-        cooldown_bars=args.cooldown_bars,
-        min_hold_bars=args.min_hold_bars,
-        fill_mode=args.fill_mode,
-        fee_bps=args.fee_bps,
-        slip_bps=args.slip_bps,
-        qty=args.qty,
+        ohlcv=ns.ohlcv, time_col=ns.time_col, resample=ns.resample,
+        ema_fast=ns.ema_fast, ema_slow=ns.ema_slow,
+        adx_len=ns.adx_len, adx_on=ns.adx_on, adx_off=ns.adx_off, require_di=_parse_bool(ns.require_di),
+        atr_len=ns.atr_len, stop_atr=ns.stop_atr, take_atr=ns.take_atr, trail_atr=ns.trail_atr,
+        breakeven_rr=ns.breakeven_rr, trail_activate_rr=ns.trail_activate_rr,
+        entry_lag=ns.entry_lag, cooldown_bars=ns.cooldown_bars, min_hold_bars=ns.min_hold_bars, fill_mode=ns.fill_mode,
+        fee_bps=ns.fee_bps, slip_bps=ns.slip_bps, qty=ns.qty,
     )
+    _, summary = run_backtest(cfg)
+    # 1) JSON — удобно людям и интеграциям
+    print(json.dumps(summary, ensure_ascii=False))
+    # 2) Совместимость со свипером — последняя строка простая
+    if getattr(ns, "emit-plain", False):
+        net = summary.get("net")
+        trades = summary.get("trades")
+        # последняя строка stdout:
+        print(f"net={net} trades={trades}")
+    return 0
 
+def run_auto(ns: argparse.Namespace) -> int:
+    # 1) sweep с ЯВНЫМ paper-cli: "<python> -m src.presentation.cli.paper_trade_cmd --emit-plain"
+    py = shlex.quote(sys.executable)
+    paper_cli_str = f"{py} -m src.presentation.cli.paper_trade_cmd --emit-plain"
+
+    sweep_cmd = [sys.executable, "-m", "src.presentation.cli.sweep_cli"]
+    if ns.sweep_args:
+        sweep_cmd += shlex.split(ns.sweep_args)
+    sweep_cmd += ["--paper-cli", paper_cli_str]
+
+    print(f"[paper-cmd] exec:", " ".join(sweep_cmd), flush=True)
+    rc = subprocess.run(sweep_cmd).returncode
+    if rc != 0:
+        print(f"[paper-cmd] ERROR: sweep step failed with rc={rc}", file=sys.stderr)
+        return rc
+
+    # 2) ранкинг (попытка модулем, затем inline fallback)
+    rank_cmd = [sys.executable, "-m", "src.presentation.cli.rank_cli"]
+    if ns.rank_args:
+        rank_cmd += shlex.split(ns.rank_args)
     try:
-        trades = run_backtest(cfg)
-        summ = summarize(trades)
-    except Exception as e:
-        # В случае сбоя отдаём валидный JSON с нулевой статистикой и текстом ошибки в stderr
-        raise
-    else:
-        # ВАЖНО: вывести РОВНО один JSON-объект одной строкой (без префиксов), это парсит sweep_cli
-        print(json.dumps(summ, ensure_ascii=False))
+        print(f"[paper-cmd] exec:", " ".join(rank_cmd), flush=True)
+        rc_rank = subprocess.run(rank_cmd).returncode
+        if rc_rank == 0:
+            return 0
+        else:
+            print(f"[paper-cmd] WARN: rank_cli returned rc={rc_rank} — using inline ranking", file=sys.stderr)
+    except Exception:
+        print(f"[paper-cmd] WARN: rank_cli not found — using inline ranking", file=sys.stderr)
 
+    # inline fallback — параметры вытащим из rank_args, если были
+    sweep_csv = "reports/sweep_full.csv"; out_top = "reports/top_ranked.csv"; out_robust = "reports/top_robust.csv"
+    objective = "net_pnl"; top_k = 50
+    toks = shlex.split(ns.rank_args or "")
+    it = iter(toks)
+    for t in it:
+        if t == "--in":            sweep_csv = next(it, sweep_csv)
+        elif t == "--out-top":     out_top = next(it, out_top)
+        elif t == "--out-robust":  out_robust = next(it, out_robust)
+        elif t == "--objective":   objective = next(it, objective)
+        elif t == "--top-k":
+            try: top_k = int(next(it, str(top_k)))
+            except Exception: pass
+
+    return _rank_inline(sweep_csv, out_top, out_robust, objective, top_k)
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    leaf_flags = {"--ohlcv","--resample","--ema-fast","--ema-slow","--adx-len","--adx-on","--adx-off",
+                  "--require-di","--stop-atr","--cooldown-bars","--fee-bps","--slip-bps","--qty","--emit-plain"}
+    if any(f in argv for f in leaf_flags):
+        parser_leaf = build_leaf_parser()
+        ns = parser_leaf.parse_args(argv)
+        return run_leaf(ns)
+    parser_auto = build_auto_parser()
+    ns = parser_auto.parse_args(argv)
+    if not ns.sweep_args:
+        build_leaf_parser().print_help(sys.stderr)
+        return 2
+    return run_auto(ns)
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

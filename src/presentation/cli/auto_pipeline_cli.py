@@ -1,384 +1,400 @@
 # src/presentation/cli/auto_pipeline_cli.py
 # -*- coding: utf-8 -*-
 """
-Автоматизированный пайплайн:
-  1) sweep_cli (перебор конфигов)
-  2) rank_sweep_cli (ранжирование, выбор чемпиона, робаст-фильтр)
-  3) (опц.) walk-forward: подготовка временных сплитов исходного OHLCV
-  4) (опц.) форвард-прогон чемпиона на внешних OHLCV
+Стриминговый раннер для длинных задач (sweep_cli / paper_trade_cmd и пр.):
+- потоковый stdout/stderr;
+- корректная обработка SIGINT/SIGTERM (мягкая остановка, затем SIGKILL);
+- heartbeat, чтобы фронт не думал, что задача зависла;
+- pass-through: всё после `--` идёт в дочерний процесс;
+- auto-detect модулей: `python -m <module>` если нужно;
+- НОВОЕ: умный режим shell. Если обнаружены «склеенные» аргументы в кавычках
+  (например, `'--ohlcv ... --resample ...'`) или включён TB_SHELL_MODE=1,
+  раннер запустит команду через оболочку (create_subprocess_shell), сохранив
+  все гарантии (process group, сигналы, таймаут, heartbeat).
 
-Примеры:
-  python -m src.presentation.cli.auto_pipeline_cli \
-    --mode assist \
-    --paper-cli-module src.presentation.cli.paper_trade_cmd \
-    --sweep-args "--ohlcv data/demo_ohlcv_1m.csv --resample 5min \
-                  --ema-fast 12 --ema-slow 21 --adx-len 14 \
-                  --adx-on 28,32 --adx-off 18,20,22 --require-di true \
-                  --htf-tf 15min,1h \
-                  --stop-atr 2.0,2.5,3.0 --take-atr 1.0,1.5,2.0 --trail-atr 1.0,2.0 \
-                  --cooldown-bars 0,12,24 \
-                  --fee-bps 10 --slip-bps 2 --qty 1 \
-                  --out reports/sweep_full.csv \
-                  --min-hold-bars 0,6 --breakeven-rr 0.5,1.0 --trail-activate-rr 1.5,3.0" \
-    --rank-args  "--objective net_pnl --top-k 50 --auto-min-trades \
-                  --neighbor-radius 1 --robust-pos-share 0.55 \
-                  --out-top reports/top_ranked.csv --out-robust reports/top_robust.csv" \
-    --artifact-champion-json reports/champion.json \
-    --artifact-champion-cli  reports/champion_cli.sh \
-    --wf-splits 5 --wf-min-trades 3
-
-  python -m src.presentation.cli.auto_pipeline_cli \
-    --mode auto \
-    --paper-cli-module src.presentation.cli.paper_trade_cmd \
-    --sweep-args "--ohlcv data/demo_ohlcv_1m.csv ... --out reports/sweep_full.csv" \
-    --rank-args  "--objective net_pnl --top-k 50 --auto-min-trades" \
-    --forward-ohlcv "data/forward_1m_A.csv,data/forward_1m_B.csv" \
-    --forward-trades-out "reports/trades_{i}_{stem}.csv" \
-    --forward-extra-args "--trades-out /dev/null"
+Переменные окружения:
+  TB_TIME_BUDGET_SEC  — мягкий таймаут в секундах (если не задан флагом)
+  TB_KILL_GRACE_SEC   — грация перед SIGKILL (по умолчанию 15)
+  TB_HEARTBEAT_SEC    — период heartbeat (по умолчанию 25)
+  TB_DEFAULT_MODULE   — модуль по умолчанию, если команда не распознана
+                        (дефолт: 'src.presentation.cli.paper_trade_cmd')
+  TB_SHELL_MODE       — '1'/'true'/'yes' — всегда через shell; '0' — всегда exec;
+                        'auto' (по умолчанию) — включать shell при «склеенных» аргументах
 """
+
 from __future__ import annotations
 
 import argparse
-import json
+import asyncio
 import os
 import shlex
-import subprocess
+import signal
 import sys
-from dataclasses import dataclass
+import threading
+import time
 from datetime import datetime
-from pathlib import Path
-from typing import List, Optional, Tuple
-
-import numpy as np
-import pandas as pd
-
-PRINT_PREFIX = "[auto]"
+from typing import List, Optional
 
 
-def _print(msg: str) -> None:
-    print(f"{PRINT_PREFIX} {msg}", flush=True)
+HEART_ICON = "💓"
 
 
-def _run(cmd: List[str]) -> int:
-    _print("▶ " + " ".join(cmd))
-    return subprocess.run(cmd).returncode
+def _now_ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _tokenize(s: str) -> List[str]:
-    return shlex.split(s, posix=True) if s else []
+class GracefulTerminator:
+    def __init__(self) -> None:
+        self.cancel_event = threading.Event()
+        self._install()
+
+    def _install(self) -> None:
+        def _handler(signum, frame):
+            self.cancel_event.set()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(sig, _handler)
+            except Exception:
+                pass
+
+    def requested(self) -> bool:
+        return self.cancel_event.is_set()
 
 
-def _has_flag(tokens: List[str], flag: str) -> bool:
+class Heartbeat:
+    def __init__(self, interval_sec: int = 25) -> None:
+        self.interval = max(1, int(interval_sec))
+        self._stop = threading.Event()
+        self._thr = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thr.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thr.join(timeout=2.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                sys.stdout.write(f"{HEART_ICON}\n")
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+
+async def _read_stream(stream: asyncio.StreamReader, sink) -> None:
     try:
-        idx = tokens.index(flag)
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            try:
+                decoded = line.decode(errors="replace")
+            except Exception:
+                decoded = str(line)
+            sink.write(decoded)
+            sink.flush()
+    except asyncio.CancelledError:
+        pass
+
+
+def _is_python_executable(s: str) -> bool:
+    base = os.path.basename(s).lower()
+    if s == sys.executable:
         return True
-    except ValueError:
-        # поддержка формата --flag=value
-        return any(t.startswith(flag + "=") for t in tokens)
+    return base in ("python", "python3") or base.startswith("python3.")
 
 
-def _get_flag_value(tokens: List[str], flag: str) -> Optional[str]:
-    # поддерживает --flag value и --flag=value
-    for i, t in enumerate(tokens):
-        if t == flag:
-            return tokens[i + 1] if i + 1 < len(tokens) else None
-        if t.startswith(flag + "="):
-            return t.split("=", 1)[1]
-    return None
+def _looks_like_module(s: str) -> bool:
+    if not s:
+        return False
+    if any(sep in s for sep in ("/", "\\")):
+        return False
+    if s.endswith((".py", ".sh", ".bash", ".zsh", ".bat", ".cmd", ".exe")):
+        return False
+    return ("." in s) or (":" in s)
 
 
-def _inject_if_missing(tokens: List[str], flag: str, value: Optional[str]) -> None:
-    if not _has_flag(tokens, flag):
-        if value is None:
-            tokens.append(flag)
-        else:
-            tokens.extend([flag, value])
+def _token_looks_like_option(token: str) -> bool:
+    if not token:
+        return False
+    t = token.strip()
+    return t.startswith("--") or t.startswith("-") or t.startswith("'--") or t.startswith('"--')
 
 
-def _ensure_required_sweep_flags(tokens: List[str]) -> None:
-    """Гарантируем, что обязательные флаги присутствуют, иначе sweep_cli ругнётся."""
-    required = [
-        "--ohlcv",
-        "--resample",
-        "--ema-fast",
-        "--ema-slow",
-        "--adx-len",
-        "--adx-on",
-        "--adx-off",
-        "--require-di",
-        "--htf-tf",
-        "--stop-atr",
-        "--trail-atr",
-        "--cooldown-bars",
-        "--min-hold-bars",
-        "--breakeven-rr",
-        "--trail-activate-rr",
-        "--fee-bps",
-        "--slip-bps",
-        "--qty",
-        "--out",
-    ]
-    missing = [f for f in required if not _has_flag(tokens, f)]
-    if missing:
-        # Ничего не подставляем автоматически (кроме paper-cli), просто подскажем.
-        _print(
-            "⚠ Обнаружены отсутствующие обязательные флаги для sweep_cli: "
-            + ", ".join(missing)
+def _normalize_cmd(cmd: List[str]) -> List[str]:
+    if not cmd:
+        return cmd
+    first = cmd[0]
+
+    if _is_python_executable(first):
+        return cmd
+
+    try:
+        if os.path.exists(first):
+            return cmd
+    except Exception:
+        pass
+
+    if _looks_like_module(first):
+        module = first
+        norm = [sys.executable, "-m", module] + cmd[1:]
+        sys.stdout.write(
+            f"{_now_ts()} INFO [runner] Executing as module: "
+            f"{shlex.join([sys.executable, '-m', module] + cmd[1:])}\n"
+        )
+        sys.stdout.flush()
+        return norm
+
+    return cmd
+
+
+def _needs_shell(cmd: List[str]) -> bool:
+    """Эвристика: если встречаем токены, начинающиеся/заканчивающиеся кавычками
+    или явные «склейки» с пробелами, которые должны интерпретироваться оболочкой,
+    то включаем shell. Также учитываем TB_SHELL_MODE."""
+    mode = os.getenv("TB_SHELL_MODE", "auto").strip().lower()
+    if mode in ("1", "true", "yes"):
+        return True
+    if mode in ("0", "false", "no"):
+        return False
+
+    # auto
+    for t in cmd:
+        st = t.strip()
+        if not st:
+            continue
+        # Если токен уже содержит внешние кавычки (типичный случай с '--ohlcv ...')
+        if (st.startswith("'") and st.endswith("'")) or (st.startswith('"') and st.endswith('"')):
+            return True
+        # Если токен содержит пробелы И выглядит как один аргумент (например значение опции),
+        # лучше отдать это на разбор shell (особенно для вложенных командных строк).
+        if " " in st and not st.startswith("-"):
+            return True
+    return False
+
+
+async def run_streaming(
+    cmd: List[str],
+    time_budget_sec: Optional[int] = None,
+    kill_grace_sec: int = 15,
+    env: Optional[dict] = None,
+) -> int:
+    terminator = GracefulTerminator()
+
+    hb_interval = int(os.getenv("TB_HEARTBEAT_SEC", "25"))
+    hb = Heartbeat(interval_sec=hb_interval)
+    hb.start()
+
+    start = time.monotonic()
+    budget = None if not time_budget_sec or time_budget_sec <= 0 else int(time_budget_sec)
+
+    sys.stdout.write(f"[api] ▶ starting run {datetime.now().strftime('%Y%m%d-%H%M%S')}\n")
+    sys.stdout.flush()
+
+    # Нормализация (python -m ...)
+    cmd = _normalize_cmd(cmd)
+
+    use_shell = _needs_shell(cmd)
+    if use_shell:
+        # В shell-ветке собираем строку так, чтобы сохранить уже переданные кавычки.
+        # Используем простое объединение через пробел — фронт уже поставил нужные кавычки.
+        cmdline = " ".join(cmd)
+        sys.stdout.write(f"{_now_ts()} INFO [runner] Using shell mode\n")
+        sys.stdout.flush()
+        proc = await asyncio.create_subprocess_shell(
+            cmdline,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            env=env or os.environ.copy(),
+        )
+    else:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            env=env or os.environ.copy(),
         )
 
+    tasks = []
+    if proc.stdout:
+        tasks.append(asyncio.create_task(_read_stream(proc.stdout, sys.stdout)))
+    if proc.stderr:
+        tasks.append(asyncio.create_task(_read_stream(proc.stderr, sys.stderr)))
 
-def _maybe_attach_paper_cli(tokens: List[str], module: Optional[str]) -> None:
-    """Если указали --paper-cli-module и он ещё не в sweep-args, прокинем в sweep_cli как --paper-cli."""
-    if module and not _has_flag(tokens, "--paper-cli"):
-        tokens.extend(["--paper-cli", module])
-
-
-def _detect_time_col(df: pd.DataFrame) -> str:
-    # Популярные имена
-    for c in ["time", "timestamp", "datetime", "date"]:
-        if c in df.columns:
-            return c
-    # Иначе пробуем найти первый столбец, который парсится в даты
-    for c in df.columns:
+    async def _grace_stop(sig: int) -> None:
         try:
-            s = pd.to_datetime(df[c], errors="raise", utc=False, infer_datetime_format=True)
-            return c
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            return
         except Exception:
-            continue
-    # Фолбек — первый столбец
-    return df.columns[0]
+            try:
+                proc.send_signal(sig)
+            except ProcessLookupError:
+                return
+
+    retcode: int
+    try:
+        while True:
+            if terminator.requested():
+                sys.stdout.write("[api] cancelled\n")
+                sys.stdout.flush()
+                await _grace_stop(signal.SIGINT)
+                try:
+                    retcode = await asyncio.wait_for(proc.wait(), timeout=kill_grace_sec)
+                except asyncio.TimeoutError:
+                    await _grace_stop(signal.SIGKILL)
+                    retcode = -2
+                break
+
+            if budget is not None and (time.monotonic() - start) >= budget:
+                sys.stdout.write(f"{_now_ts()} INFO [runner] Time budget reached. Stopping child...\n")
+                sys.stdout.flush()
+                await _grace_stop(signal.SIGTERM)
+                try:
+                    retcode = await asyncio.wait_for(proc.wait(), timeout=kill_grace_sec)
+                except asyncio.TimeoutError:
+                    await _grace_stop(signal.SIGKILL)
+                    retcode = -2
+                break
+
+            try:
+                ret = await asyncio.wait_for(proc.wait(), timeout=0.25)
+                retcode = int(ret)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        hb.stop()
+
+    return retcode
 
 
-def _split_ohlcv_for_walkforward(ohlcv_path: str, splits: int, out_dir: Path) -> List[Path]:
-    """
-    Режем один OHLCV-файл на K последовательных кусков по времени.
-    Возвращаем список путей к сохранённым фрагментам.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    df = pd.read_csv(ohlcv_path)
-    time_col = _detect_time_col(df)
-    # сортировка во времени (на всякий случай)
-    df = df.sort_values(by=time_col).reset_index(drop=True)
-
-    n = len(df)
-    if n == 0:
-        _print("⚠ OHLCV пустой — walk-forward пропущен.")
-        return []
-
-    splits = max(1, min(int(splits), n))
-    # Главное исправление: используем numpy.array_split вместо несуществующего .split()
-    idx_chunks = np.array_split(np.arange(n), splits)
-
-    out_paths: List[Path] = []
-    for i, idx in enumerate(idx_chunks, 1):
-        part = df.iloc[idx]
-        if part.empty:
-            continue
-        stem = Path(ohlcv_path).stem
-        out_path = out_dir / f"{stem}_wf_{i}.csv"
-        part.to_csv(out_path, index=False)
-        out_paths.append(out_path)
-
-    _print(f"Создано WF-сплитов: {len(out_paths)} (из запрошенных {splits}).")
-    return out_paths
-
-
-@dataclass
-class Args:
-    mode: str
-    sweep_args: str
-    rank_args: str
-    paper_cli_module: Optional[str]
-    artifact_champion_json: Optional[str]
-    artifact_champion_cli: Optional[str]
-    cache_all: bool
-    wf_splits: int
-    wf_min_trades: int
-    forward_ohlcv: Optional[str]
-    forward_trades_out: Optional[str]
-    forward_extra_args: Optional[str]
-
-
-def parse_args(argv: List[str]) -> Args:
-    p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["manual", "assist", "auto"], required=True)
-    p.add_argument("--sweep-args", required=True, help="Строка аргументов для sweep_cli")
-    p.add_argument("--rank-args", default="", help="Строка аргументов для rank_sweep_cli")
-    p.add_argument("--paper-cli-module", default=None,
-                   help="Модуль исполнения бумаги (например, src.presentation.cli.paper_trade_cmd)")
-
-    # артефакты
-    p.add_argument("--artifact-champion-json", default=None)
-    p.add_argument("--artifact-champion-cli", default=None)
-
-    # кэш и walk-forward
-    p.add_argument("--cache-all", action="store_true")
-    p.add_argument("--wf-splits", type=int, default=0,
-                   help="Сколько временных сплитов подготовить из исходного OHLCV (только подготовка)")
-    p.add_argument("--wf-min-trades", type=int, default=0,
-                   help="Требование к min_trades для WF-подзадач (сейчас используется как инфо/лог)")
-
-    # форвард-прогон
-    p.add_argument("--forward-ohlcv", default=None, help="Список CSV через запятую для форварда")
-    p.add_argument("--forward-trades-out", default=None, help="Шаблон для trades CSV: можно {i} и {stem}")
-    p.add_argument("--forward-extra-args", default=None, help="Доп. аргументы для paper_trade_cmd на форварде")
-
-    a = p.parse_args(argv)
-
-    return Args(
-        mode=a.mode,
-        sweep_args=a.sweep_args,
-        rank_args=a.rank_args,
-        paper_cli_module=a.paper_cli_module,
-        artifact_champion_json=a.artifact_champion_json,
-        artifact_champion_cli=a.artifact_champion_cli,
-        cache_all=bool(a.cache_all),
-        wf_splits=int(a.wf_splits or 0),
-        wf_min_trades=int(a.wf_min_trades or 0),
-        forward_ohlcv=a.forward_ohlcv,
-        forward_trades_out=a.forward_trades_out,
-        forward_extra_args=a.forward_extra_args,
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="auto_pipeline_cli",
+        description="Streaming runner with graceful cancellation/time budget.",
+        add_help=True,
+    )
+    parser.add_argument(
+        "--time-budget-sec",
+        type=int,
+        default=int(os.getenv("TB_TIME_BUDGET_SEC", "0")),
+        help="Мягкий лимит по времени (сек). 0 — без лимита.",
+    )
+    parser.add_argument(
+        "--kill-grace-sec",
+        type=int,
+        default=int(os.getenv("TB_KILL_GRACE_SEC", "15")),
+        help="Секунды ожидания после SIGTERM/SIGINT перед SIGKILL.",
+    )
+    parser.add_argument(
+        "--heartbeat-sec",
+        type=int,
+        default=int(os.getenv("TB_HEARTBEAT_SEC", "25")),
+        help="Период сердцебиения в секундах.",
     )
 
+    # Для совместимости — просто съедаем и игнорируем
+    parser.add_argument("--mode", default=None, help="Совместимость со старыми лаунчерами. Игнорируется.")
+    parser.add_argument("--paper-cli-module", default=None, help="Совместимость. Игнорируется.")
 
-def main() -> int:
-    args = parse_args(sys.argv[1:])
+    parser.add_argument(
+        "cmd",
+        nargs=argparse.REMAINDER,
+        help=("Команда для запуска. Передайте через `--`.\n"
+              "Пример: -- python -m src.presentation.cli.sweep_cli --ohlcv ...\n"
+              "Или только высокоуровневые флаги: -- --sweep-args '...' --rank-args '...'"),
+    )
+    return parser
 
-    # 1) S W E E P
-    sweep_tokens = _tokenize(args.sweep_args)
-    _ensure_required_sweep_flags(sweep_tokens)
-    _maybe_attach_paper_cli(sweep_tokens, args.paper_cli_module)
 
-    # Убедимся, что есть --out
-    out_csv = _get_flag_value(sweep_tokens, "--out")
-    if not out_csv:
-        # Если не задано - по умолчанию
-        out_csv = "reports/sweep_full.csv"
-        sweep_tokens.extend(["--out", out_csv])
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    parser = _build_parser()
+    args, unknown = parser.parse_known_args(argv)
 
-    # Запомним путь к OHLCV для WF
-    ohlcv_in = _get_flag_value(sweep_tokens, "--ohlcv")
+    if args.cmd and args.cmd[0] == "--":
+        args.cmd = args.cmd[1:]
 
-    sweep_cmd = ["python", "-m", "src.presentation.cli.sweep_cli"] + sweep_tokens
-    rc = _run(sweep_cmd)
-    if rc != 0:
-        _print("❌ sweep_cli завершился с ошибкой")
-        return rc
+    # Сохраним unknown (флаги до `--`), чтобы приклеить их к дочерней команде
+    setattr(args, "_unknown", unknown)
+    return args
 
-    # 2) R A N K
-    rank_tokens = _tokenize(args.rank_args)
 
-    # Если пользователь не указал вход явно в rank-args, добавим его
-    if not _has_flag(rank_tokens, "--in"):
-        rank_tokens.extend(["--in", out_csv])
+def _compose_child_cmd(args: argparse.Namespace) -> List[str]:
+    """
+    Если явной команды нет или первый токен выглядит как опция — подставим модуль по умолчанию
+    и приклеим unknown + cmd. Это покрывает кейс, когда фронт шлёт:
+      <наш раннер> -- --sweep-args '...' --rank-args '...' ...
+    """
+    default_module = os.getenv("TB_DEFAULT_MODULE", "src.presentation.cli.paper_trade_cmd")
+    tokens = list(args.cmd)
+    unknown = list(getattr(args, "_unknown", []))
 
-    # Пробросим артефакты чемпиона
-    if args.artifact_champion_json and not _has_flag(rank_tokens, "--emit-champion-json"):
-        rank_tokens.extend(["--emit-champion-json", args.artifact_champion_json])
-    if args.artifact_champion_cli and not _has_flag(rank_tokens, "--emit-champion-cli"):
-        rank_tokens.extend(["--emit-champion-cli", args.artifact_champion_cli])
-
-    rank_cmd = ["python", "-m", "src.presentation.cli.rank_sweep_cli"] + rank_tokens
-    rc = _run(rank_cmd)
-    if rc != 0:
-        _print("❌ rank_sweep_cli завершился с ошибкой")
-        return rc
-
-    # 3) Walk-forward (подготовка сплитов исходного OHLCV)
-    if args.wf_splits and ohlcv_in:
-        wf_dir = Path("reports") / "wf"
+    def _has_executable(ts: List[str]) -> bool:
+        if not ts:
+            return False
+        first = ts[0]
+        if _is_python_executable(first):
+            return True
         try:
-            _split_ohlcv_for_walkforward(ohlcv_in, args.wf_splits, wf_dir)
-        except Exception as e:
-            _print(f"⚠ Не удалось подготовить WF-сплиты: {e}")
+            if os.path.exists(first):
+                return True
+        except Exception:
+            pass
+        if _looks_like_module(first):
+            return True
+        return False
 
-    # 4) Форвард-прогон (auto/assist — если задан forward-ohlcv)
-    if args.forward_ohlcv:
-        champion_path = args.artifact_champion_json or "reports/champion.json"
-        if not Path(champion_path).exists():
-            _print(f"⚠ Форвард задан, но не найден champion JSON: {champion_path}")
-        else:
-            try:
-                with open(champion_path, "r", encoding="utf-8") as f:
-                    champion = json.load(f)
-            except Exception as e:
-                _print(f"⚠ Не удалось прочитать чемпиона: {e}")
-                champion = None
+    if _has_executable(tokens) and not (_token_looks_like_option(tokens[0])):
+        return tokens + unknown
 
-            if champion:
-                # Соберём общий набор аргументов для paper_trade_cmd из чемпиона
-                base = [
-                    "python", "-m", (args.paper_cli_module or "src.presentation.cli.paper_trade_cmd"),
-                    "--resample", str(champion["resample"]),
-                    "--ema-fast", str(champion["ema_fast"]),
-                    "--ema-slow", str(champion["ema_slow"]),
-                    "--adx-len", str(champion["adx_len"]),
-                    "--adx-on", str(champion["adx_on"]),
-                    "--adx-off", str(champion["adx_off"]),
-                    "--require-di", str(champion["require_di"]),
-                    "--htf-tf", str(champion["htf_tf"]),
-                    "--stop-atr", str(champion["stop_atr"]),
-                    "--take-atr", str(champion["take_atr"]),
-                    "--trail-atr", str(champion["trail_atr"]),
-                    "--cooldown-bars", str(champion["cooldown_bars"]),
-                    "--min-hold-bars", str(champion["min_hold_bars"]),
-                    "--breakeven-rr", str(champion["breakeven_rr"]),
-                    "--trail-activate-rr", str(champion["trail_activate_rr"]),
-                    "--fee-bps", str(champion["fee_bps"]),
-                    "--slip-bps", str(champion["slip_bps"]),
-                    "--qty", str(champion["qty"]),
-                ]
+    sys.stdout.write(
+        f"{_now_ts()} INFO [runner] No explicit command detected. Defaulting to module: {default_module}\n"
+    )
+    sys.stdout.flush()
+    return [default_module] + unknown + tokens
 
-                # Разберём доп. аргументы форварда
-                extra_tokens = _tokenize(args.forward_extra_args or "")
-                extra_has_trades_out = _has_flag(extra_tokens, "--trades-out")
 
-                # Список внешних OHLCV
-                fwd_files = [s.strip() for s in args.forward_ohlcv.split(",") if s.strip()]
-                for i, path in enumerate(fwd_files, 1):
-                    stem = Path(path).stem
-                    cmd = base + ["--ohlcv", path]
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
 
-                    if args.forward_trades_out:
-                        # если пользователь уже явно задал --trades-out в extra, не дублируем наш шаблон
-                        if not extra_has_trades_out:
-                            out_trades = args.forward_trades_out.format(i=i, stem=stem)
-                            cmd += ["--trades-out", out_trades]
+    child_cmd = _compose_child_cmd(args)
 
-                    # Приклеим доп. флаги (после наших базовых)
-                    cmd += extra_tokens
+    # Покажем, что пришло от фронта и что реально побежит
+    if args.cmd:
+        sys.stdout.write(f"[auto] ▶ {' '.join(shlex.quote(x) for x in args.cmd)}\n")
+    else:
+        sys.stdout.write("[auto] ▶ <empty>\n")
+    sys.stdout.write(f"{_now_ts()} INFO [runner] Child command: {shlex.join(child_cmd)}\n")
+    sys.stdout.flush()
 
-                    rc = _run(cmd)
-                    if rc != 0:
-                        _print("❌ команда завершилась с кодом %s" % rc)
-                        # продолжаем остальные файлы
-            else:
-                _print("⚠ Чемпион не загружен — форвард пропущен.")
+    env = os.environ.copy()
+    env["TB_HEARTBEAT_SEC"] = str(args.heartbeat_sec)
+    if args.time_budget_sec and args.time_budget_sec > 0:
+        env["TB_TIME_BUDGET_SEC"] = str(args.time_budget_sec)
 
-    # 5) Кэширование результатов (минимальная реализация)
-    if args.cache_all:
-        try:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            run_dir = Path("reports") / f"auto_run_{ts}"
-            run_dir.mkdir(parents=True, exist_ok=True)
-            # копируем заметные артефакты, если есть
-            for p in [
-                out_csv,
-                _get_flag_value(rank_tokens, "--out-top") or "reports/top_ranked.csv",
-                _get_flag_value(rank_tokens, "--out-robust") or "reports/top_robust.csv",
-                args.artifact_champion_json or "reports/champion.json",
-                args.artifact_champion_cli or "reports/champion_cli.sh",
-            ]:
-                if p and Path(p).exists():
-                    Path(run_dir / Path(p).name).write_bytes(Path(p).read_bytes())
-            _print(f"Кэш сохранён: {run_dir}")
-        except Exception as e:
-            _print(f"⚠ Не удалось сохранить кэш: {e}")
+    try:
+        ret = asyncio.run(
+            run_streaming(
+                cmd=child_cmd,
+                time_budget_sec=args.time_budget_sec,
+                kill_grace_sec=args.kill_grace_sec,
+                env=env,
+            )
+        )
+    except KeyboardInterrupt:
+        ret = -2
 
-    if args.artifact_champion_cli and Path(args.artifact_champion_cli).exists():
-        _print(f"champion CLI сохранён: {args.artifact_champion_cli}")
-
-    return 0
+    return int(ret)
 
 
 if __name__ == "__main__":
